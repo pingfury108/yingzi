@@ -27,7 +27,7 @@ async fn main() -> Result<()> {
     let mut listeners = StreamMap::new();
     // 添加要监听的端口
     for port in ports {
-        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, port)).await?;
+        let listener = TcpListener::bind((Ipv4Addr::new(0, 0, 0, 0), port)).await?;
         log::info!("Listening on port {}", port);
         listeners.insert(port, TcpListenerStream::new(listener));
     }
