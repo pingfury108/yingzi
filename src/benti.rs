@@ -1,6 +1,5 @@
 use anyhow::Result;
 use clap::Parser;
-use env_logger;
 use std::net::Ipv4Addr;
 use tokio::net::{TcpListener, TcpStream};
 

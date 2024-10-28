@@ -1,9 +1,15 @@
+mod tls;
+
 use anyhow::Result;
 use clap::Parser;
-use env_logger;
-use std::net::Ipv4Addr;
+use std::{net::Ipv4Addr, path::Path};
 use tokio::net::{TcpListener, TcpStream};
 use tokio_stream::{wrappers::TcpListenerStream, StreamExt, StreamMap};
+
+use std::io;
+use std::sync::Arc;
+use tls::{load_certs, load_keys};
+use tokio_rustls::{rustls, TlsAcceptor};
 
 /// yingzi is a tcp/udp data copy tool
 #[derive(Parser, Debug)]
@@ -17,6 +23,12 @@ struct Args {
 
     #[arg(short, long, default_value_t = 9120)]
     end_port: u16,
+
+    #[arg(short, long)]
+    cret: String,
+
+    #[arg(short, long)]
+    key: String,
 }
 
 #[tokio::main]
@@ -24,6 +36,18 @@ async fn main() -> Result<()> {
     env_logger::init();
     let args = Args::parse();
     let ports: Vec<u16> = (args.start_port..=args.end_port).collect();
+
+    // tls
+
+    let certs = load_certs(Path::new(args.cret.as_str()))?;
+    let key = load_keys(Path::new(args.key.as_str()))?;
+
+    let config = rustls::ServerConfig::builder()
+        .with_no_client_auth()
+        .with_single_cert(certs, key)
+        .map_err(|err| io::Error::new(io::ErrorKind::InvalidInput, err))?;
+    let acceptor = TlsAcceptor::from(Arc::new(config));
+
     let mut listeners = StreamMap::new();
     // 添加要监听的端口
     for port in ports {
@@ -34,12 +58,16 @@ async fn main() -> Result<()> {
 
     while let Some((_, mut listener)) = listeners.next().await {
         let target_addr = args.target_addr.clone(); // 克隆目标地址，以便在异步块中使用
+        let acceptor = acceptor.clone();
         tokio::spawn(async move {
             while let Ok(ref mut inbound) = listener {
                 log::info!("target_addr: {target_addr}");
+                let stream = acceptor.accept(inbound).await.expect("");
+                let (socket, _) = stream.into_inner();
+
                 let mut outbound = TcpStream::connect(target_addr.clone()).await.unwrap();
 
-                let (mut ri, mut wi) = inbound.split();
+                let (mut ri, mut wi) = socket.split();
                 let (mut ro, mut wo) = outbound.split();
 
                 let client_to_server = tokio::io::copy(&mut ri, &mut wo);
