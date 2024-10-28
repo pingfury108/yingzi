@@ -10,3 +10,7 @@ env_logger = "0.11.5"
 log = "0.4.22"
 tokio = { version = "1.41.0", features = ["full"] }
 tokio-stream = { version = "0.1.16", features = ["net"] }
+
+[[bin]]
+name = "benti"
+path = "src/benti.rs"
