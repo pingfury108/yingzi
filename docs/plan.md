@@ -185,16 +185,20 @@ port_range = "8000-9000"
 - 页面：节点拓扑卡片（在线/延迟/角色）、出口下拉选择、入口发布管理、规则表、实时日志条
 - 现状：P4 已实现 status/nodes/exit/routes API + 单页控制台(2s 轮询); WS 实时推送、延迟展示、入口发布管理待后续
 
-## 7. 隐匿层（P5）
+## 7. 隐匿层（P5，进行中）
 
 | 模式 | 外观 | 用途 |
 |---|---|---|
-| 噪声模式（默认） | 全流随机噪声，无结构无指纹 | 一般环境 |
-| 模仿模式 | 套 HTTP/2 / WSS 帧皮，挂真实域名，可过 CDN | 严格环境/UDP被QoS |
+| 噪声模式（默认）✔ | 全流随机噪声，无结构无指纹 | 一般环境 |
+| 模仿模式（待做） | 套 HTTP/2 / WSS 帧皮，挂真实域名，可过 CDN | 严格环境/UDP被QoS |
 
-- 长度混淆：随机 padding，包长分布可配置（模仿视频流）
-- 时序整形：burst 聚合 + 随机微延迟
-- fallback：未通过握手的连接转发到本机真实站点，探测者看到正常网站
+已实现（P5a）：
+- **握手尺寸随机化**：`rand_pad || core`，TCP 侧加 NS 掩码长度——消除 116/124 固定长度指纹
+- **UDP 尺寸桶填充**：加密层内填充到 {64,160,320,640,1024,1380}+抖动，ACK/小包无尺寸特征
+- **fallback 站点**：TCP 握手失败的连接原样转发到真实站点（`--fallback host:port`），主动探测者看到正常 HTTP 服务
+- 未认证连接静默丢弃；无任何错误回显
+
+待做（P5b）：WSS 模仿模式（TLS+真实证书+CDN）、时序整形（burst 聚合+微延迟）、连接轮换
 
 ## 8. NAT 打洞（yz-rudp Endpoint，P2b ✔）
 
@@ -212,12 +216,8 @@ yingzi/
 ├── crates/
 │   ├── yz-proto/          # 帧编解码 (§3.4)            [P0 ✔]
 │   ├── yz-crypto/         # NS/身份/握手/会话 (§3.1-3.3) [P0 ✔]
-│   ├── yz-node/           # 节点二进制 (dial/serve)      [P0 ✔]
-│   ├── yz-rudp/           # UDP 可靠传输 (P2a ✔)                       │
-│   ├── yz-nat/            # 打洞                          [P2]
-│   ├── yz-mesh/           # 目录同步/路由/虚拟IP          [P1/P6]
-│   ├── yz-policy/         # 出口策略 + 入口发布 + ACL           [P3]
-│   └── yz-web/            # Web UI                      [P4]
+│   ├── yz-node/           # 节点二进制 (tunnel/coord/policy/socks5/ingress/web/mesh) │
+│   └── yz-rudp/           # UDP 可靠传输 + 探测/打洞 (P2 ✔)               │
 └── (legacy) src/ yingzi+benti  旧玩具, 仅供对照, 不再演进
 ```
 
@@ -231,9 +231,11 @@ yingzi/
 | **P2b** NAT 打洞 ✔ | probe(双端口判定 cone/对称) + PUNCH_REQ/START 撮合 + 散射 + P2P UDP 直连, TCP 兜底 | 节点间无 TCP 连接的纯 UDP 代理成功 |
 | **P3** 出口/入口体系 ✔ | exit + 策略路由 + ACL + SOCKS5 入口 + ingress 静态/动态端口发布 | 任选节点出流量/公网反代组网服务 |
 | **P4** Web UI ✔(轮询版) | yz-web: status/nodes/exit/routes API + 内嵌单页控制台 | 浏览器可看全网节点、切换出口、增删规则 |
-| **P5** 隐匿增强 | 噪声/模仿双模式、fallback、时序整形 | 抓包无结构可识别 |
-| **P6** 全局组网 | TUN 接管 + 虚拟 IP + subnet 路由 | 设备互 ping 虚拟 IP |
-| **P7** 强健化 | rekey、连接迁移、拥塞控制优化、管理 CLI | 长期真实环境运行 |
+| **P5a** 噪声强化 ✔ | 握手尺寸随机化 + UDP 尺寸桶填充 + fallback 伪装站点 | 探针看到真实 HTTP 服务 |
+| **P5b** WSS 模仿 ✔ | 真实 TLS + RFC6455 承载 YZP, 可挂 CDN | TLS 观察者看到真实证书, 隧道 200 |
+| **P6** 全局组网 ✔ | TUN + 确定性虚拟IP(100.64.0.0/10 | node_id低22位) + Mesh帧路由(自动P2P) | 设备互 ping 虚拟 IP (需root, 降级已验证) |
+| **P7** 强健化(进行中) | 中继兜底 ✔(嵌套YZP隧道, coordinator零明文) | 对称NAT/直连失败仍可达 |
+| P7 剩余 | rekey、RTT 测量驱动的 RTO/拥塞、ingress ack 关联、多 coordinator | 长期真实环境运行 |
 
 ## 11. 安全假设
 

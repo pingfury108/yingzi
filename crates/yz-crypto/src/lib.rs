@@ -493,6 +493,60 @@ fn now_secs() -> u64 {
         .as_secs()
 }
 
+/// 密码学安全随机字节
+pub fn random_bytes(n: usize) -> Vec<u8> {
+    let mut v = vec![0u8; n];
+    SystemRandom::new().fill(&mut v).expect("rng");
+    v
+}
+
+/// SHA1 (仅用于 WebSocket 协议要求的 accept 密钥)
+pub fn sha1(data: &[u8]) -> [u8; 20] {
+    digest::digest(&digest::SHA1_FOR_LEGACY_USE_ONLY, data)
+        .as_ref()
+        .try_into()
+        .expect("sha1 is 20 bytes")
+}
+
+// ---------- 握手线格式 (抗指纹: 长度随机化) ----------
+
+const HS_PAD_MIN: usize = 32;
+const HS_PAD_MAX: usize = 160; // 不含
+/// UDP 侧握手报文最大长度
+pub const HS_WIRE_MAX: usize = HS_PAD_MAX + MSG2_LEN + 16;
+
+/// 通用包装 (UDP): rand_pad || core —— 消除固定尺寸特征, 对端取尾部 core_len
+pub fn wrap_hs(core: &[u8]) -> Vec<u8> {
+    let pad_len = HS_PAD_MIN + random_bytes(1)[0] as usize % (HS_PAD_MAX - HS_PAD_MIN);
+    let mut out = random_bytes(pad_len);
+    out.extend_from_slice(core);
+    out
+}
+
+/// TCP 长度掩码: NS 派生, 只有网络成员能解出报文边界
+pub fn hs_len_mask(ns: &NetworkSecret) -> Result<u16> {
+    let prk = hkdf::Salt::new(HKDF_SHA256, b"yz-hs-len-v1").extract(&ns.0);
+    let okm = prk.expand(&[b"m"], OkmLen(2))?;
+    let mut b = [0u8; 2];
+    okm.fill(&mut b)?;
+    Ok(u16::from_be_bytes(b))
+}
+
+/// TCP 包装: masked_len(2) | rand_pad | core
+pub fn wrap_hs_stream(ns: &NetworkSecret, core: &[u8]) -> Result<Vec<u8>> {
+    let body = wrap_hs(core);
+    let masked = (body.len() as u16) ^ hs_len_mask(ns)?;
+    let mut out = Vec::with_capacity(2 + body.len());
+    out.extend_from_slice(&masked.to_be_bytes());
+    out.extend_from_slice(&body);
+    Ok(out)
+}
+
+/// TCP 读侧: masked -> body 长度
+pub fn unwrap_hs_len(ns: &NetworkSecret, masked: u16) -> Result<usize> {
+    Ok((masked ^ hs_len_mask(ns)?) as usize)
+}
+
 // ---------- hex ----------
 
 pub fn to_hex(b: &[u8]) -> String {
@@ -615,6 +669,27 @@ mod tests {
         let masked = u16::from_be_bytes([pkt[0], pkt[1]]);
         let mut ct = pkt[2..].to_vec();
         assert!(matches!(sess_r.open(masked, &mut ct), Err(Error::Auth)));
+    }
+
+    #[test]
+    fn hs_wrap_randomized() {
+        let (ns, _, _) = pair();
+        let core = [7u8; MSG1_LEN];
+        let a = wrap_hs_stream(&ns, &core).unwrap();
+        let b = wrap_hs_stream(&ns, &core).unwrap();
+        // 同一 core 两次包装, 线格式不同且长度随机
+        assert_ne!(a, b);
+        let masked_a = u16::from_be_bytes([a[0], a[1]]);
+        let masked_b = u16::from_be_bytes([b[0], b[1]]);
+        let la = unwrap_hs_len(&ns, masked_a).unwrap();
+        let lb = unwrap_hs_len(&ns, masked_b).unwrap();
+        assert_eq!(la, a.len() - 2);
+        assert_eq!(lb, b.len() - 2);
+        // core 在尾部
+        assert_eq!(&a[a.len() - MSG1_LEN..], &core);
+        // 非成员解出的长度无意义
+        let ns_bad = NetworkSecret::generate();
+        assert_ne!(unwrap_hs_len(&ns_bad, masked_a).unwrap(), la);
     }
 
     #[test]

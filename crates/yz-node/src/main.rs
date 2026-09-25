@@ -10,11 +10,13 @@
 mod coord;
 mod dial;
 mod ingress;
+mod mesh;
 mod node;
 mod policy;
 mod socks5;
 mod tunnel;
 mod web;
+mod wss;
 
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
@@ -45,6 +47,9 @@ enum Cmd {
     Coord {
         #[arg(long, default_value = "0.0.0.0:9000")]
         bind: String,
+        /// 握手失败连接的伪装转发目标, 如 127.0.0.1:443
+        #[arg(long)]
+        fallback: Option<String>,
     },
     /// 对等节点
     Node {
@@ -83,6 +88,12 @@ enum Cmd {
         /// 我当出口的 ACL: all | none | node_id列表(逗号分隔, 支持前缀)
         #[arg(long, default_value = "none")]
         exit_allow: String,
+        /// 握手失败连接的伪装转发目标, 如 127.0.0.1:443
+        #[arg(long)]
+        fallback: Option<String>,
+        /// TUN 网卡名, 启用虚拟组网 (需 root/CAP_NET_ADMIN)
+        #[arg(long)]
+        tun: Option<String>,
     },
     /// 独立隧道出口(无 mesh)
     Serve {
@@ -91,6 +102,15 @@ enum Cmd {
         /// 使用 UDP 可靠传输而非 TCP
         #[arg(long)]
         udp: bool,
+        /// 握手失败连接的伪装转发目标, 如 127.0.0.1:443
+        #[arg(long)]
+        fallback: Option<String>,
+        /// WSS 模仿模式: TLS 证书 PEM (需与 --wss-key 同时给)
+        #[arg(long)]
+        wss_cert: Option<String>,
+        /// WSS 模仿模式: TLS 私钥 PEM
+        #[arg(long)]
+        wss_key: Option<String>,
     },
     /// 本地入口: 流量经隧道从 peer 出去
     Dial {
@@ -104,6 +124,12 @@ enum Cmd {
         /// 使用 UDP 可靠传输而非 TCP
         #[arg(long)]
         udp: bool,
+        /// WSS 模仿模式: SNI 域名 (挂 CDN 时用 CDN 域名)
+        #[arg(long)]
+        wss_sni: Option<String>,
+        /// WSS 跳过证书校验 (自签测试用)
+        #[arg(long)]
+        wss_insecure: bool,
     },
 }
 
@@ -129,7 +155,7 @@ async fn main() -> Result<()> {
 
     match cli.cmd {
         Cmd::Keygen => unreachable!(),
-        Cmd::Coord { bind } => coord::run(&bind, &ns, id_pub).await,
+        Cmd::Coord { bind, fallback } => coord::run(&bind, &ns, id_pub, fallback).await,
         Cmd::Node {
             bind,
             coordinator,
@@ -143,6 +169,8 @@ async fn main() -> Result<()> {
             routes,
             default_exit,
             exit_allow,
+            fallback,
+            tun,
         } => {
             let routes = routes
                 .iter()
@@ -169,19 +197,39 @@ async fn main() -> Result<()> {
                     default_exit,
                     routes,
                     exit_acl: policy::ExitAcl::parse(&exit_allow),
+                    fallback,
+                    tun,
                 },
                 &ns,
                 id_pub,
             )
             .await
         }
-        Cmd::Serve { bind, udp } => node::serve(&bind, &ns, id_pub, udp).await,
+        Cmd::Serve {
+            bind,
+            udp,
+            fallback,
+            wss_cert,
+            wss_key,
+        } => {
+            let wss = match (wss_cert, wss_key) {
+                (Some(c), Some(k)) => Some((c, k)),
+                (None, None) => None,
+                _ => anyhow::bail!("--wss-cert 与 --wss-key 需同时提供"),
+            };
+            node::serve(&bind, &ns, id_pub, udp, fallback, wss).await
+        }
         Cmd::Dial {
             peer,
             listen,
             target,
             udp,
-        } => dial::run(&peer, &listen, parse_addr(&target)?, &ns, id_pub, udp).await,
+            wss_sni,
+            wss_insecure,
+        } => {
+            let wss = wss_sni.map(|s| (s, wss_insecure));
+            dial::run(&peer, &listen, parse_addr(&target)?, &ns, id_pub, udp, wss).await
+        }
     }
 }
 

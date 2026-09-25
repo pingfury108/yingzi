@@ -22,7 +22,7 @@ struct NodeRec {
 
 type Registry = Arc<Mutex<HashMap<String, NodeRec>>>;
 
-pub async fn run(bind: &str, ns: &NetworkSecret, id_pub: [u8; 32]) -> Result<()> {
+pub async fn run(bind: &str, ns: &NetworkSecret, id_pub: [u8; 32], fallback: Option<String>) -> Result<()> {
     let listener = TcpListener::bind(bind).await?;
     log::info!("coordinator on {bind}, node_id = {}", yz_crypto::node_id(&id_pub));
 
@@ -45,8 +45,9 @@ pub async fn run(bind: &str, ns: &NetworkSecret, id_pub: [u8; 32]) -> Result<()>
         let (stream, from) = listener.accept().await?;
         let registry = registry.clone();
         let ns = ns.clone();
+        let fallback = fallback.clone();
         tokio::spawn(async move {
-            if let Err(e) = handle(stream, from.to_string(), &ns, &id_pub, registry).await {
+            if let Err(e) = handle(stream, from.to_string(), &ns, &id_pub, registry, fallback).await {
                 log::debug!("node conn from {from} closed: {e:#}");
             }
         });
@@ -59,8 +60,11 @@ async fn handle(
     ns: &NetworkSecret,
     id_pub: &[u8; 32],
     registry: Registry,
+    fallback: Option<String>,
 ) -> Result<()> {
-    let mut h = tunnel::accept(stream, ns, id_pub).await?;
+    let Some(mut h) = tunnel::accept(stream, ns, id_pub, fallback.as_deref()).await? else {
+        return Ok(()); // 探针已转发 fallback
+    };
     let nid = h.peer.node_id();
 
     // 首条控制消息必须是 HELLO
@@ -100,6 +104,24 @@ async fn handle(
         },
     );
     broadcast(&registry).await;
+
+    // 中继数据面: SYN Domain(node_id, 0) = 请求中继到目标节点
+    {
+        let registry = registry.clone();
+        let t = h.tunnel.clone();
+        let mut accept_rx = h.accept_rx;
+        tokio::spawn(async move {
+            while let Some(crate::tunnel::Incoming { sid, addr, rx }) = accept_rx.recv().await {
+                let registry = registry.clone();
+                let t = t.clone();
+                tokio::spawn(async move {
+                    if let Err(e) = relay_stream(registry, t, sid, addr, rx).await {
+                        log::debug!("relay: {e:#}");
+                    }
+                });
+            }
+        });
+    }
 
     loop {
         tokio::select! {
@@ -180,6 +202,61 @@ async fn route_punch(registry: &Registry, from_id: &str, target: &str) {
     let _ = t_from.write_frame(&Frame::Control { payload: to_req }).await;
     let _ = t_target.write_frame(&Frame::Control { payload: to_tgt }).await;
     log::debug!("punch撮合 {} <-> {}", &from_id[..8], &target[..8]);
+}
+
+/// 中继转发: 在 A 的流与目标节点的流之间对泵 (端口 0 的 SYN 视为中继请求)
+async fn relay_stream(
+    registry: Registry,
+    coord_t: Arc<Tunnel>,
+    sid: u32,
+    addr: yz_proto::Addr,
+    rx: tokio::sync::mpsc::Receiver<Frame>,
+) -> Result<()> {
+    let yz_proto::Addr::Domain(target, 0) = &addr else {
+        bail!("coord stream: only relay (port 0)");
+    };
+    let target_t = {
+        let reg = registry.lock().await;
+        reg.get(target).map(|r| r.tunnel.clone()).or_else(|| {
+            reg.values()
+                .find(|r| r.name == *target)
+                .map(|r| r.tunnel.clone())
+        })
+    };
+    let Some(target_t) = target_t else {
+        let _ = coord_t
+            .write_frame(&Frame::SynAck {
+                stream_id: sid,
+                ok: false,
+            })
+            .await;
+        bail!("relay target {target} offline");
+    };
+    // 向目标开中继端点流
+    let (sid_b, mut rx_b) = target_t
+        .open_stream(yz_proto::Addr::Domain(crate::tunnel::RELAY_MARK.into(), 0))
+        .await?;
+    match timeout(Duration::from_secs(10), rx_b.recv()).await? {
+        Some(Frame::SynAck { ok: true, .. }) => {}
+        _ => {
+            let _ = coord_t
+                .write_frame(&Frame::SynAck {
+                    stream_id: sid,
+                    ok: false,
+                })
+                .await;
+            bail!("relay target refused");
+        }
+    }
+    coord_t
+        .write_frame(&Frame::SynAck {
+            stream_id: sid,
+            ok: true,
+        })
+        .await?;
+    log::debug!("relay stream {sid} -> {target}");
+    crate::tunnel::pipe_streams(coord_t, sid, rx, target_t, sid_b, rx_b).await;
+    Ok(())
 }
 
 /// advertise 主机为 0.0.0.0/空 时, 用观察到的源 IP 替代

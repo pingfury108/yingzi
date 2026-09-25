@@ -19,8 +19,8 @@ use tokio::net::UdpSocket;
 use tokio::sync::{mpsc, watch, Mutex, Notify};
 use tokio::time::timeout;
 use yz_crypto::{
-    handshake_accept, handshake_finish, handshake_init, DgramSession, NetworkSecret, PeerInfo,
-    Role, StaticKey, MSG1_LEN, MSG2_LEN,
+    handshake_accept, handshake_finish, handshake_init, wrap_hs, DgramSession, NetworkSecret,
+    PeerInfo, Role, StaticKey, HS_WIRE_MAX, MSG1_LEN, MSG2_LEN,
 };
 
 const T_DATA: u8 = 0x01;
@@ -115,13 +115,15 @@ impl Endpoint {
         mut rx: mpsc::Receiver<Vec<u8>>,
     ) -> Result<(Rudp, PeerInfo)> {
         let (msg1, st) = handshake_init(ns, id_pub)?;
+        let wire1 = wrap_hs(&msg1); // 随机填充, 消除固定尺寸
         let mut st = Some(st);
         let mut wait = Duration::from_millis(600);
         for _ in 0..4 {
-            self.inner.sock.send_to(&msg1, peer).await?;
+            self.inner.sock.send_to(&wire1, peer).await?;
             match timeout(wait, rx.recv()).await {
-                Ok(Some(d)) if d.len() == MSG2_LEN => {
-                    let (keys, peer_info) = handshake_finish(ns, st.take().unwrap(), &d)?;
+                Ok(Some(d)) if (MSG2_LEN..=HS_WIRE_MAX).contains(&d.len()) => {
+                    let (keys, peer_info) =
+                        handshake_finish(ns, st.take().unwrap(), &d[d.len() - MSG2_LEN..])?;
                     let sess = DgramSession::from_keys(&keys, Role::Initiator);
                     let rudp = Rudp::new(
                         self.inner.sock.clone(),
@@ -229,14 +231,16 @@ async fn demux_loop(
                 }
             }
         }
-        // 新隧道握手: 非法 msg1 静默丢弃 (抗探测)
-        if dgram.len() != MSG1_LEN {
+        // 新隧道握手: 随机填充包装, 取尾部 core; 非法则静默丢弃 (抗探测)
+        if !(MSG1_LEN..=HS_WIRE_MAX).contains(&dgram.len()) {
             continue;
         }
-        let Ok((msg2, keys, peer_info)) = handshake_accept(&ns, &id_pub, &dgram) else {
+        let core = &dgram[dgram.len() - MSG1_LEN..];
+        let Ok((msg2_core, keys, peer_info)) = handshake_accept(&ns, &id_pub, core) else {
             continue;
         };
-        if inner.sock.send_to(&msg2, from).await.is_err() {
+        let wire2 = wrap_hs(&msg2_core);
+        if inner.sock.send_to(&wire2, from).await.is_err() {
             continue;
         }
         let (tx, rx) = mpsc::channel(CHAN_CAP);
@@ -266,6 +270,36 @@ pub fn spawn_probe_responder(sock: UdpSocket, key: StaticKey) {
             }
         }
     });
+}
+
+// ---------- 尺寸桶填充 (隐匿: 加密内填充, 观察者只见随机长度的随机报文) ----------
+
+/// type | padlen(1) | body | rand_pad —— 填充到尺寸桶+抖动
+fn pad_inner(inner: &[u8]) -> Vec<u8> {
+    const BUCKETS: [usize; 6] = [64, 160, 320, 640, 1024, 1380];
+    let base = inner.len() + 1;
+    let bucket = BUCKETS.iter().copied().find(|b| *b >= base).unwrap_or(base);
+    let jitter = yz_crypto::random_bytes(1)[0] as usize % 33;
+    let target = (bucket + jitter).min(1380);
+    let pad = target.saturating_sub(base).min(255);
+    let mut out = Vec::with_capacity(base + pad);
+    out.push(inner[0]);
+    out.push(pad as u8);
+    out.extend_from_slice(&inner[1..]);
+    out.extend_from_slice(&yz_crypto::random_bytes(pad));
+    out
+}
+
+/// pad_inner 的逆: 返回 (type, body)
+fn unpad(pkt: &[u8]) -> Option<(u8, &[u8])> {
+    if pkt.len() < 2 {
+        return None;
+    }
+    let pad = pkt[1] as usize;
+    if pkt.len() < 2 + pad {
+        return None;
+    }
+    Some((pkt[0], &pkt[2..pkt.len() - pad]))
 }
 
 // ---------- Rudp ----------
@@ -359,7 +393,7 @@ impl Rudp {
                         pkt.push(T_DATA);
                         pkt.extend_from_slice(&seq.to_be_bytes());
                         pkt.extend_from_slice(chunk);
-                        let ct = self.inner.sess.seal(&pkt)?;
+                        let ct = self.inner.sess.seal(&pad_inner(&pkt))?;
                         self.inner.sock.send_to(&ct, self.inner.peer).await?;
                         st.unacked.insert(
                             seq,
@@ -408,7 +442,7 @@ async fn rx_loop(inner: Arc<Inner>, mut c: mpsc::Receiver<Vec<u8>>, peers: Optio
         let Ok(pkt) = inner.sess.open(&dgram) else {
             continue; // 解密失败静默丢弃
         };
-        let Some((&t, body)) = pkt.split_first() else {
+        let Some((t, body)) = unpad(&pkt) else {
             continue;
         };
         match t {
@@ -474,7 +508,7 @@ async fn send_ack(inner: &Inner, cum: u32, pending: &BTreeMap<u32, Vec<u8>>) {
     pkt.push(T_ACK);
     pkt.extend_from_slice(&cum.to_be_bytes());
     pkt.extend_from_slice(&sack.to_be_bytes());
-    if let Ok(ct) = inner.sess.seal(&pkt) {
+    if let Ok(ct) = inner.sess.seal(&pad_inner(&pkt)) {
         let _ = inner.sock.send_to(&ct, inner.peer).await;
     }
 }
@@ -558,7 +592,7 @@ async fn do_close(inner: &Inner, send_fin: bool) {
         return;
     }
     if send_fin {
-        if let Ok(ct) = inner.sess.seal(&[T_FIN]) {
+        if let Ok(ct) = inner.sess.seal(&pad_inner(&[T_FIN])) {
             let _ = inner.sock.send_to(&ct, inner.peer).await;
         }
     }

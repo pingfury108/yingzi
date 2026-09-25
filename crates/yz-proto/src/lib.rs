@@ -66,6 +66,8 @@ pub enum Frame {
     WindowUpdate { stream_id: u32, delta: u32 },
     /// stream 0 控制消息（plan.md §3.5）
     Control { payload: Vec<u8> },
+    /// 组网 IP 包 (P6, 无流语义)
+    Mesh { payload: Vec<u8> },
     Ping { ts: u64 },
     Pong { ts: u64 },
 }
@@ -77,6 +79,7 @@ const T_FIN: u8 = 0x04;
 const T_RST: u8 = 0x05;
 const T_WIN: u8 = 0x06;
 const T_CTRL: u8 = 0x10;
+const T_MESH: u8 = 0x20;
 const T_PING: u8 = 0x11;
 const T_PONG: u8 = 0x12;
 
@@ -91,6 +94,7 @@ impl Frame {
             | Frame::Rst { stream_id }
             | Frame::WindowUpdate { stream_id, .. } => *stream_id,
             Frame::Control { .. } | Frame::Ping { .. } | Frame::Pong { .. } => 0,
+            Frame::Mesh { .. } => 0,
         }
     }
 }
@@ -151,6 +155,10 @@ pub fn encode(f: &Frame) -> Vec<u8> {
         }
         Frame::Control { payload } => {
             out.push(T_CTRL);
+            out.extend_from_slice(payload);
+        }
+        Frame::Mesh { payload } => {
+            out.push(T_MESH);
             out.extend_from_slice(payload);
         }
         Frame::Ping { ts } => {
@@ -222,6 +230,9 @@ pub fn decode(buf: &[u8]) -> Result<Frame, DecodeError> {
             }
         }
         T_CTRL => Frame::Control {
+            payload: b.to_vec(),
+        },
+        T_MESH => Frame::Mesh {
             payload: b.to_vec(),
         },
         T_PING => {
@@ -587,6 +598,9 @@ mod tests {
         });
         roundtrip(Frame::Control {
             payload: vec![0x02, 1, 2, 3],
+        });
+        roundtrip(Frame::Mesh {
+            payload: vec![0x45, 0, 0, 20, 1, 2, 3],
         });
         roundtrip(Frame::Ping { ts: 1_700_000_000 });
         roundtrip(Frame::Pong { ts: 1_700_000_001 });

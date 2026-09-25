@@ -43,6 +43,9 @@ struct NodeResp {
     node_id: String,
     name: String,
     addr: String,
+    /// 确定性虚拟 IP (100.64.0.0/10)
+    vip: String,
+    p2p: bool,
     exit_capable: bool,
     is_self: bool,
 }
@@ -103,6 +106,8 @@ async fn nodes(State(app): State<Arc<AppState>>) -> Json<Vec<NodeResp>> {
             node_id: n.node_id.clone(),
             name: n.name.clone(),
             addr: n.addr.clone(),
+            vip: crate::mesh::vip_of(&n.node_id).to_string(),
+            p2p: !n.udp_addr.is_empty(),
             exit_capable: n.caps & caps::EXIT != 0,
             is_self: n.node_id == app.info.node_id,
         })
