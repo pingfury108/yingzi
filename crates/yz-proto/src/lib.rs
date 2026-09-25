@@ -7,7 +7,7 @@ use std::fmt;
 /// 单帧明文上限（加密后 +16B tag）
 pub const MAX_FRAME_LEN: usize = 18 * 1024;
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum Addr {
     V4([u8; 4], u16),
     V6([u8; 16], u16),
@@ -54,10 +54,20 @@ impl Addr {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StreamKind {
+    Tcp,
+    Udp,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Frame {
-    /// 开流并指定目标地址
-    Syn { stream_id: u32, addr: Addr },
+    /// 开流并指定目标地址 (kind 决定 TCP 转发还是 UDP 中继)
+    Syn {
+        stream_id: u32,
+        kind: StreamKind,
+        addr: Addr,
+    },
     SynAck { stream_id: u32, ok: bool },
     Data { stream_id: u32, payload: Vec<u8> },
     /// 半关闭
@@ -104,6 +114,7 @@ pub enum DecodeError {
     Truncated,
     UnknownType(u8),
     BadAddrType(u8),
+    BadStreamKind,
     BadUtf8,
     Trailing,
 }
@@ -114,6 +125,7 @@ impl fmt::Display for DecodeError {
             DecodeError::Truncated => write!(f, "truncated frame"),
             DecodeError::UnknownType(t) => write!(f, "unknown frame type {t:#04x}"),
             DecodeError::BadAddrType(t) => write!(f, "unknown addr type {t:#04x}"),
+            DecodeError::BadStreamKind => write!(f, "unknown stream kind"),
             DecodeError::BadUtf8 => write!(f, "invalid utf8 in domain"),
             DecodeError::Trailing => write!(f, "trailing bytes after frame"),
         }
@@ -122,12 +134,23 @@ impl fmt::Display for DecodeError {
 
 impl std::error::Error for DecodeError {}
 
+fn kind_of(f: &Frame) -> StreamKind {
+    match f {
+        Frame::Syn { kind, .. } => *kind,
+        _ => StreamKind::Tcp,
+    }
+}
+
 pub fn encode(f: &Frame) -> Vec<u8> {
     let mut out = Vec::with_capacity(32);
     match f {
-        Frame::Syn { stream_id, addr } => {
+        Frame::Syn { stream_id, addr, .. } => {
             out.push(T_SYN);
             out.extend_from_slice(&stream_id.to_be_bytes());
+            out.push(match kind_of(f) {
+                StreamKind::Tcp => 0x00,
+                StreamKind::Udp => 0x01,
+            });
             encode_addr(addr, &mut out);
         }
         Frame::SynAck { stream_id, ok } => {
@@ -180,11 +203,21 @@ pub fn decode(buf: &[u8]) -> Result<Frame, DecodeError> {
     let frame = match t {
         T_SYN => {
             let (stream_id, rest) = take_u32(b)?;
-            let (addr, n) = decode_addr(rest)?;
-            if n != rest.len() {
+            let kind = match rest.first() {
+                Some(0) => StreamKind::Tcp,
+                Some(1) => StreamKind::Udp,
+                Some(_) => return Err(DecodeError::BadStreamKind),
+                None => return Err(DecodeError::Truncated),
+            };
+            let (addr, n) = decode_addr(&rest[1..])?;
+            if n != rest.len() - 1 {
                 return Err(DecodeError::Trailing);
             }
-            Frame::Syn { stream_id, addr }
+            Frame::Syn {
+                stream_id,
+                kind,
+                addr,
+            }
         }
         T_SYN_ACK => {
             let (stream_id, rest) = take_u32(b)?;
@@ -568,14 +601,22 @@ mod tests {
     fn frame_roundtrip() {
         roundtrip(Frame::Syn {
             stream_id: 1,
+            kind: StreamKind::Tcp,
             addr: Addr::V4([127, 0, 0, 1], 8080),
         });
         roundtrip(Frame::Syn {
+            stream_id: 3,
+            kind: StreamKind::Udp,
+            addr: Addr::V4([127, 0, 0, 1], 53),
+        });
+        roundtrip(Frame::Syn {
             stream_id: 7,
+            kind: StreamKind::Tcp,
             addr: Addr::Domain("example.com".into(), 443),
         });
         roundtrip(Frame::Syn {
             stream_id: 9,
+            kind: StreamKind::Tcp,
             addr: Addr::V6([0x20, 1, 0xd, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1], 22),
         });
         roundtrip(Frame::SynAck {

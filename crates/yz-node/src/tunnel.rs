@@ -24,6 +24,7 @@ const CHAN_CAP: usize = 64;
 
 pub struct Incoming {
     pub sid: u32,
+    pub kind: yz_proto::StreamKind,
     pub addr: Addr,
     pub rx: mpsc::Receiver<Frame>,
 }
@@ -107,14 +108,24 @@ impl Tunnel {
         }
     }
 
-    /// 主动开流; rx 首帧应为 SYN_ACK
+    /// 主动开流 (默认 TCP 语义); rx 首帧应为 SYN_ACK
     pub async fn open_stream(&self, addr: Addr) -> Result<(u32, mpsc::Receiver<Frame>)> {
+        self.open_stream_kind(addr, yz_proto::StreamKind::Tcp).await
+    }
+
+    /// 主动开流, 指定 kind (Udp = 目标侧做数据报中继)
+    pub async fn open_stream_kind(
+        &self,
+        addr: Addr,
+        kind: yz_proto::StreamKind,
+    ) -> Result<(u32, mpsc::Receiver<Frame>)> {
         let sid = self.next_sid.fetch_add(2, Ordering::Relaxed);
         let (tx, rx) = mpsc::channel(CHAN_CAP);
         self.streams.lock().await.insert(sid, tx);
         if let Err(e) = self
             .write_frame(&Frame::Syn {
                 stream_id: sid,
+                kind,
                 addr,
             })
             .await
@@ -125,7 +136,7 @@ impl Tunnel {
         Ok((sid, rx))
     }
 
-    async fn close_stream(&self, sid: u32) {
+    pub(crate) async fn close_stream(&self, sid: u32) {
         self.streams.lock().await.remove(&sid);
     }
 
@@ -377,11 +388,16 @@ async fn dispatch(t: &Arc<Tunnel>, f: Frame) -> bool {
             let _ = t.mesh_tx.try_send(payload);
             true
         }
-        Frame::Syn { stream_id, addr } => {
+        Frame::Syn {
+            stream_id,
+            kind,
+            addr,
+        } => {
             let (tx, rx) = mpsc::channel(CHAN_CAP);
             t.streams.lock().await.insert(stream_id, tx);
             let inc = Incoming {
                 sid: stream_id,
+                kind,
                 addr,
                 rx,
             };
@@ -636,6 +652,64 @@ impl AsyncWrite for StreamIo {
         });
         std::task::Poll::Ready(Ok(()))
     }
+}
+
+/// UDP 流: 目标侧数据报中继 (一帧 = 一个数据报)
+pub async fn pump_udp_stream(
+    target: Addr,
+    sid: u32,
+    mut rx: mpsc::Receiver<Frame>,
+    t: Arc<Tunnel>,
+) -> Result<()> {
+    let bind = match target {
+        Addr::V6(..) => "[::]:0",
+        _ => "0.0.0.0:0",
+    };
+    let sock = Arc::new(UdpSocket::bind(bind).await?);
+    sock.connect(target.to_string()).await?;
+    log::debug!("udp stream {sid} up -> {target}");
+    t.write_frame(&Frame::SynAck {
+        stream_id: sid,
+        ok: true,
+    })
+    .await?;
+
+    let s2 = sock.clone();
+    let t2 = t.clone();
+    let down = tokio::spawn(async move {
+        let mut b = vec![0u8; 65535];
+        loop {
+            match sock.recv(&mut b).await {
+                Ok(n) => {
+                    if t2
+                        .write_frame(&Frame::Data {
+                            stream_id: sid,
+                            payload: b[..n].to_vec(),
+                        })
+                        .await
+                        .is_err()
+                    {
+                        break;
+                    }
+                }
+                Err(_) => break,
+            }
+        }
+    });
+    while let Some(f) = rx.recv().await {
+        match f {
+            Frame::Data { payload, .. } => {
+                if s2.send(&payload).await.is_err() {
+                    break;
+                }
+            }
+            Frame::Fin { .. } | Frame::Rst { .. } => break,
+            _ => {}
+        }
+    }
+    down.abort();
+    t.close_stream(sid).await;
+    Ok(())
 }
 
 /// 中继发起方: 在 coordinator 隧道上开流 (SYN=Domain(target,0)), 其上跑嵌套握手

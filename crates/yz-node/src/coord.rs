@@ -111,7 +111,7 @@ async fn handle(
         let t = h.tunnel.clone();
         let mut accept_rx = h.accept_rx;
         tokio::spawn(async move {
-            while let Some(crate::tunnel::Incoming { sid, addr, rx }) = accept_rx.recv().await {
+            while let Some(crate::tunnel::Incoming { sid, addr, rx, .. }) = accept_rx.recv().await {
                 let registry = registry.clone();
                 let t = t.clone();
                 tokio::spawn(async move {

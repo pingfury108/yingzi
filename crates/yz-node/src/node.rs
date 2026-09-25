@@ -14,13 +14,15 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{mpsc, oneshot, Mutex, RwLock};
 use tokio::time::timeout;
 use yz_crypto::NetworkSecret;
-use yz_proto::{caps, ControlMsg, Frame, NodeEntry};
+use tokio::io::AsyncReadExt;
+use yz_proto::{caps, Addr, ControlMsg, Frame, NodeEntry};
 
 pub struct NodeOpts {
     pub bind: String,
@@ -142,18 +144,32 @@ pub async fn run(opts: NodeOpts, ns: &NetworkSecret, id_pub: [u8; 32]) -> Result
         log::info!("p2p disabled by YZ_NO_P2P");
         None
     } else {
-        match tokio::net::UdpSocket::bind(&opts.bind).await {
-            Ok(s) => match yz_rudp::Endpoint::bind(s, ns, id_pub).await {
+        // 重启时旧进程可能未完全退出, 重试几次绑定
+        let mut bound = None;
+        for attempt in 0..5 {
+            match tokio::net::UdpSocket::bind(&opts.bind).await {
+                Ok(s) => {
+                    bound = Some(s);
+                    break;
+                }
+                Err(e) => {
+                    if attempt == 4 {
+                        log::warn!("udp bind {} 失败: {e} (P2P 不可用)", opts.bind);
+                    } else {
+                        tokio::time::sleep(Duration::from_millis(500 * (attempt + 1))).await;
+                    }
+                }
+            }
+        }
+        match bound {
+            Some(s) => match yz_rudp::Endpoint::bind(s, ns, id_pub).await {
                 Ok(ep) => Some(Arc::new(ep)),
                 Err(e) => {
                     log::warn!("udp endpoint: {e:#}");
                     None
                 }
             },
-            Err(e) => {
-                log::warn!("udp bind {}: {e}", opts.bind);
-                None
-            }
+            None => None,
         }
     };
     *state.udp_ep.write().await = udp_ep.clone();
@@ -458,7 +474,12 @@ async fn handle_socks5(
     self_id: &str,
 ) -> Result<()> {
     local.set_nodelay(true).ok();
-    let addr = socks5::handshake(&mut local).await?;
+    let addr = match socks5::handshake(&mut local).await? {
+        socks5::Request::Connect(a) => a,
+        socks5::Request::UdpAssociate => {
+            return udp_associate(local, state, ns, id_pub, self_id).await;
+        }
+    };
 
     let key = {
         let routes = state.routes.read().await;
@@ -509,8 +530,7 @@ async fn handle_socks5(
 }
 
 /// 解析 exit 配置为具体决策
-async fn resolve_exit(state: &Arc<NodeState>, exit: &str, self_id: &str) -> Exit {
-    match exit {
+async fn resolve_exit(state: &Arc<NodeState>, exit: &str, self_id: &str) -> Exit {    match exit {
         "direct" => Exit::Direct,
                 // auto: 选延迟最低的可出口节点 (未测得延迟的排最后)
                 "auto" => {
@@ -540,6 +560,205 @@ async fn resolve_exit(state: &Arc<NodeState>, exit: &str, self_id: &str) -> Exit
                     Exit::Direct
                 }
             }
+        }
+    }
+}
+
+// ---------- SOCKS5 UDP ASSOCIATE ----------
+
+/// 本地 UDP 中继: 解 SOCKS5 UDP 头 → 按策略走 direct 或 exit 节点的数据报通道
+async fn udp_associate(
+    mut tcp: TcpStream,
+    state: &Arc<NodeState>,
+    ns: &NetworkSecret,
+    id_pub: &[u8; 32],
+    self_id: &str,
+) -> Result<()> {
+    let sock = Arc::new(tokio::net::UdpSocket::bind("127.0.0.1:0").await?);
+    let relay = sock.local_addr()?;
+    socks5::reply_udp(&mut tcp, relay).await?;
+    log::debug!("udp associate relay {relay}");
+
+    // TCP 连接关闭 = 关联结束
+    let alive = Arc::new(AtomicBool::new(true));
+    {
+        let alive = alive.clone();
+        tokio::spawn(async move {
+            let mut b = [0u8; 64];
+            while let Ok(n) = tcp.read(&mut b).await {
+                if n == 0 {
+                    break;
+                }
+            }
+            alive.store(false, Ordering::Relaxed);
+        });
+    }
+
+    let client: Arc<Mutex<Option<SocketAddr>>> = Default::default();
+    let routes: Arc<Mutex<HashMap<Addr, mpsc::Sender<Vec<u8>>>>> = Default::default();
+    let mut buf = vec![0u8; 65536];
+    loop {
+        if !alive.load(Ordering::Relaxed) {
+            break;
+        }
+        let (n, from) = match sock.recv_from(&mut buf).await {
+            Ok(x) => x,
+            Err(_) => break,
+        };
+        {
+            let mut c = client.lock().await;
+            if c.is_none() {
+                *c = Some(from);
+                log::debug!("udp client {from}");
+            }
+            if *c != Some(from) {
+                continue;
+            }
+        }
+        let Some((target, off)) = socks5::parse_udp_header(&buf[..n]) else {
+            continue;
+        };
+        let data = buf[off..n].to_vec();
+        let existing = { routes.lock().await.get(&target).cloned() };
+        let tx = match existing {
+            Some(tx) => tx,
+            None => {
+                let tx = match open_udp_route(
+                    state,
+                    ns,
+                    id_pub,
+                    self_id,
+                    &target,
+                    sock.clone(),
+                    client.clone(),
+                )
+                .await
+                {
+                    Ok(tx) => tx,
+                    Err(e) => {
+                        log::debug!("udp route {target}: {e:#}");
+                        continue;
+                    }
+                };
+                routes.lock().await.insert(target.clone(), tx.clone());
+                tx
+            }
+        };
+        if tx.send(data).await.is_err() {
+            routes.lock().await.remove(&target);
+        }
+    }
+    Ok(())
+}
+
+/// 建一条到目标的 UDP 通道: direct 本地转发, 或经 exit 节点的隧道流
+async fn open_udp_route(
+    state: &Arc<NodeState>,
+    ns: &NetworkSecret,
+    id_pub: &[u8; 32],
+    self_id: &str,
+    target: &Addr,
+    client_sock: Arc<tokio::net::UdpSocket>,
+    client: Arc<Mutex<Option<SocketAddr>>>,
+) -> Result<mpsc::Sender<Vec<u8>>> {
+    let key = {
+        let routes = state.routes.read().await;
+        match match_route(&routes, target) {
+            Some(e) => e.to_string(),
+            None => state.default_exit.read().await.clone(),
+        }
+    };
+    log::debug!("udp route {target} key={key}");
+    match resolve_exit(state, &key, self_id).await {
+        Exit::Direct => {
+            log::debug!("udp route {target} -> direct");
+            let bind = match target {
+                Addr::V6(..) => "[::]:0",
+                _ => "0.0.0.0:0",
+            };
+            let out = Arc::new(tokio::net::UdpSocket::bind(bind).await?);
+            out.connect(target.to_string()).await?;
+            let (tx, mut rx) = mpsc::channel::<Vec<u8>>(256);
+            let out2 = out.clone();
+            let target = target.clone();
+            tokio::spawn(async move {
+                let o = out2.clone();
+                let down = tokio::spawn(async move {
+                    while let Some(d) = rx.recv().await {
+                        if o.send(&d).await.is_err() {
+                            break;
+                        }
+                    }
+                });
+                let mut b = vec![0u8; 65536];
+                loop {
+                    match out2.recv(&mut b).await {
+                        Ok(n) => {
+                            if let Some(c) = *client.lock().await {
+                                let pkt = socks5::build_udp_header(&target, &b[..n]);
+                                if client_sock.send_to(&pkt, c).await.is_err() {
+                                    break;
+                                }
+                            }
+                        }
+                        Err(_) => break,
+                    }
+                }
+                down.abort();
+            });
+            Ok(tx)
+        }
+        Exit::Via(node_id) => {
+            log::debug!("udp route {target} -> exit {}", &node_id[..8]);
+            let t = tunnel_for(state, ns, id_pub, &node_id).await?;
+            let (sid, mut rx) = t
+                .open_stream_kind(target.clone(), yz_proto::StreamKind::Udp)
+                .await?;
+            log::debug!("udp stream {sid} opened to exit");
+            match timeout(Duration::from_secs(10), rx.recv()).await? {
+                Some(Frame::SynAck { ok: true, .. }) => {
+                    log::debug!("udp stream {sid} ready");
+                }
+                Some(other) => bail!("exit {node_id} udp open rejected: {other:?}"),
+                None => bail!("exit {node_id} udp stream closed before ack"),
+            }
+            let (tx, mut out_rx) = mpsc::channel::<Vec<u8>>(256);
+            let t2 = t.clone();
+            let target = target.clone();
+            tokio::spawn(async move {
+                let t3 = t2.clone();
+                let down = tokio::spawn(async move {
+                    while let Some(d) = out_rx.recv().await {
+                        if t3
+                            .write_frame(&Frame::Data {
+                                stream_id: sid,
+                                payload: d,
+                            })
+                            .await
+                            .is_err()
+                        {
+                            break;
+                        }
+                    }
+                });
+                while let Some(f) = rx.recv().await {
+                    match f {
+                        Frame::Data { payload, .. } => {
+                            if let Some(c) = *client.lock().await {
+                                let pkt = socks5::build_udp_header(&target, &payload);
+                                if client_sock.send_to(&pkt, c).await.is_err() {
+                                    break;
+                                }
+                            }
+                        }
+                        Frame::Fin { .. } | Frame::Rst { .. } => break,
+                        _ => {}
+                    }
+                }
+                down.abort();
+                t2.close_stream(sid).await;
+            });
+            Ok(tx)
         }
     }
 }
@@ -937,7 +1156,17 @@ pub(crate) fn spawn_incoming_handler(
     relay_ok: bool,
 ) {
     tokio::spawn(async move {
-        while let Some(Incoming { sid, addr, rx }) = accept_rx.recv().await {
+        while let Some(Incoming { sid, kind, addr, rx }) = accept_rx.recv().await {
+            // UDP 流: 目标侧做数据报中继
+            if kind == yz_proto::StreamKind::Udp {
+                let t = t.clone();
+                tokio::spawn(async move {
+                    if let Err(e) = tunnel::pump_udp_stream(addr, sid, rx, t).await {
+                        log::debug!("udp stream {sid}: {e:#}");
+                    }
+                });
+                continue;
+            }
             // 中继端点
             if relay_ok && matches!(&addr, yz_proto::Addr::Domain(d, 0) if d == tunnel::RELAY_MARK)
             {
