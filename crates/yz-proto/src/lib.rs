@@ -34,6 +34,26 @@ impl fmt::Display for Addr {
     }
 }
 
+impl Addr {
+    /// "host:port" → Addr; host 为 IP 字面量时转 V4/V6, 否则 Domain
+    pub fn parse(s: &str) -> Result<Addr, String> {
+        let (host, port_s) = s
+            .rsplit_once(':')
+            .ok_or_else(|| format!("addr must be host:port: {s}"))?;
+        let port: u16 = port_s.parse().map_err(|_| format!("bad port: {s}"))?;
+        if let Ok(ip) = host.parse::<std::net::IpAddr>() {
+            return Ok(match ip {
+                std::net::IpAddr::V4(v4) => Addr::V4(v4.octets(), port),
+                std::net::IpAddr::V6(v6) => Addr::V6(v6.octets(), port),
+            });
+        }
+        if host.is_empty() || host.len() > 255 {
+            return Err(format!("bad host: {s}"));
+        }
+        Ok(Addr::Domain(host.to_string(), port))
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Frame {
     /// 开流并指定目标地址
@@ -293,27 +313,53 @@ fn decode_addr(b: &[u8]) -> Result<(Addr, usize), DecodeError> {
 pub struct NodeEntry {
     pub node_id: String,
     pub name: String,
+    /// 隧道监听地址 host:port (供其他节点直连)
     pub addr: String,
+    /// 能力位: caps::EXIT 等
+    pub caps: u8,
+}
+
+pub mod caps {
+    /// 允许被用作出口
+    pub const EXIT: u8 = 0x01;
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ControlMsg {
-    /// 节点上线注册
-    Hello { version: u16, name: String },
+    /// 节点上线注册, addr 为隧道监听地址
+    Hello {
+        version: u16,
+        name: String,
+        addr: String,
+        caps: u8,
+    },
     /// 节点目录全量同步 (coordinator → node)
     DirSync { nodes: Vec<NodeEntry> },
+    /// 动态入口发布请求 (node → 公网入口节点)
+    IngressPub { port: u16, addr: String },
+    /// 动态入口发布应答
+    IngressPubAck { port: u16, ok: bool, msg: String },
 }
 
 const C_HELLO: u8 = 0x01;
 const C_DIR_SYNC: u8 = 0x02;
+const C_INGRESS_PUB: u8 = 0x09;
+const C_INGRESS_PUB_ACK: u8 = 0x0a;
 
 pub fn encode_control(m: &ControlMsg) -> Vec<u8> {
     let mut out = Vec::with_capacity(32);
     match m {
-        ControlMsg::Hello { version, name } => {
+        ControlMsg::Hello {
+            version,
+            name,
+            addr,
+            caps,
+        } => {
             out.push(C_HELLO);
             out.extend_from_slice(&version.to_be_bytes());
             push_str(&mut out, name);
+            push_str(&mut out, addr);
+            out.push(*caps);
         }
         ControlMsg::DirSync { nodes } => {
             out.push(C_DIR_SYNC);
@@ -322,7 +368,19 @@ pub fn encode_control(m: &ControlMsg) -> Vec<u8> {
                 push_str(&mut out, &n.node_id);
                 push_str(&mut out, &n.name);
                 push_str(&mut out, &n.addr);
+                out.push(n.caps);
             }
+        }
+        ControlMsg::IngressPub { port, addr } => {
+            out.push(C_INGRESS_PUB);
+            out.extend_from_slice(&port.to_be_bytes());
+            push_str(&mut out, addr);
+        }
+        ControlMsg::IngressPubAck { port, ok, msg } => {
+            out.push(C_INGRESS_PUB_ACK);
+            out.extend_from_slice(&port.to_be_bytes());
+            out.push(*ok as u8);
+            push_str(&mut out, msg);
         }
     }
     out
@@ -335,10 +393,17 @@ pub fn decode_control(b: &[u8]) -> Result<ControlMsg, DecodeError> {
         C_HELLO => {
             let version = take_u16(&mut cur)?;
             let name = take_str(&mut cur)?;
-            if !cur.is_empty() {
+            let addr = take_str(&mut cur)?;
+            let caps = *cur.first().ok_or(DecodeError::Truncated)?;
+            if cur.len() != 1 {
                 return Err(DecodeError::Trailing);
             }
-            Ok(ControlMsg::Hello { version, name })
+            Ok(ControlMsg::Hello {
+                version,
+                name,
+                addr,
+                caps,
+            })
         }
         C_DIR_SYNC => {
             let count = take_u16(&mut cur)? as usize;
@@ -347,12 +412,41 @@ pub fn decode_control(b: &[u8]) -> Result<ControlMsg, DecodeError> {
                 let node_id = take_str(&mut cur)?;
                 let name = take_str(&mut cur)?;
                 let addr = take_str(&mut cur)?;
-                nodes.push(NodeEntry { node_id, name, addr });
+                let caps = *cur.first().ok_or(DecodeError::Truncated)?;
+                cur = &cur[1..];
+                nodes.push(NodeEntry {
+                    node_id,
+                    name,
+                    addr,
+                    caps,
+                });
             }
             if !cur.is_empty() {
                 return Err(DecodeError::Trailing);
             }
             Ok(ControlMsg::DirSync { nodes })
+        }
+        C_INGRESS_PUB => {
+            let port = take_u16(&mut cur)?;
+            let addr = take_str(&mut cur)?;
+            if !cur.is_empty() {
+                return Err(DecodeError::Trailing);
+            }
+            Ok(ControlMsg::IngressPub { port, addr })
+        }
+        C_INGRESS_PUB_ACK => {
+            let port = take_u16(&mut cur)?;
+            let ok = match cur.first() {
+                Some(0) => false,
+                Some(_) => true,
+                None => return Err(DecodeError::Truncated),
+            };
+            cur = &cur[1..];
+            let msg = take_str(&mut cur)?;
+            if !cur.is_empty() {
+                return Err(DecodeError::Trailing);
+            }
+            Ok(ControlMsg::IngressPubAck { port, ok, msg })
         }
         other => Err(DecodeError::UnknownType(other)),
     }
@@ -438,6 +532,8 @@ mod tests {
             ControlMsg::Hello {
                 version: 1,
                 name: "nas-home".into(),
+                addr: "1.2.3.4:9100".into(),
+                caps: caps::EXIT,
             },
             ControlMsg::DirSync { nodes: vec![] },
             ControlMsg::DirSync {
@@ -446,13 +542,24 @@ mod tests {
                         node_id: "0123456789abcdef".into(),
                         name: "vps-tokyo".into(),
                         addr: "1.2.3.4:9000".into(),
+                        caps: caps::EXIT,
                     },
                     NodeEntry {
                         node_id: "fedcba9876543210".into(),
                         name: "nas-home".into(),
                         addr: "5.6.7.8:9000".into(),
+                        caps: 0,
                     },
                 ],
+            },
+            ControlMsg::IngressPub {
+                port: 8080,
+                addr: "127.0.0.1:80".into(),
+            },
+            ControlMsg::IngressPubAck {
+                port: 8080,
+                ok: false,
+                msg: "port out of range".into(),
             },
         ];
         for m in msgs {

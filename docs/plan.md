@@ -150,9 +150,10 @@ exit 的镜像方向：有公网 IP 的节点把**自己的公网端口**映射�
 
 - 数据面与 exit 完全复用：公网连接到达入口节点 → 入口节点向目标节点建立隧道流，SYN 指定目标节点的本地地址 → 双向转发。入口节点只做转发，服务内容由目标节点终结
 - 发布方式：
-  - **静态**：入口节点配置里写死映射
-  - **动态**：节点经 INGRESS_PUB 控制消息申请（"把你在 8080 的端口指到我这台机器的 80"），入口节点按 ACL 审批
-- ACL：入口节点配置 `ingress_allow = { node_ids: [...], port_range: "8000-9000" }`，防止组网内节点乱占公网端口
+  - **静态**：入口节点配置里写死映射 ✔ (`--ingress "listen=node/addr"`)
+  - **动态**：节点经 INGRESS_PUB 控制消息申请（"把你在 8080 的端口指到我这台机器的 80"），入口节点按 ACL 审批 ✔ (Web UI `/api/ingress`)
+- ACL：入口节点配置 `--ingress-allow` + `--ingress-ports` 端口范围；**注意**：作为 ingress 目标的节点也需 `--exit-allow` 放行入口节点（反向流复用 exit 数据面）
+- 动态映射随隧道生命周期：隧道断开自动回收监听端口，重连后需重新申请
 - 可选增强（P5+）：按 TLS SNI / HTTP Host 分流，一个 443 端口托管多个节点的多个站点；TCP/UDP 均支持
 
 ```toml
@@ -182,6 +183,7 @@ port_range = "8000-9000"
   - `POST /api/ingress`       申请/撤销端口发布
   - `GET  /api/events` (WS)   实时事件：节点上下线、打洞结果、延迟更新
 - 页面：节点拓扑卡片（在线/延迟/角色）、出口下拉选择、入口发布管理、规则表、实时日志条
+- 现状：P4 已实现 status/nodes/exit/routes API + 单页控制台(2s 轮询); WS 实时推送、延迟展示、入口发布管理待后续
 
 ## 7. 隐匿层（P5）
 
@@ -228,8 +230,8 @@ yingzi/
 | **P0** 协议地基 ✔ | yz-proto + yz-crypto + yz-node(dial/serve, TCP承载, 单流) | 两节点加密转发 TCP |
 | **P1** 组网骨架 ✔ | node 统一角色 + coordinator + 目录同步(HELLO/DIR_SYNC) + 一隧道多流复用 | 多节点互相可见, 并发流复用 |
 | **P2** UDP+打洞 | 传输抽象、udp-reliable(ARQ/SACK/FEC)、yz-nat | NAT 后两节点 P2P 直连 |
-| **P3** 出口/入口体系 | exit 模块 + ingress 端口发布 + 策略路由 + ACL + SOCKS5 入口 | 任选节点出流量/公网反代组网服务 |
-| **P4** Web UI | yz-web + 实时事件 + 出口切换 + 规则编辑 | 浏览器控制台可用 |
+| **P3** 出口/入口体系 ✔ | exit + 策略路由 + ACL + SOCKS5 入口 + ingress 静态/动态端口发布 | 任选节点出流量/公网反代组网服务 |
+| **P4** Web UI ✔(轮询版) | yz-web: status/nodes/exit/routes API + 内嵌单页控制台 | 浏览器可看全网节点、切换出口、增删规则 |
 | **P5** 隐匿增强 | 噪声/模仿双模式、fallback、时序整形 | 抓包无结构可识别 |
 | **P6** 全局组网 | TUN 接管 + 虚拟 IP + subnet 路由 | 设备互 ping 虚拟 IP |
 | **P7** 强健化 | rekey、连接迁移、拥塞控制优化、管理 CLI | 长期真实环境运行 |

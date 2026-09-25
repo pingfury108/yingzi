@@ -9,12 +9,15 @@
 
 mod coord;
 mod dial;
+mod ingress;
 mod node;
+mod policy;
+mod socks5;
 mod tunnel;
+mod web;
 
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
-use std::net::IpAddr;
 use std::path::PathBuf;
 use yz_crypto::NetworkSecret;
 use yz_proto::Addr;
@@ -53,6 +56,33 @@ enum Cmd {
         /// 节点名
         #[arg(long, default_value = "node")]
         name: String,
+        /// 对外公布的隧道监听地址 (默认取 bind; 通配地址由 coordinator 替换为观察到的源IP)
+        #[arg(long)]
+        advertise: Option<String>,
+        /// 本地 SOCKS5 入口地址, 如 127.0.0.1:1080
+        #[arg(long)]
+        socks5: Option<String>,
+        /// Web UI 监听地址, 如 127.0.0.1:9800
+        #[arg(long)]
+        web: Option<String>,
+        /// 静态入口发布 "listen=node/addr", 可多次; 例: 0.0.0.0:8080=nas-home/127.0.0.1:80
+        #[arg(long = "ingress")]
+        ingress: Vec<String>,
+        /// 动态入口发布 ACL: all | none | node_id列表(逗号分隔)
+        #[arg(long, default_value = "none")]
+        ingress_allow: String,
+        /// 动态发布允许的端口范围
+        #[arg(long, default_value = "8000-9999")]
+        ingress_ports: String,
+        /// 分流规则 "matcher=exit", 可多次; matcher: domain-suffix:x / domain:x / cidr:x/n
+        #[arg(long = "route")]
+        routes: Vec<String>,
+        /// 默认出口: direct | auto | 节点名/node_id 前缀
+        #[arg(long, default_value = "direct")]
+        default_exit: String,
+        /// 我当出口的 ACL: all | none | node_id列表(逗号分隔, 支持前缀)
+        #[arg(long, default_value = "none")]
+        exit_allow: String,
     },
     /// 独立隧道出口(无 mesh)
     Serve {
@@ -98,7 +128,47 @@ async fn main() -> Result<()> {
             bind,
             coordinator,
             name,
-        } => node::run(&bind, &coordinator, &name, &ns, id_pub).await,
+            advertise,
+            socks5,
+            web,
+            ingress,
+            ingress_allow,
+            ingress_ports,
+            routes,
+            default_exit,
+            exit_allow,
+        } => {
+            let routes = routes
+                .iter()
+                .map(|r| policy::RouteRule::parse(r))
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(|e| anyhow::anyhow!("bad --route: {e}"))?;
+            let ingress = ingress
+                .iter()
+                .map(|r| ingress::parse_rule(r))
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(|e| anyhow::anyhow!("bad --ingress: {e}"))?;
+            let ingress_ports = parse_port_range(&ingress_ports)?;
+            node::run(
+                node::NodeOpts {
+                    advertise: advertise.unwrap_or_else(|| bind.clone()),
+                    bind,
+                    coord: coordinator,
+                    name,
+                    socks5,
+                    web,
+                    ingress,
+                    ingress_acl: policy::ExitAcl::parse(&ingress_allow),
+                    ingress_ports,
+                    default_exit,
+                    routes,
+                    exit_acl: policy::ExitAcl::parse(&exit_allow),
+                },
+                &ns,
+                id_pub,
+            )
+            .await
+        }
         Cmd::Serve { bind } => node::serve(&bind, &ns, id_pub).await,
         Cmd::Dial {
             peer,
@@ -128,17 +198,16 @@ fn load_or_create_identity(path: &PathBuf) -> Result<[u8; 32]> {
     }
 }
 
+fn parse_port_range(s: &str) -> Result<(u16, u16)> {
+    let (a, b) = s
+        .split_once('-')
+        .with_context(|| format!("port range must be a-b: {s}"))?;
+    let lo: u16 = a.parse().context("bad range start")?;
+    let hi: u16 = b.parse().context("bad range end")?;
+    anyhow::ensure!(lo <= hi, "empty port range");
+    Ok((lo, hi))
+}
+
 fn parse_addr(s: &str) -> Result<Addr> {
-    let (host, port_s) = s
-        .rsplit_once(':')
-        .with_context(|| format!("addr must be host:port, got {s}"))?;
-    let port: u16 = port_s.parse().context("bad port")?;
-    if let Ok(ip) = host.parse::<IpAddr>() {
-        return Ok(match ip {
-            IpAddr::V4(v4) => Addr::V4(v4.octets(), port),
-            IpAddr::V6(v6) => Addr::V6(v6.octets(), port),
-        });
-    }
-    anyhow::ensure!(!host.is_empty() && host.len() <= 255, "bad host");
-    Ok(Addr::Domain(host.to_string(), port))
+    Addr::parse(s).map_err(|e| anyhow::anyhow!(e))
 }

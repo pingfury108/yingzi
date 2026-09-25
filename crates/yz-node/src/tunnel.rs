@@ -100,6 +100,14 @@ impl Tunnel {
     async fn close_stream(&self, sid: u32) {
         self.streams.lock().await.remove(&sid);
     }
+
+    pub fn is_closed(&self) -> bool {
+        *self.closed_tx.borrow()
+    }
+
+    pub fn watch_closed(&self) -> watch::Receiver<bool> {
+        self.closed_tx.subscribe()
+    }
 }
 
 /// 隧道发起方 (dial/节点外连)

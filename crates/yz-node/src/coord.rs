@@ -15,6 +15,7 @@ use yz_proto::{ControlMsg, Frame, NodeEntry};
 struct NodeRec {
     name: String,
     addr: String,
+    caps: u8,
     tunnel: Arc<Tunnel>,
 }
 
@@ -50,11 +51,21 @@ async fn handle(
     let first = timeout(Duration::from_secs(10), h.ctrl_rx.recv())
         .await?
         .context("expect HELLO")?;
-    let name = match first {
+    let (name, addr, caps) = match first {
         Frame::Control { payload } => match yz_proto::decode_control(&payload)? {
-            ControlMsg::Hello { version, name } => {
-                log::info!("node {} ({name}) joined from {from}, proto v{version}", &nid[..8]);
-                name
+            ControlMsg::Hello {
+                version,
+                name,
+                addr,
+                caps,
+            } => {
+                // advertise 为通配地址时, 用观察到的源 IP 替代主机部分
+                let addr = fixup_advertise(&addr, &from);
+                log::info!(
+                    "node {} ({name}) joined from {from}, addr {addr}, proto v{version}",
+                    &nid[..8]
+                );
+                (name, addr, caps)
             }
             _ => bail!("expect HELLO"),
         },
@@ -65,7 +76,8 @@ async fn handle(
         nid.clone(),
         NodeRec {
             name,
-            addr: from.clone(),
+            addr,
+            caps,
             tunnel: h.tunnel.clone(),
         },
     );
@@ -98,6 +110,7 @@ async fn broadcast(registry: &Registry) {
             node_id: id.clone(),
             name: r.name.clone(),
             addr: r.addr.clone(),
+            caps: r.caps,
         })
         .collect();
     let payload = yz_proto::encode_control(&ControlMsg::DirSync { nodes });
@@ -108,5 +121,18 @@ async fn broadcast(registry: &Registry) {
                 payload: payload.clone(),
             })
             .await;
+    }
+}
+
+/// advertise 主机为 0.0.0.0/空 时, 用观察到的源 IP 替代
+fn fixup_advertise(addr: &str, from: &str) -> String {
+    let Some((host, port)) = addr.rsplit_once(':') else {
+        return addr.to_string();
+    };
+    if host.is_empty() || host == "0.0.0.0" || host == "::" || host == "[::]" {
+        let src_ip = from.rsplit_once(':').map(|(h, _)| h).unwrap_or(from);
+        format!("{src_ip}:{port}")
+    } else {
+        addr.to_string()
     }
 }
