@@ -225,8 +225,8 @@ yingzi/
 
 | 阶段 | 内容 | 验收 |
 |---|---|---|
-| **P0** 协议地基 | yz-proto + yz-crypto + yz-node(dial/serve, TCP承载, 单流) | 两节点加密转发 TCP |
-| **P1** 组网骨架 | node 统一角色 + coordinator + 目录同步 + 多流复用 | 多节点互相可见 |
+| **P0** 协议地基 ✔ | yz-proto + yz-crypto + yz-node(dial/serve, TCP承载, 单流) | 两节点加密转发 TCP |
+| **P1** 组网骨架 ✔ | node 统一角色 + coordinator + 目录同步(HELLO/DIR_SYNC) + 一隧道多流复用 | 多节点互相可见, 并发流复用 |
 | **P2** UDP+打洞 | 传输抽象、udp-reliable(ARQ/SACK/FEC)、yz-nat | NAT 后两节点 P2P 直连 |
 | **P3** 出口/入口体系 | exit 模块 + ingress 端口发布 + 策略路由 + ACL + SOCKS5 入口 | 任选节点出流量/公网反代组网服务 |
 | **P4** Web UI | yz-web + 实时事件 + 出口切换 + 规则编辑 | 浏览器控制台可用 |

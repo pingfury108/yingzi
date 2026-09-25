@@ -60,6 +60,21 @@ const T_CTRL: u8 = 0x10;
 const T_PING: u8 = 0x11;
 const T_PONG: u8 = 0x12;
 
+impl Frame {
+    /// 流帧返回 stream_id; Control/Ping/Pong 返回 0
+    pub fn stream_id(&self) -> u32 {
+        match self {
+            Frame::Syn { stream_id, .. }
+            | Frame::SynAck { stream_id, .. }
+            | Frame::Data { stream_id, .. }
+            | Frame::Fin { stream_id }
+            | Frame::Rst { stream_id }
+            | Frame::WindowUpdate { stream_id, .. } => *stream_id,
+            Frame::Control { .. } | Frame::Ping { .. } | Frame::Pong { .. } => 0,
+        }
+    }
+}
+
 #[derive(Debug)]
 pub enum DecodeError {
     Truncated,
@@ -272,6 +287,103 @@ fn decode_addr(b: &[u8]) -> Result<(Addr, usize), DecodeError> {
     }
 }
 
+// ---------- 控制消息 (plan.md §3.5) ----------
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NodeEntry {
+    pub node_id: String,
+    pub name: String,
+    pub addr: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ControlMsg {
+    /// 节点上线注册
+    Hello { version: u16, name: String },
+    /// 节点目录全量同步 (coordinator → node)
+    DirSync { nodes: Vec<NodeEntry> },
+}
+
+const C_HELLO: u8 = 0x01;
+const C_DIR_SYNC: u8 = 0x02;
+
+pub fn encode_control(m: &ControlMsg) -> Vec<u8> {
+    let mut out = Vec::with_capacity(32);
+    match m {
+        ControlMsg::Hello { version, name } => {
+            out.push(C_HELLO);
+            out.extend_from_slice(&version.to_be_bytes());
+            push_str(&mut out, name);
+        }
+        ControlMsg::DirSync { nodes } => {
+            out.push(C_DIR_SYNC);
+            out.extend_from_slice(&(nodes.len() as u16).to_be_bytes());
+            for n in nodes {
+                push_str(&mut out, &n.node_id);
+                push_str(&mut out, &n.name);
+                push_str(&mut out, &n.addr);
+            }
+        }
+    }
+    out
+}
+
+pub fn decode_control(b: &[u8]) -> Result<ControlMsg, DecodeError> {
+    let t = *b.first().ok_or(DecodeError::Truncated)?;
+    let mut cur = &b[1..];
+    match t {
+        C_HELLO => {
+            let version = take_u16(&mut cur)?;
+            let name = take_str(&mut cur)?;
+            if !cur.is_empty() {
+                return Err(DecodeError::Trailing);
+            }
+            Ok(ControlMsg::Hello { version, name })
+        }
+        C_DIR_SYNC => {
+            let count = take_u16(&mut cur)? as usize;
+            let mut nodes = Vec::with_capacity(count);
+            for _ in 0..count {
+                let node_id = take_str(&mut cur)?;
+                let name = take_str(&mut cur)?;
+                let addr = take_str(&mut cur)?;
+                nodes.push(NodeEntry { node_id, name, addr });
+            }
+            if !cur.is_empty() {
+                return Err(DecodeError::Trailing);
+            }
+            Ok(ControlMsg::DirSync { nodes })
+        }
+        other => Err(DecodeError::UnknownType(other)),
+    }
+}
+
+fn push_str(out: &mut Vec<u8>, s: &str) {
+    out.push(s.len() as u8);
+    out.extend_from_slice(s.as_bytes());
+}
+
+fn take_u16(cur: &mut &[u8]) -> Result<u16, DecodeError> {
+    if cur.len() < 2 {
+        return Err(DecodeError::Truncated);
+    }
+    let v = u16::from_be_bytes(cur[..2].try_into().unwrap());
+    *cur = &cur[2..];
+    Ok(v)
+}
+
+fn take_str(cur: &mut &[u8]) -> Result<String, DecodeError> {
+    let len = *cur.first().ok_or(DecodeError::Truncated)? as usize;
+    if cur.len() < 1 + len {
+        return Err(DecodeError::Truncated);
+    }
+    let s = std::str::from_utf8(&cur[1..1 + len])
+        .map_err(|_| DecodeError::BadUtf8)?
+        .to_string();
+    *cur = &cur[1 + len..];
+    Ok(s)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -318,6 +430,34 @@ mod tests {
         });
         roundtrip(Frame::Ping { ts: 1_700_000_000 });
         roundtrip(Frame::Pong { ts: 1_700_000_001 });
+    }
+
+    #[test]
+    fn control_roundtrip() {
+        let msgs = [
+            ControlMsg::Hello {
+                version: 1,
+                name: "nas-home".into(),
+            },
+            ControlMsg::DirSync { nodes: vec![] },
+            ControlMsg::DirSync {
+                nodes: vec![
+                    NodeEntry {
+                        node_id: "0123456789abcdef".into(),
+                        name: "vps-tokyo".into(),
+                        addr: "1.2.3.4:9000".into(),
+                    },
+                    NodeEntry {
+                        node_id: "fedcba9876543210".into(),
+                        name: "nas-home".into(),
+                        addr: "5.6.7.8:9000".into(),
+                    },
+                ],
+            },
+        ];
+        for m in msgs {
+            assert_eq!(decode_control(&encode_control(&m)).unwrap(), m);
+        }
     }
 
     #[test]
