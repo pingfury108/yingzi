@@ -227,7 +227,7 @@ pub async fn run(opts: NodeOpts, ns: &NetworkSecret, id_pub: [u8; 32]) -> Result
 
     // 1) peer 隧道监听 (exit 数据面)
     {
-        let listener = TcpListener::bind(&opts.bind).await?;
+        let listener = bind_tcp_retry(&opts.bind).await?;
         log::info!("node [{}] serving peers on {}", opts.name, opts.bind);
         let ns = ns.clone();
         let ctx = PeerCtx {
@@ -843,6 +843,7 @@ fn spawn_ctrl_handler(
     t: Arc<Tunnel>,
     mut ctrl: mpsc::Receiver<Frame>,
     peer_id: String,
+    self_id: Option<String>,
     state: Option<Arc<NodeState>>,
     ingress: Option<(ExitAcl, (u16, u16))>,
 ) {
@@ -864,6 +865,40 @@ fn spawn_ctrl_handler(
             }
         });
     }
+    // 定时密钥轮换 (默认关闭, 实验性): 需显式设置 YZ_REKEY_SECS>0
+    // 已知问题: 切换瞬间旧钥帧积压在 rudp 未确认队列, 新钥帧被窗口阻塞会明显停摆
+    if let (Some(me), Some(_)) = (&self_id, &state) {
+        let rekey_secs = std::env::var("YZ_REKEY_SECS")
+            .ok()
+            .and_then(|v| v.parse::<u64>().ok())
+            .unwrap_or(0);
+        if rekey_secs > 0 && me.as_str() < peer_id.as_str() {
+            let t2 = t.clone();
+            let secs = rekey_secs;
+            tokio::spawn(async move {
+                loop {
+                    tokio::time::sleep(Duration::from_secs(secs)).await;
+                    if t2.is_closed() {
+                        break;
+                    }
+                    match t2.rekey_begin().await {
+                        Ok(wire) => {
+                            let payload =
+                                yz_proto::encode_control(&ControlMsg::RekeyInit { wire });
+                            if t2
+                                .write_frame(&Frame::Control { payload })
+                                .await
+                                .is_err()
+                            {
+                                break;
+                            }
+                        }
+                        Err(e) => log::debug!("rekey begin: {e}"),
+                    }
+                }
+            });
+        }
+    }
     tokio::spawn(async move {
         while let Some(f) = ctrl.recv().await {
             match f {
@@ -877,31 +912,53 @@ fn spawn_ctrl_handler(
                     }
                 }
                 Frame::Control { payload } => {
-                    if let Some((acl, range)) = &ingress {
-                        if let Ok(ControlMsg::IngressPub { port, addr }) =
-                            yz_proto::decode_control(&payload)
-                        {
-                            let (ok, msg) = ingress::handle_pub_request(
-                                &state,
-                                acl,
-                                *range,
-                                &peer_id,
-                                port,
-                                &addr,
-                                t.clone(),
-                            )
-                            .await;
-                            let ack =
-                                yz_proto::encode_control(&ControlMsg::IngressPubAck { port, ok, msg });
-                            let _ = t.write_frame(&Frame::Control { payload: ack }).await;
+                    match yz_proto::decode_control(&payload) {
+                        // 对端申请发布端口 (我是入口节点)
+                        Ok(ControlMsg::IngressPub { port, addr }) => {
+                            if let Some((acl, range)) = &ingress {
+                                let (ok, msg) = ingress::handle_pub_request(
+                                    &state,
+                                    acl,
+                                    *range,
+                                    &peer_id,
+                                    port,
+                                    &addr,
+                                    t.clone(),
+                                )
+                                .await;
+                                let ack = yz_proto::encode_control(&ControlMsg::IngressPubAck {
+                                    port,
+                                    ok,
+                                    msg,
+                                });
+                                let _ = t.write_frame(&Frame::Control { payload: ack }).await;
+                            }
                         }
-                    } else if let Ok(ControlMsg::IngressPubAck { port, ok, msg }) =
-                        yz_proto::decode_control(&payload)
-                    {
-                        log::info!(
-                            "ingress :{port} {} ({msg})",
-                            if ok { "ok" } else { "failed" }
-                        );
+                        // 密钥轮换
+                        Ok(ControlMsg::RekeyInit { wire }) => match t.rekey_accept(&wire).await {
+                            Ok((reply, keys)) => {
+                                // 先用旧密钥回 ack, 再切换
+                                let payload =
+                                    yz_proto::encode_control(&ControlMsg::RekeyAck { wire: reply });
+                                let _ = t.write_frame(&Frame::Control { payload }).await;
+                                t.apply_keys_responder(&keys).await;
+                                log::info!("rekey done (responder, peer {})", &peer_id[..8]);
+                            }
+                            Err(e) => log::warn!("rekey accept: {e}"),
+                        },
+                        Ok(ControlMsg::RekeyAck { wire }) => {
+                            match t.rekey_finish_with(&wire).await {
+                                Ok(()) => log::info!("rekey done (initiator, peer {})", &peer_id[..8]),
+                                Err(e) => log::warn!("rekey finish: {e}"),
+                            }
+                        }
+                        Ok(ControlMsg::IngressPubAck { port, ok, msg }) => {
+                            log::info!(
+                                "ingress :{port} {} ({msg})",
+                                if ok { "ok" } else { "failed" }
+                            );
+                        }
+                        _ => {}
                     }
                 }
                 _ => {}
@@ -930,6 +987,7 @@ async fn adopt_tunnel(
         t.clone(),
         h.ctrl_rx,
         node_id.to_string(),
+        Some(yz_crypto::node_id(&id_pub)),
         Some(state.clone()),
         None,
     );
@@ -1026,6 +1084,22 @@ pub struct PeerCtx {
     pub id_pub: [u8; 32],
 }
 
+/// TCP 监听绑定重试 (重启时旧进程可能未退干净; 避免崩溃重启循环)
+async fn bind_tcp_retry(bind: &str) -> Result<TcpListener> {
+    let mut last_err = None;
+    for attempt in 0..6u64 {
+        match TcpListener::bind(bind).await {
+            Ok(l) => return Ok(l),
+            Err(e) => {
+                log::warn!("tcp bind {bind} 失败: {e}, 重试 ({}/6)", attempt + 1);
+                last_err = Some(e);
+                tokio::time::sleep(Duration::from_millis(500 * (attempt + 1))).await;
+            }
+        }
+    }
+    Err(last_err.expect("bind attempts").into())
+}
+
 /// 独立出口 (serve 子命令), 允许组网内任何节点, 不开 ingress
 pub async fn serve(
     bind: &str,
@@ -1046,7 +1120,7 @@ pub async fn serve(
     };
     if let Some((cert, key)) = wss {
         let acceptor = crate::wss::server_acceptor(Path::new(&cert), Path::new(&key))?;
-        let listener = TcpListener::bind(bind).await?;
+        let listener = bind_tcp_retry(bind).await?;
         log::info!("serving tunnel on wss/{bind}");
         loop {
             let (stream, from) = listener.accept().await?;
@@ -1080,7 +1154,7 @@ pub async fn serve(
         }
         return Ok(());
     }
-    let listener = TcpListener::bind(bind).await?;
+    let listener = bind_tcp_retry(bind).await?;
     log::info!("serving tunnel on {bind}");
     loop {
         let (stream, from) = listener.accept().await?;
@@ -1119,6 +1193,7 @@ pub async fn handle_peer(h: TunnelHandle, ctx: &PeerCtx) -> Result<()> {
         t.clone(),
         h.ctrl_rx,
         peer_id.clone(),
+        Some(yz_crypto::node_id(&ctx.id_pub)),
         ctx.state.clone(),
         Some((ctx.ingress_acl.clone(), ctx.ingress_ports)),
     );
@@ -1202,10 +1277,12 @@ pub(crate) fn spawn_incoming_handler(
                                 peer,
                             );
                             let t2 = h.tunnel.clone();
+                            let self_id = yz_crypto::node_id(&id_pub);
                             spawn_ctrl_handler(
                                 t2.clone(),
                                 h.ctrl_rx,
                                 pid.clone(),
+                                Some(self_id),
                                 state.clone(),
                                 None,
                             );

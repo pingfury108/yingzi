@@ -128,6 +128,7 @@ pub enum Role {
 }
 
 /// 握手产出的原始密钥材料
+#[derive(Clone, Copy)]
 pub struct SessionKeys {
     pub c2s: [u8; 32],
     pub s2c: [u8; 32],
@@ -340,6 +341,8 @@ fn derive_session(
 pub struct Session {
     send_key: LessSafeKey,
     recv_key: LessSafeKey,
+    /// 上一代接收密钥 (换钥瞬间的在途包仍能解开; 与当前密钥共用同一计数器)
+    prev_recv_key: Option<LessSafeKey>,
     mask: [u8; 16],
     send_ctr: u64,
     recv_ctr: u64,
@@ -353,10 +356,46 @@ impl Session {
         Self {
             send_key: mk(&send),
             recv_key: mk(&recv),
+            prev_recv_key: None,
             mask,
             send_ctr: 0,
             recv_ctr: 0,
         }
+    }
+
+    /// 轮换会话密钥 (计数器只增不减; mask 在握手后保持不变)
+    pub fn set_keys(&mut self, k: &SessionKeys, role: Role) {
+        self.set_recv_keys(k, role);
+        self.set_send_keys(k, role);
+        // 注意: 不更新 mask —— 换钥时 mask 必须两侧一致且终身不变,
+        // 否则长度掩码解错会导致 TCP 字节流错位(连接永久损坏)
+    }
+
+    /// 只切接收方向 (保留上一代, 兼容在途旧包)
+    pub fn set_recv_keys(&mut self, k: &SessionKeys, role: Role) {
+        let r = match role {
+            Role::Initiator => &k.s2c,
+            Role::Responder => &k.c2s,
+        };
+        let mk = |b: &[u8; 32]| {
+            LessSafeKey::new(UnboundKey::new(&CHACHA20_POLY1305, b).expect("32-byte key"))
+        };
+        self.prev_recv_key = Some(std::mem::replace(&mut self.recv_key, mk(r)));
+        // 注意: 不改 mask、不重置 recv_ctr、也不单独记 prev 计数器 ——
+        // 收发方向各只有一个单调计数器, 新旧密钥共用同一 nonce 序列, 否则换钥后无法对齐
+    }
+
+    /// 只切发送方向
+    pub fn set_send_keys(&mut self, k: &SessionKeys, role: Role) {
+        let s = match role {
+            Role::Initiator => &k.c2s,
+            Role::Responder => &k.s2c,
+        };
+        let mk = |b: &[u8; 32]| {
+            LessSafeKey::new(UnboundKey::new(&CHACHA20_POLY1305, b).expect("32-byte key"))
+        };
+        self.send_key = mk(s);
+        // send_ctr 继续累加 (计数器只增不减)
     }
 
     pub fn from_keys(k: &SessionKeys, role: Role) -> Self {
@@ -383,19 +422,39 @@ impl Session {
         Ok(out)
     }
 
+    /// (recv_ctr, 是否有prev) —— 诊断用
+    pub fn ctr_info(&self) -> (u64, bool) {
+        (self.recv_ctr, self.prev_recv_key.is_some())
+    }
+
     /// 用接收计数器解掩长度（在 read_exact 密文之前调用）
     pub fn unmask_len(&self, masked: u16) -> usize {
         (masked ^ self.mask_word(self.recv_ctr)) as usize
     }
 
     /// 解密一个包, 返回帧明文
+    ///
+    /// 注意: ring 的 `open_in_place` 认证失败时会就地覆写缓冲区,
+    /// 因此重试上一代密钥前必须保留未受污染的原始密文。
     pub fn open(&mut self, _masked: u16, ct: &mut [u8]) -> Result<Vec<u8>> {
-        let plain = self
-            .recv_key
-            .open_in_place(nonce_of(self.recv_ctr), Aad::empty(), ct)
-            .map_err(|_| Error::Auth)?;
-        self.recv_ctr += 1;
-        Ok(plain.to_vec())
+        let pristine = self.prev_recv_key.is_some().then(|| ct.to_vec());
+        if let Ok(plain) =
+            self.recv_key
+                .open_in_place(nonce_of(self.recv_ctr), Aad::empty(), ct)
+        {
+            self.recv_ctr += 1;
+            return Ok(plain.to_vec());
+        }
+        // 换钥瞬间的在途包: 用上一代密钥 + 原始密文 + 同一计数器
+        if let (Some(prev), Some(mut buf)) = (&self.prev_recv_key, pristine) {
+            if let Ok(plain) =
+                prev.open_in_place(nonce_of(self.recv_ctr), Aad::empty(), &mut buf)
+            {
+                self.recv_ctr += 1;
+                return Ok(plain.to_vec());
+            }
+        }
+        Err(Error::Auth)
     }
 
     fn mask_word(&self, ctr: u64) -> u16 {
@@ -414,6 +473,10 @@ fn nonce_of(ctr: u64) -> Nonce {
 pub struct DgramSession {
     send_key: LessSafeKey,
     recv_key: LessSafeKey,
+    prev_recv_key: Option<LessSafeKey>,
+    /// 收发方向各自密钥指纹 (诊断)
+    fp_send: String,
+    fp_recv: String,
 }
 
 impl DgramSession {
@@ -428,7 +491,44 @@ impl DgramSession {
         Self {
             send_key: mk(send),
             recv_key: mk(recv),
+            prev_recv_key: None,
+            fp_send: key_fingerprint(k),
+            fp_recv: key_fingerprint(k),
         }
+    }
+
+    pub fn set_keys(&mut self, k: &SessionKeys, role: Role) {
+        self.set_recv_keys(k, role);
+        self.set_send_keys(k, role);
+    }
+
+    /// (send_fp, recv_fp) —— 诊断
+    pub fn fingerprints(&self) -> (&str, &str) {
+        (&self.fp_send, &self.fp_recv)
+    }
+
+    pub fn set_recv_keys(&mut self, k: &SessionKeys, role: Role) {
+        let r = match role {
+            Role::Initiator => &k.s2c,
+            Role::Responder => &k.c2s,
+        };
+        let mk = |b: &[u8; 32]| {
+            LessSafeKey::new(UnboundKey::new(&CHACHA20_POLY1305, b).expect("32-byte key"))
+        };
+        self.prev_recv_key = Some(std::mem::replace(&mut self.recv_key, mk(r)));
+        self.fp_recv = key_fingerprint(k);
+    }
+
+    pub fn set_send_keys(&mut self, k: &SessionKeys, role: Role) {
+        let s = match role {
+            Role::Initiator => &k.c2s,
+            Role::Responder => &k.s2c,
+        };
+        let mk = |b: &[u8; 32]| {
+            LessSafeKey::new(UnboundKey::new(&CHACHA20_POLY1305, b).expect("32-byte key"))
+        };
+        self.send_key = mk(s);
+        self.fp_send = key_fingerprint(k);
     }
 
     /// nonce(12) | ct+tag
@@ -469,9 +569,17 @@ fn dgram_open(key: &LessSafeKey, dgram: &[u8]) -> Result<Vec<u8>> {
     Ok(plain.to_vec())
 }
 
+/// 密钥指纹 (诊断: 两侧比对是否派生出一致的会话密钥)
+pub fn key_fingerprint(k: &SessionKeys) -> String {
+    let mut buf = Vec::with_capacity(64);
+    buf.extend_from_slice(&k.c2s);
+    buf.extend_from_slice(&k.s2c);
+    let d = digest::digest(&digest::SHA256, &buf);
+    to_hex(&d.as_ref()[..4])
+}
+
 /// NS 派生的静态密钥: 用于 NAT 探测/打洞等会话前带外小包, 只有网络成员可解码
 pub struct StaticKey(LessSafeKey);
-
 impl StaticKey {
     pub fn derive(ns: &NetworkSecret, salt: &[u8]) -> Result<Self> {
         Ok(Self(hs_key(ns, salt)?))
@@ -547,7 +655,64 @@ pub fn unwrap_hs_len(ns: &NetworkSecret, masked: u16) -> Result<usize> {
     Ok((masked ^ hs_len_mask(ns)?) as usize)
 }
 
-// ---------- hex ----------
+// ---------- 密钥轮换 (rekey) ----------
+
+/// 轮换态: 本端临时公钥报文 (eph_pub(32) || nonce(16))
+pub struct RekeyState {
+    eph: Option<EphemeralPrivateKey>,
+    wire: Vec<u8>,
+}
+
+pub const REKEY_WIRE_LEN: usize = 48;
+
+/// 生成本端 rekey 报文
+pub fn rekey_init() -> Result<(Vec<u8>, RekeyState)> {
+    let rng = SystemRandom::new();
+    let eph = EphemeralPrivateKey::generate(&X25519, &rng)?;
+    let pk = eph.compute_public_key()?;
+    let mut wire = pk.as_ref().to_vec();
+    let mut nonce = [0u8; 16];
+    rng.fill(&mut nonce)?;
+    wire.extend_from_slice(&nonce);
+    Ok((
+        wire.clone(),
+        RekeyState {
+            eph: Some(eph),
+            wire,
+        },
+    ))
+}
+
+/// 发起方: 收到对端报文后派生新密钥 (transcript = 我方 || 对方)
+pub fn rekey_finish(mut st: RekeyState, peer_wire: &[u8], role: Role) -> Result<SessionKeys> {
+    if peer_wire.len() != REKEY_WIRE_LEN {
+        return Err(Error::BadMessage);
+    }
+    let peer_pub = UnparsedPublicKey::new(&X25519, &peer_wire[..32]);
+    let eph = st.eph.take().ok_or(Error::BadMessage)?;
+    let mine = st.wire.clone();
+    let material = agreement::agree_ephemeral(eph, &peer_pub, |shared| {
+        derive_session(shared, &mine, peer_wire)
+    })?;
+    let (c2s, s2c, mask) = material?;
+    let _ = role;
+    Ok(SessionKeys { c2s, s2c, mask })
+}
+
+/// 响应方: 收到对端报文后生成本端报文并派生密钥 (transcript = 对方 || 我方)
+pub fn rekey_respond(st: RekeyState, peer_wire: &[u8]) -> Result<(Vec<u8>, SessionKeys)> {
+    if peer_wire.len() != REKEY_WIRE_LEN {
+        return Err(Error::BadMessage);
+    }
+    let (mine, st2) = (st.wire.clone(), st);
+    let peer_pub = UnparsedPublicKey::new(&X25519, &peer_wire[..32]);
+    let eph = st2.eph.ok_or(Error::BadMessage)?;
+    let material = agreement::agree_ephemeral(eph, &peer_pub, |shared| {
+        derive_session(shared, peer_wire, &mine)
+    })?;
+    let (c2s, s2c, mask) = material?;
+    Ok((mine, SessionKeys { c2s, s2c, mask }))
+}
 
 pub fn to_hex(b: &[u8]) -> String {
     const T: &[u8; 16] = b"0123456789abcdef";
@@ -698,5 +863,131 @@ mod tests {
         let h = ns.to_hex();
         let ns2 = NetworkSecret::from_hex(&h).unwrap();
         assert_eq!(ns.to_hex(), ns2.to_hex());
+    }
+}
+
+#[cfg(test)]
+mod rekey_tests {
+    use super::*;
+
+    #[test]
+    fn rekey_both_sides_agree() {
+        for role_pair in [(Role::Initiator, Role::Responder)] {
+            let (wi, st_i) = rekey_init().unwrap();
+            let (wr, st_r) = rekey_init().unwrap();
+            let keys_r = rekey_respond(st_r, &wi).unwrap().1;
+            let keys_i = rekey_finish(st_i, &wr, role_pair.0).unwrap();
+            // 双方 c2s/s2c 必须一致
+            assert_eq!(keys_i.c2s, keys_r.c2s);
+            assert_eq!(keys_i.s2c, keys_r.s2c);
+            assert_eq!(keys_i.mask, keys_r.mask);
+            // 换钥后仍能互通
+            let mut a = Session::from_keys(&keys_i, Role::Initiator);
+            let mut b = Session::from_keys(&keys_r, Role::Responder);
+            let pkt = a.seal(b"after rekey").unwrap();
+            let masked = u16::from_be_bytes([pkt[0], pkt[1]]);
+            let mut ct = pkt[2..].to_vec();
+            assert_eq!(b.open(masked, &mut ct).unwrap(), b"after rekey");
+        }
+    }
+
+    #[test]
+    fn set_keys_switches_session() {
+        let (ns, id_a, id_b) = {
+            let ns = NetworkSecret::generate();
+            let (_, a) = generate_identity().unwrap();
+            let (_, b) = generate_identity().unwrap();
+            (ns, a, b)
+        };
+        let (msg1, st) = handshake_init(&ns, &id_a).unwrap();
+        let (msg2, keys_r, _) = handshake_accept(&ns, &id_b, &msg1).unwrap();
+        let (keys_i, _) = handshake_finish(&ns, st, &msg2).unwrap();
+        let mut sa = Session::from_keys(&keys_i, Role::Initiator);
+        let mut sb = Session::from_keys(&keys_r, Role::Responder);
+        // 计数器连续: 换钥前先把旧钥帧正常交付
+        let p0 = sa.seal(b"old").unwrap();
+        let m0 = u16::from_be_bytes([p0[0], p0[1]]);
+        let mut c0 = p0[2..].to_vec();
+        assert_eq!(sb.open(m0, &mut c0).unwrap(), b"old");
+        // 触发轮换
+        let (wi, si) = rekey_init().unwrap();
+        let (wr, sr) = rekey_init().unwrap();
+        let new_r = rekey_respond(sr, &wi).unwrap().1;
+        let new_i = rekey_finish(si, &wr, Role::Initiator).unwrap();
+        sa.set_keys(&new_i, Role::Initiator);
+        sb.set_keys(&new_r, Role::Responder);
+        let pkt = sa.seal(b"new key").unwrap();
+        let masked = u16::from_be_bytes([pkt[0], pkt[1]]);
+        let mut ct = pkt[2..].to_vec();
+        assert_eq!(sb.open(masked, &mut ct).unwrap(), b"new key");
+    }
+}
+
+#[cfg(test)]
+mod rekey_switch_tests {
+    use super::*;
+
+    /// 模拟不对称切换: 响应方先切收钥, 延迟切发钥; 发起方收到 ack 后立即双切。
+    /// 断言: 切换窗口内两个方向的在途旧钥帧都能被解开, 且计数器连续。
+    #[test]
+    fn asymmetric_switch_keeps_inflight_frames() {
+        let ns = NetworkSecret::generate();
+        let (_, id_a) = generate_identity().unwrap();
+        let (_, id_b) = generate_identity().unwrap();
+        let (msg1, st) = handshake_init(&ns, &id_a).unwrap();
+        let (msg2, keys_r, _) = handshake_accept(&ns, &id_b, &msg1).unwrap();
+        let (keys_i, _) = handshake_finish(&ns, st, &msg2).unwrap();
+        // a = 发起方(链路 Initiator), b = 响应方(链路 Responder)
+        let mut a = Session::from_keys(&keys_i, Role::Initiator);
+        let mut b = Session::from_keys(&keys_r, Role::Responder);
+
+        // 若干正常帧
+        for _ in 0..5 {
+            let p = a.seal(b"hello").unwrap();
+            let m = u16::from_be_bytes([p[0], p[1]]);
+            let mut ct = p[2..].to_vec();
+            assert_eq!(b.open(m, &mut ct).unwrap(), b"hello");
+        }
+
+        // rekey: a 发起, b 响应
+        let (wi, si) = rekey_init().unwrap();
+        let (wr, sr) = rekey_init().unwrap();
+        let (ack_wire, keys_b) = rekey_respond(sr, &wi).unwrap();
+        let keys_a = rekey_finish(si, &wr, Role::Initiator).unwrap();
+        let _ = (&ack_wire, &wr);
+        assert_eq!(key_fingerprint(&keys_a), key_fingerprint(&keys_b));
+
+        // 1) b(响应方) 立即切收钥
+        b.set_recv_keys(&keys_b, Role::Responder);
+        // 2) a(发起方) 收到 ack 后双切
+        a.set_keys(&keys_a, Role::Initiator);
+        // 3) b 仍在宽限期用旧钥发送 (在途帧)
+        let inflight_from_b = b.seal(b"inflight-old").unwrap();
+        // 4) a 用新钥发送
+        let from_a = a.seal(b"new-key").unwrap();
+
+        // a 能解开 b 的旧钥在途帧 (走 prev 窗口)
+        let m = u16::from_be_bytes([inflight_from_b[0], inflight_from_b[1]]);
+        let mut ct = inflight_from_b[2..].to_vec();
+        assert_eq!(
+            a.open(m, &mut ct).unwrap(),
+            b"inflight-old",
+            "发起方必须能用上一代密钥解开在途旧钥帧"
+        );
+        // b 能解开 a 的新钥帧
+        let m2 = u16::from_be_bytes([from_a[0], from_a[1]]);
+        let mut ct2 = from_a[2..].to_vec();
+        assert_eq!(b.open(m2, &mut ct2).unwrap(), b"new-key");
+
+        // 5) b 宽限期结束切换发钥后, 双向继续可用
+        b.set_send_keys(&keys_b, Role::Responder);
+        let p = b.seal(b"after-grace").unwrap();
+        let m3 = u16::from_be_bytes([p[0], p[1]]);
+        let mut ct3 = p[2..].to_vec();
+        assert_eq!(a.open(m3, &mut ct3).unwrap(), b"after-grace");
+        let p2 = a.seal(b"still-fine").unwrap();
+        let m4 = u16::from_be_bytes([p2[0], p2[1]]);
+        let mut ct4 = p2[2..].to_vec();
+        assert_eq!(b.open(m4, &mut ct4).unwrap(), b"still-fine");
     }
 }

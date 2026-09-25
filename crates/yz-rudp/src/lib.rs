@@ -20,7 +20,7 @@ use tokio::sync::{mpsc, watch, Mutex, Notify};
 use tokio::time::timeout;
 use yz_crypto::{
     handshake_accept, handshake_finish, handshake_init, wrap_hs, DgramSession, NetworkSecret,
-    PeerInfo, Role, StaticKey, HS_WIRE_MAX, MSG1_LEN, MSG2_LEN,
+    PeerInfo, Role, StaticKey, SessionKeys, HS_WIRE_MAX, MSG1_LEN, MSG2_LEN,
 };
 
 const T_DATA: u8 = 0x01;
@@ -30,12 +30,14 @@ const T_FIN: u8 = 0x03;
 const MAX_DGRAM: usize = 1400; // 避开 IP 分片
 const MAX_CHUNK: usize = MAX_DGRAM - 12 - 16 - 5; // nonce/tag/type/seq
 const CHAN_CAP: usize = 512;
+const RTO_MIN: Duration = Duration::from_millis(200);
 const RTO_INIT: Duration = Duration::from_millis(200);
 const RTO_MAX: Duration = Duration::from_secs(3);
-const RTX_TICK: Duration = Duration::from_millis(50);
+const RTX_TICK: Duration = Duration::from_millis(20);
 const IDLE_TIMEOUT: Duration = Duration::from_secs(45);
 const CWND_INIT: f64 = 8.0;
 const CWND_MAX: f64 = 512.0;
+const SSTHRESH_INIT: f64 = 64.0;
 const MAX_PENDING_DIST: u32 = 4096;
 
 /// PUNCH 报文长度: nonce12 + 5 + tag16
@@ -316,15 +318,60 @@ fn unpad(pkt: &[u8]) -> Option<(u8, &[u8])> {
 struct Unacked {
     ct: Vec<u8>,
     sent_at: Instant,
+    /// 重传过则不采样 RTT (Karn)
+    retrans: bool,
 }
 
 struct TxState {
     next_seq: u32,
     unacked: BTreeMap<u32, Unacked>,
     cwnd: f64,
+    ssthresh: f64,
     rto: Duration,
+    /// 平滑 RTT (ms)
+    srtt_ms: Option<f64>,
+    /// RTT 偏差 (ms)
+    rttvar_ms: f64,
     last_cum: Option<u32>,
     dup: u8,
+}
+
+impl TxState {
+    /// RFC6298: SRTT/RTTVAR → RTO (用毫秒浮点, 避免 Duration 运算溢出)
+    fn update_rtt(&mut self, sample: Duration) {
+        let ms = sample.as_secs_f64() * 1000.0;
+        match self.srtt_ms {
+            None => {
+                self.srtt_ms = Some(ms);
+                self.rttvar_ms = ms / 2.0;
+            }
+            Some(s) => {
+                self.rttvar_ms = 0.75 * self.rttvar_ms + 0.25 * (ms - s).abs();
+                self.srtt_ms = Some(0.875 * s + 0.125 * ms);
+            }
+        }
+        let rto_ms = (self.srtt_ms.unwrap_or(200.0) + 4.0 * self.rttvar_ms)
+            .clamp(RTO_MIN.as_millis() as f64, RTO_MAX.as_millis() as f64);
+        self.rto = Duration::from_millis(rto_ms as u64);
+    }
+
+    /// 新确认: 慢启动→拥塞避免
+    fn on_acked(&mut self, acked: usize) {
+        if acked == 0 {
+            return;
+        }
+        if self.cwnd < self.ssthresh {
+            self.cwnd = (self.cwnd + acked as f64).min(CWND_MAX); // 慢启动
+        } else {
+            self.cwnd = (self.cwnd + acked as f64 / self.cwnd).min(CWND_MAX); // 拥塞避免
+        }
+    }
+
+    /// 超时/重传: 进入拥塞避免
+    fn on_loss(&mut self) {
+        self.ssthresh = (self.cwnd / 2.0).max(2.0);
+        self.cwnd = self.ssthresh;
+    }
 }
 
 struct RxState {
@@ -335,17 +382,19 @@ struct RxState {
 struct Inner {
     sock: Arc<UdpSocket>,
     peer: SocketAddr,
-    sess: DgramSession,
+    sess: tokio::sync::RwLock<DgramSession>,
     tx: Mutex<TxState>,
     win: Notify,
     closed_tx: watch::Sender<bool>,
-    user_tx: mpsc::Sender<Vec<u8>>,
+    user_tx: mpsc::UnboundedSender<Vec<u8>>,
     last_rx: Mutex<Instant>,
+    /// 解密失败计数 (诊断)
+    dec_fail: std::sync::atomic::AtomicU64,
 }
 
 pub struct Rudp {
     inner: Arc<Inner>,
-    user_rx: Mutex<mpsc::Receiver<Vec<u8>>>,
+    user_rx: Mutex<mpsc::UnboundedReceiver<Vec<u8>>>,
 }
 
 impl Rudp {
@@ -357,16 +406,19 @@ impl Rudp {
         peers: Option<PeersMap>,
     ) -> Rudp {
         let (closed_tx, _) = watch::channel(false);
-        let (user_tx, user_rx) = mpsc::channel(CHAN_CAP);
+        let (user_tx, user_rx) = mpsc::unbounded_channel();
         let inner = Arc::new(Inner {
             sock,
             peer,
-            sess,
+            sess: tokio::sync::RwLock::new(sess),
             tx: Mutex::new(TxState {
                 next_seq: 0,
                 unacked: BTreeMap::new(),
                 cwnd: CWND_INIT,
+                ssthresh: SSTHRESH_INIT,
                 rto: RTO_INIT,
+                srtt_ms: None,
+                rttvar_ms: 50.0,
                 last_cum: None,
                 dup: 0,
             }),
@@ -374,6 +426,7 @@ impl Rudp {
             closed_tx,
             user_tx,
             last_rx: Mutex::new(Instant::now()),
+            dec_fail: std::sync::atomic::AtomicU64::new(0),
         });
         tokio::spawn(rx_loop(inner.clone(), rx, peers));
         tokio::spawn(rtx_loop(inner.clone()));
@@ -402,13 +455,20 @@ impl Rudp {
                         pkt.push(T_DATA);
                         pkt.extend_from_slice(&seq.to_be_bytes());
                         pkt.extend_from_slice(chunk);
-                        let ct = self.inner.sess.seal(&pad_inner(&pkt))?;
+                        let (ct, sfp) = {
+                            let g = self.inner.sess.read().await;
+                            (g.seal(&pad_inner(&pkt))?, g.fingerprints().0.to_string())
+                        };
+                        if st.next_seq % 32 == 0 {
+                            log::debug!("rudp send seq={seq} send_fp {sfp}");
+                        }
                         self.inner.sock.send_to(&ct, self.inner.peer).await?;
                         st.unacked.insert(
                             seq,
                             Unacked {
                                 ct,
                                 sent_at: Instant::now(),
+                                retrans: false,
                             },
                         );
                         break;
@@ -434,6 +494,38 @@ impl Rudp {
         *self.inner.closed_tx.borrow()
     }
 
+    /// 已测得的平滑 RTT
+    pub fn srtt(&self) -> Option<Duration> {
+        self.inner
+            .tx
+            .try_lock()
+            .ok()
+            .and_then(|st| st.srtt_ms)
+            .map(|ms| Duration::from_secs_f64(ms / 1000.0))
+    }
+
+    /// 会话密钥轮换 (收发同时切)
+    pub async fn set_keys(&self, keys: &SessionKeys, role: Role) {
+        self.inner.sess.write().await.set_keys(keys, role);
+    }
+
+    /// 只切接收方向
+    pub async fn set_recv_keys(&self, keys: &SessionKeys, role: Role) {
+        self.inner.sess.write().await.set_recv_keys(keys, role);
+    }
+
+    /// 只切发送方向
+    pub async fn set_send_keys(&self, keys: &SessionKeys, role: Role) {
+        self.inner.sess.write().await.set_send_keys(keys, role);
+    }
+
+    /// (send_fp, recv_fp) —— 诊断
+    pub async fn key_fps(&self) -> (String, String) {
+        let g = self.inner.sess.read().await;
+        let (a, b) = g.fingerprints();
+        (a.to_string(), b.to_string())
+    }
+
     /// 主动关闭 (best-effort FIN)
     pub async fn close(&self) {
         do_close(&self.inner, true).await;
@@ -448,8 +540,23 @@ async fn rx_loop(inner: Arc<Inner>, mut c: mpsc::Receiver<Vec<u8>>, peers: Optio
     loop {
         let Some(dgram) = c.recv().await else { break };
         *inner.last_rx.lock().await = Instant::now();
-        let Ok(pkt) = inner.sess.open(&dgram) else {
-            continue; // 解密失败静默丢弃
+        let Ok(pkt) = inner.sess.read().await.open(&dgram) else {
+            let n = inner
+                .dec_fail
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            if n % 20 == 0 {
+                let (sfp, rfp) = {
+                    let g = inner.sess.read().await;
+                    let (a, b) = g.fingerprints();
+                    (a.to_string(), b.to_string())
+                };
+                log::debug!(
+                    "rudp 解密失败累计 {} (peer {}, send_fp {sfp}, recv_fp {rfp})",
+                    n + 1,
+                    inner.peer
+                );
+            }
+            continue;
         };
         let Some((t, body)) = unpad(&pkt) else {
             continue;
@@ -461,8 +568,9 @@ async fn rx_loop(inner: Arc<Inner>, mut c: mpsc::Receiver<Vec<u8>>, peers: Optio
                 }
                 let seq = u32::from_be_bytes(body[..4].try_into().unwrap());
                 let payload = body[4..].to_vec();
+                // 交付通道无界, deliver 不阻塞; ACK 紧跟着发
                 if seq == rx.expect {
-                    if !deliver(&inner, &mut rx, seq, payload).await {
+                    if !deliver(&inner, &mut rx, seq, payload) {
                         break;
                     }
                 } else {
@@ -492,13 +600,13 @@ async fn rx_loop(inner: Arc<Inner>, mut c: mpsc::Receiver<Vec<u8>>, peers: Optio
 }
 
 /// 交付 seq 并冲刷连续的 pending; 返回 false 表示用户侧已断开
-async fn deliver(inner: &Inner, rx: &mut RxState, seq: u32, payload: Vec<u8>) -> bool {
-    if inner.user_tx.send(payload).await.is_err() {
+fn deliver(inner: &Inner, rx: &mut RxState, seq: u32, payload: Vec<u8>) -> bool {
+    if inner.user_tx.send(payload).is_err() {
         return false;
     }
     rx.expect = seq.wrapping_add(1);
     while let Some(p) = rx.pending.remove(&rx.expect) {
-        if inner.user_tx.send(p).await.is_err() {
+        if inner.user_tx.send(p).is_err() {
             return false;
         }
         rx.expect = rx.expect.wrapping_add(1);
@@ -517,7 +625,7 @@ async fn send_ack(inner: &Inner, cum: u32, pending: &BTreeMap<u32, Vec<u8>>) {
     pkt.push(T_ACK);
     pkt.extend_from_slice(&cum.to_be_bytes());
     pkt.extend_from_slice(&sack.to_be_bytes());
-    if let Ok(ct) = inner.sess.seal(&pad_inner(&pkt)) {
+    if let Ok(ct) = inner.sess.read().await.seal(&pad_inner(&pkt)) {
         let _ = inner.sock.send_to(&ct, inner.peer).await;
     }
 }
@@ -526,20 +634,33 @@ async fn process_ack(inner: &Inner, cum: u32, sack: u32) {
     let mut fast_rtx = None;
     {
         let mut st = inner.tx.lock().await;
-        let before = st.unacked.len();
-        // 移除 <= cum
+        let now = Instant::now();
+        // 取出 <= cum 的条目并采样 RTT (Karn: 仅未被重传过的)
         let rest = st.unacked.split_off(&cum.wrapping_add(1));
-        st.unacked = rest;
-        // sack 位图
-        for i in 0..32u32 {
-            if sack & (1 << i) != 0 {
-                st.unacked.remove(&cum.wrapping_add(1 + i));
+        let acked_map = std::mem::replace(&mut st.unacked, rest);
+        let mut samples: Vec<Duration> = Vec::new();
+        let mut acked: usize = 0;
+        for (_, u) in acked_map {
+            acked += 1;
+            if !u.retrans {
+                samples.push(now.duration_since(u.sent_at));
             }
         }
-        let acked = before - st.unacked.len();
+        for i in 0..32u32 {
+            if sack & (1 << i) != 0 {
+                if let Some(u) = st.unacked.remove(&cum.wrapping_add(1 + i)) {
+                    acked += 1;
+                    if !u.retrans {
+                        samples.push(now.duration_since(u.sent_at));
+                    }
+                }
+            }
+        }
+        for s in samples {
+            st.update_rtt(s);
+        }
         if acked > 0 {
-            st.cwnd = (st.cwnd + acked as f64 / st.cwnd).min(CWND_MAX);
-            st.rto = RTO_INIT;
+            st.on_acked(acked);
             st.dup = 0;
             st.last_cum = Some(cum);
         } else if st.last_cum == Some(cum) && !st.unacked.is_empty() {
@@ -547,6 +668,7 @@ async fn process_ack(inner: &Inner, cum: u32, sack: u32) {
             if st.dup >= 3 {
                 fast_rtx = st.unacked.keys().next().copied();
                 st.dup = 0;
+                st.on_loss();
             }
         }
     }
@@ -558,6 +680,13 @@ async fn process_ack(inner: &Inner, cum: u32, sack: u32) {
         };
         if let Some(ct) = ct {
             log::debug!("fast rtx seq={seq}");
+            {
+                let mut st = inner.tx.lock().await;
+                if let Some(u) = st.unacked.get_mut(&seq) {
+                    u.sent_at = Instant::now();
+                    u.retrans = true;
+                }
+            }
             let _ = inner.sock.send_to(&ct, inner.peer).await;
         }
     }
@@ -582,11 +711,12 @@ async fn rtx_loop(inner: Arc<Inner>) {
                 if now.duration_since(u.sent_at) >= rto {
                     resend.push(u.ct.clone());
                     u.sent_at = now;
+                    u.retrans = true;
                 }
             }
             if !resend.is_empty() {
-                st.cwnd = (st.cwnd / 2.0).max(1.0);
-                st.rto = (st.rto * 2).min(RTO_MAX);
+                st.on_loss();
+                st.rto = (st.rto * 2).min(RTO_MAX); // 退避
             }
         }
         for ct in resend {
@@ -601,7 +731,7 @@ async fn do_close(inner: &Inner, send_fin: bool) {
         return;
     }
     if send_fin {
-        if let Ok(ct) = inner.sess.seal(&pad_inner(&[T_FIN])) {
+        if let Ok(ct) = inner.sess.read().await.seal(&pad_inner(&[T_FIN])) {
             let _ = inner.sock.send_to(&ct, inner.peer).await;
         }
     }

@@ -12,8 +12,9 @@ use tokio::net::{TcpStream, UdpSocket};
 use tokio::sync::{mpsc, watch, Mutex};
 use tokio::time::timeout;
 use yz_crypto::{
-    handshake_accept, handshake_finish, handshake_init, unwrap_hs_len, wrap_hs_stream,
-    NetworkSecret, PeerInfo, Role, Session, SessionKeys, MSG1_LEN, MSG2_LEN,
+    handshake_accept, handshake_finish, handshake_init, rekey_finish, rekey_init, rekey_respond,
+    unwrap_hs_len, wrap_hs_stream, NetworkSecret, PeerInfo, RekeyState, Role, Session, SessionKeys,
+    MSG1_LEN, MSG2_LEN,
 };
 use yz_proto::{Addr, Frame, MAX_FRAME_LEN};
 use yz_rudp::Rudp;
@@ -39,6 +40,12 @@ pub struct TunnelHandle {
     pub closed: watch::Receiver<bool>,
 }
 
+/// 供延迟切换发送钥使用
+enum EitherLink {
+    Tcp(Arc<Mutex<Session>>),
+    Udp(Arc<Rudp>),
+}
+
 enum Link {
     Tcp {
         sess: Arc<Mutex<Session>>,
@@ -49,6 +56,9 @@ enum Link {
 
 pub struct Tunnel {
     link: Link,
+    role: Role,
+    /// 进行中的 rekey 状态 (发起方)
+    rekey: Mutex<Option<RekeyState>>,
     streams: Mutex<HashMap<u32, mpsc::Sender<Frame>>>,
     ctrl_tx: mpsc::Sender<Frame>,
     accept_tx: mpsc::Sender<Incoming>,
@@ -60,6 +70,7 @@ pub struct Tunnel {
 impl Tunnel {
     fn assemble(
         link: Link,
+        role: Role,
         sid_base: u32,
         tcp_reader: Option<Box<dyn AsyncRead + Unpin + Send>>,
     ) -> (
@@ -75,6 +86,8 @@ impl Tunnel {
         let (closed_tx, closed_rx) = watch::channel(false);
         let t = Arc::new(Tunnel {
             link,
+            role,
+            rekey: Mutex::new(None),
             streams: Mutex::new(HashMap::new()),
             ctrl_tx,
             accept_tx,
@@ -138,6 +151,90 @@ impl Tunnel {
 
     pub(crate) async fn close_stream(&self, sid: u32) {
         self.streams.lock().await.remove(&sid);
+    }
+
+    /// 发起密钥轮换, 返回本端报文
+    pub async fn rekey_begin(&self) -> Result<Vec<u8>> {
+        let (wire, st) = rekey_init()?;
+        *self.rekey.lock().await = Some(st);
+        Ok(wire)
+    }
+
+    /// 收到对端 rekey 报文(作为响应方): 只算密钥, 由调用方先用旧钥回包再切换。
+    /// 顺序很重要: 若先换钥, ack 会用新钥加密而对端仍是旧钥 → 解不开。
+    pub async fn rekey_accept(&self, peer_wire: &[u8]) -> Result<(Vec<u8>, SessionKeys)> {
+        let (wire, st) = rekey_init()?;
+        let (_mine, keys) = rekey_respond(st, peer_wire)?;
+        Ok((wire, keys))
+    }
+
+    /// 应用新密钥 (供调用方在回包之后调用)
+    pub async fn apply_keys_public(&self, keys: &SessionKeys) {
+        self.apply_keys(keys).await;
+    }
+
+    /// 收到对端 rekey 应答(作为发起方): 换钥
+    pub async fn rekey_finish_with(&self, peer_wire: &[u8]) -> Result<()> {
+        let st = self
+            .rekey
+            .lock()
+            .await
+            .take()
+            .context("no pending rekey")?;
+        let keys = rekey_finish(st, peer_wire, self.role)?;
+        self.apply_keys(&keys).await;
+        Ok(())
+    }
+
+    /// 响应方换钥: 立即切收钥(能解对端新钥), 延迟切发钥
+    /// 理由: 发起方收到 ack 就切了; 若我们立刻切发钥, 我们发出的新钥帧对端(未切)解不开。
+    /// 延迟期间我们仍用旧钥发送, 对端靠其"上一代收钥窗口"解出, 实现零丢包。
+    pub(crate) async fn apply_keys_responder(&self, keys: &SessionKeys) {
+        log::info!(
+            "rekey applied (responder, fp {})",
+            yz_crypto::key_fingerprint(keys)
+        );
+        match &self.link {
+            Link::Tcp { sess, .. } => sess.lock().await.set_recv_keys(keys, self.role),
+            Link::Udp(r) => {
+                r.set_recv_keys(keys, self.role).await;
+                log::debug!("udp link recv 切到 fp {:?}", r.key_fps().await);
+            }
+        }
+        let keys = *keys;
+        let role = self.role;
+        // 500ms 后切发送方向
+        let link_recv = match &self.link {
+            Link::Tcp { sess, .. } => EitherLink::Tcp(sess.clone()),
+            Link::Udp(r) => EitherLink::Udp(r.clone()),
+        };
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(500)).await;
+            match link_recv {
+                EitherLink::Tcp(sess) => sess.lock().await.set_send_keys(&keys, role),
+                EitherLink::Udp(r) => r.set_send_keys(&keys, role).await,
+            }
+        });
+    }
+
+    async fn apply_keys(&self, keys: &SessionKeys) {
+        log::info!(
+            "rekey applied (role {:?}, fp {})",
+            self.role,
+            yz_crypto::key_fingerprint(keys)
+        );
+        match &self.link {
+            Link::Tcp { sess, .. } => sess.lock().await.set_keys(keys, self.role),
+            Link::Udp(r) => r.set_keys(keys, self.role).await,
+        }
+    }
+
+    /// UDP 链路已测得的平滑 RTT (诊断用)
+    pub fn link_rtt(&self) -> Option<Duration> {
+        match &self.link {
+            Link::Udp(r) => r.srtt(),
+            Link::Tcp { .. } => None,
+        }
     }
 
     pub fn is_closed(&self) -> bool {
@@ -216,6 +313,7 @@ where
                 Box::new(w) as Box<dyn AsyncWrite + Unpin + Send>,
             )),
         },
+        role,
         sid_base,
         Some(Box::new(r)),
     );
@@ -363,8 +461,13 @@ pub fn from_rudp(rudp: Rudp, peer_info: PeerInfo) -> TunnelHandle {
 
 /// UDP 隧道装配, sid_base: 发起方 1, 响应方 2
 pub fn from_rudp_with_base(rudp: Rudp, peer_info: PeerInfo, sid_base: u32) -> TunnelHandle {
+    let role = if sid_base == 1 {
+        Role::Initiator
+    } else {
+        Role::Responder
+    };
     let (tunnel, ctrl_rx, accept_rx, mesh_rx, closed) =
-        Tunnel::assemble(Link::Udp(Arc::new(rudp)), sid_base, None);
+        Tunnel::assemble(Link::Udp(Arc::new(rudp)), role, sid_base, None);
     TunnelHandle {
         tunnel,
         peer: peer_info,
@@ -434,7 +537,10 @@ fn spawn_reader_tcp(
                         break;
                     }
                 }
-                Err(_) => break,
+                Err(e) => {
+                    log::debug!("tunnel reader 结束: {e:#}");
+                    break;
+                }
             }
         }
         reader_close(&t).await;
@@ -470,7 +576,10 @@ fn spawn_reader_udp(t: Arc<Tunnel>, rudp: Arc<Rudp>) {
                         }
                     }
                 }
-                Err(_) => break,
+                Err(e) => {
+                    log::debug!("tunnel reader(udp) 结束: {e}");
+                    break;
+                }
             }
         }
         reader_close(&t).await;
@@ -488,7 +597,19 @@ async fn read_frame_tcp(
     anyhow::ensure!(len > 16 && len <= MAX_FRAME_LEN + 16, "bad packet len {len}");
     let mut ct = vec![0u8; len];
     r.read_exact(&mut ct).await?;
-    let plain = { sess.lock().await.open(masked, &mut ct)? };
+    let plain = {
+        let mut s = sess.lock().await;
+        match s.open(masked, &mut ct) {
+            Ok(p) => p,
+            Err(e) => {
+                let (ctr, has_prev) = s.ctr_info();
+                log::debug!(
+                    "解密失败: masked={masked:#06x} len={len} recv_ctr={ctr} (有prev={has_prev})"
+                );
+                return Err(e.into());
+            }
+        }
+    };
     Ok(yz_proto::decode(&plain)?)
 }
 

@@ -390,6 +390,10 @@ pub enum ControlMsg {
         initiator: bool,
         addrs: Vec<String>,
     },
+    /// 密钥轮换: 发起方报文 (eph_pub||nonce)
+    RekeyInit { wire: Vec<u8> },
+    /// 密钥轮换: 响应方报文
+    RekeyAck { wire: Vec<u8> },
     /// 动态入口发布请求 (node → 公网入口节点)
     IngressPub { port: u16, addr: String },
     /// 动态入口发布应答
@@ -400,6 +404,8 @@ const C_HELLO: u8 = 0x01;
 const C_DIR_SYNC: u8 = 0x02;
 const C_PUNCH_REQ: u8 = 0x04;
 const C_PUNCH_START: u8 = 0x05;
+const C_REKEY_INIT: u8 = 0x0b;
+const C_REKEY_ACK: u8 = 0x0c;
 const C_INGRESS_PUB: u8 = 0x09;
 const C_INGRESS_PUB_ACK: u8 = 0x0a;
 
@@ -447,6 +453,16 @@ pub fn encode_control(m: &ControlMsg) -> Vec<u8> {
             for a in addrs {
                 push_str(&mut out, a);
             }
+        }
+        ControlMsg::RekeyInit { wire } => {
+            out.push(C_REKEY_INIT);
+            out.extend_from_slice(&(wire.len() as u16).to_be_bytes());
+            out.extend_from_slice(wire);
+        }
+        ControlMsg::RekeyAck { wire } => {
+            out.push(C_REKEY_ACK);
+            out.extend_from_slice(&(wire.len() as u16).to_be_bytes());
+            out.extend_from_slice(wire);
         }
         ControlMsg::IngressPub { port, addr } => {
             out.push(C_INGRESS_PUB);
@@ -535,6 +551,18 @@ pub fn decode_control(b: &[u8]) -> Result<ControlMsg, DecodeError> {
                 initiator,
                 addrs,
             })
+        }
+        C_REKEY_INIT | C_REKEY_ACK => {
+            let len = take_u16(&mut cur)? as usize;
+            if cur.len() != len {
+                return Err(DecodeError::Truncated);
+            }
+            let wire = cur.to_vec();
+            if t == C_REKEY_INIT {
+                Ok(ControlMsg::RekeyInit { wire })
+            } else {
+                Ok(ControlMsg::RekeyAck { wire })
+            }
         }
         C_INGRESS_PUB => {
             let port = take_u16(&mut cur)?;
@@ -683,6 +711,12 @@ mod tests {
                 peer_id: "fedcba9876543210".into(),
                 initiator: true,
                 addrs: vec!["5.6.7.8:9000".into(), "[::1]:9000".into()],
+            },
+            ControlMsg::RekeyInit {
+                wire: vec![7u8; 48],
+            },
+            ControlMsg::RekeyAck {
+                wire: vec![9u8; 48],
             },
             ControlMsg::IngressPub {
                 port: 8080,
