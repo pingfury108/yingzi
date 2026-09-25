@@ -1,3 +1,6 @@
+[workspace]
+members = ["crates/yz-proto", "crates/yz-crypto", "crates/yz-node"]
+
 [package]
 name = "yingzi"
 version = "0.1.0"

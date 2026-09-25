@@ -1,0 +1,17 @@
+[package]
+name = "yz-node"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "yz"
+path = "src/main.rs"
+
+[dependencies]
+yz-proto = { path = "../yz-proto" }
+yz-crypto = { path = "../yz-crypto" }
+anyhow = "1"
+clap = { version = "4", features = ["derive", "env"] }
+tokio = { version = "1", features = ["full"] }
+log = "0.4"
+env_logger = "0.11"
