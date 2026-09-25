@@ -107,6 +107,7 @@ async function refresh() {
         <span class="mono sub">${short(n.node_id)}</span>
         <span class="mono sub">${n.vip}</span>
         <span class="mono sub">${n.addr}</span>
+        ${n.rtt_ms != null ? `<span class="mono sub">${n.rtt_ms} ms</span>` : ''}
         <span class="grow"></span>
         ${n.p2p ? '<span class="badge exit">p2p</span>' : ''}
         ${n.exit_capable ? '<span class="badge exit">exit</span>' : ''}

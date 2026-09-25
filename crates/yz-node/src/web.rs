@@ -46,11 +46,13 @@ struct NodeResp {
     node_id: String,
     name: String,
     addr: String,
-    /// 确定性虚拟 IP (100.64.0.0/10)
+    /// 确定性虚拟 IP (100.64.0.0/14)
     vip: String,
     p2p: bool,
     exit_capable: bool,
     is_self: bool,
+    /// 最近测得 RTT (ms, None = 未测量)
+    rtt_ms: Option<u32>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -136,6 +138,7 @@ async fn status(State(app): State<Arc<AppState>>) -> Json<StatusResp> {
 
 async fn nodes(State(app): State<Arc<AppState>>) -> Json<Vec<NodeResp>> {
     let dir = app.node.dir.read().await;
+    let rtt = app.node.rtt.read().await;
     let mut v: Vec<NodeResp> = dir
         .values()
         .map(|n| NodeResp {
@@ -146,6 +149,7 @@ async fn nodes(State(app): State<Arc<AppState>>) -> Json<Vec<NodeResp>> {
             p2p: !n.udp_addr.is_empty(),
             exit_capable: n.caps & caps::EXIT != 0,
             is_self: n.node_id == app.info.node_id,
+            rtt_ms: rtt.get(&n.node_id).copied(),
         })
         .collect();
     v.sort_by(|a, b| a.name.cmp(&b.name));
@@ -161,6 +165,7 @@ async fn get_exit(State(app): State<Arc<AppState>>) -> Json<ExitReq> {
 async fn set_exit(State(app): State<Arc<AppState>>, Json(req): Json<ExitReq>) -> StatusCode {
     log::info!("default exit -> {}", req.exit);
     *app.node.default_exit.write().await = req.exit;
+    app.node.save_config().await;
     StatusCode::NO_CONTENT
 }
 
@@ -183,6 +188,7 @@ async fn add_route(State(app): State<Arc<AppState>>, Json(req): Json<RouteAddReq
         Ok(r) => {
             log::info!("route + {}", req.rule);
             app.node.routes.write().await.push(r);
+            app.node.save_config().await;
             StatusCode::CREATED
         }
         Err(e) => {
@@ -196,7 +202,9 @@ async fn del_route(State(app): State<Arc<AppState>>, Path(idx): Path<usize>) -> 
     let mut routes = app.node.routes.write().await;
     if idx < routes.len() {
         let r = routes.remove(idx);
+        drop(routes);
         log::info!("route - {r}");
+        app.node.save_config().await;
         StatusCode::NO_CONTENT
     } else {
         StatusCode::NOT_FOUND

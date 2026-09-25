@@ -103,6 +103,9 @@ enum Cmd {
         /// 关闭 TUN 虚拟组网
         #[arg(long)]
         no_tun: bool,
+        /// 可持久化配置路径 (Web UI 改的出口/规则落盘到此)
+        #[arg(long)]
+        config: Option<String>,
     },
     /// 独立隧道出口(无 mesh)
     Serve {
@@ -183,6 +186,7 @@ async fn main() -> Result<()> {
             fallback,
             tun,
             no_tun,
+            config,
         } => {
             let routes = routes
                 .iter()
@@ -213,6 +217,7 @@ async fn main() -> Result<()> {
                     exit_acl: policy::ExitAcl::parse(&exit_allow),
                     fallback,
                     tun: if no_tun { None } else { Some(tun) },
+                    config: config.map(std::path::PathBuf::from),
                 },
                 &ns,
                 id_pub,

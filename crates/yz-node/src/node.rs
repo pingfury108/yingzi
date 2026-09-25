@@ -10,11 +10,12 @@ use crate::policy::{match_route, ExitAcl, RouteRule};
 use crate::socks5;
 use crate::tunnel::{self, Incoming, Tunnel, TunnelHandle};
 use anyhow::{bail, Context, Result};
+use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::net::SocketAddr;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{mpsc, oneshot, Mutex, RwLock};
 use tokio::time::timeout;
@@ -48,6 +49,8 @@ pub struct NodeOpts {
     pub fallback: Option<String>,
     /// TUN 网卡名, 启用虚拟组网
     pub tun: Option<String>,
+    /// 可持久化配置路径 (Web UI 改动落盘)
+    pub config: Option<PathBuf>,
 }
 
 #[derive(Default)]
@@ -72,13 +75,67 @@ pub struct NodeState {
     pub punch_pending: Mutex<HashMap<String, oneshot::Sender<Vec<String>>>>,
     /// mesh 收编: 隧道来的 IP 包 → TUN (未启用 TUN 时 None)
     pub mesh_sink: RwLock<Option<mpsc::Sender<Vec<u8>>>>,
+    /// node_id → 最近测得 RTT (ms)
+    pub rtt: RwLock<HashMap<String, u32>>,
+    /// 持久化配置路径
+    pub config_path: Option<PathBuf>,
+}
+
+/// 落盘的最小配置面 (Web UI 可改的那部分)
+#[derive(Serialize, Deserialize, Default)]
+pub struct PersistedConfig {
+    pub default_exit: Option<String>,
+    pub routes: Option<Vec<String>>,
+}
+
+impl NodeState {
+    /// 将当前路由/默认出口写入配置文件
+    pub async fn save_config(&self) {
+        let Some(path) = &self.config_path else { return };
+        let cfg = PersistedConfig {
+            default_exit: Some(self.default_exit.read().await.clone()),
+            routes: Some(self.routes.read().await.iter().map(|r| r.to_string()).collect()),
+        };
+        match serde_json::to_string_pretty(&cfg) {
+            Ok(s) => {
+                if let Err(e) = std::fs::write(path, s) {
+                    log::warn!("save config {}: {e}", path.display());
+                }
+            }
+            Err(e) => log::warn!("serialize config: {e}"),
+        }
+    }
 }
 
 pub async fn run(opts: NodeOpts, ns: &NetworkSecret, id_pub: [u8; 32]) -> Result<()> {
     let self_id = yz_crypto::node_id(&id_pub);
-    let state = Arc::new(NodeState::default());
-    *state.routes.write().await = opts.routes.clone();
-    *state.default_exit.write().await = opts.default_exit.clone();
+    let mut state0 = NodeState::default();
+    state0.config_path.clone_from(&opts.config);
+    let state = Arc::new(state0);
+
+    // 配置加载: 文件优先 (Web UI 改的是事实源), 无文件时用 CLI 初值
+    let persisted: Option<PersistedConfig> = opts
+        .config
+        .as_ref()
+        .and_then(|p| std::fs::read_to_string(p).ok())
+        .and_then(|s| serde_json::from_str(&s).ok());
+    let (routes_init, exit_init) = match &persisted {
+        Some(c) => (
+            c.routes
+                .as_ref()
+                .map(|rs| rs.iter().filter_map(|r| RouteRule::parse(r).ok()).collect())
+                .unwrap_or_else(|| opts.routes.clone()),
+            c.default_exit
+                .clone()
+                .unwrap_or_else(|| opts.default_exit.clone()),
+        ),
+        None => (opts.routes.clone(), opts.default_exit.clone()),
+    };
+    *state.routes.write().await = routes_init;
+    *state.default_exit.write().await = exit_init;
+    if opts.config.is_some() && persisted.is_none() {
+        state.save_config().await; // 首次生成配置文件
+    }
 
     // 0) UDP 端点 + NAT 探测 (YZ_NO_P2P=1 强制关闭, 调试用)
     let udp_ep = if std::env::var("YZ_NO_P2P").is_ok() {
@@ -299,6 +356,20 @@ pub async fn run(opts: NodeOpts, ns: &NetworkSecret, id_pub: [u8; 32]) -> Result
                     opts.exit_acl.clone(),
                     true,
                 );
+                // coordinator 隧道存活探测 (它挂了要尽早重连)
+                {
+                    let t = h.tunnel.clone();
+                    tokio::spawn(async move {
+                        loop {
+                            tokio::time::sleep(Duration::from_secs(10)).await;
+                            if t.is_closed()
+                                || t.write_frame(&Frame::Ping { ts: now_ms() }).await.is_err()
+                            {
+                                break;
+                            }
+                        }
+                    });
+                }
                 loop {
                     tokio::select! {
                         f = h.ctrl_rx.recv() => match f {
@@ -441,19 +512,26 @@ async fn handle_socks5(
 async fn resolve_exit(state: &Arc<NodeState>, exit: &str, self_id: &str) -> Exit {
     match exit {
         "direct" => Exit::Direct,
-        "auto" => {
-            // P3: 取目录里第一个可出口节点(非自己); P4 起按延迟
-            let dir = state.dir.read().await;
-            let mut candidates: Vec<&NodeEntry> = dir
-                .values()
-                .filter(|n| n.caps & caps::EXIT != 0 && n.node_id != self_id)
-                .collect();
-            candidates.sort_by(|a, b| a.node_id.cmp(&b.node_id));
-            match candidates.first() {
-                Some(n) => Exit::Via(n.node_id.clone()),
-                None => Exit::Direct,
-            }
-        }
+                // auto: 选延迟最低的可出口节点 (未测得延迟的排最后)
+                "auto" => {
+                    let dir = state.dir.read().await;
+                    let rtt = state.rtt.read().await;
+                    let mut cands: Vec<(u32, String)> = dir
+                        .values()
+                        .filter(|n| n.caps & caps::EXIT != 0 && n.node_id != self_id)
+                        .map(|n| {
+                            (
+                                rtt.get(&n.node_id).copied().unwrap_or(u32::MAX),
+                                n.node_id.clone(),
+                            )
+                        })
+                        .collect();
+                    cands.sort();
+                    match cands.first() {
+                        Some((_, id)) => Exit::Via(id.clone()),
+                        None => Exit::Direct,
+                    }
+                }
         key => {
             match resolve_node(state, key).await {
                 Some(n) => Exit::Via(n.node_id),
@@ -539,6 +617,87 @@ async fn relay_fallback(
     Ok(adopt_tunnel(state, h, node_id, ns, *id_pub).await)
 }
 
+/// 隧道控制消息统一处理: 延迟测量(PING/PONG) + 存活探测 + 可选 ingress 发布
+///
+/// `ingress = None` 时只处理延迟/回射 ingress 应答 (主动侧/中继侧隧道)
+fn spawn_ctrl_handler(
+    t: Arc<Tunnel>,
+    mut ctrl: mpsc::Receiver<Frame>,
+    peer_id: String,
+    state: Option<Arc<NodeState>>,
+    ingress: Option<(ExitAcl, (u16, u16))>,
+) {
+    // 每 10s 发一次 PING, 兼作存活探测 (对端不回则 RTT 不更新)
+    if let Some(st) = &state {
+        let t2 = t.clone();
+        let pid = peer_id.clone();
+        let st2 = st.clone();
+        tokio::spawn(async move {
+            loop {
+                tokio::time::sleep(Duration::from_secs(10)).await;
+                if t2.is_closed() {
+                    st2.rtt.write().await.remove(&pid);
+                    break;
+                }
+                if t2.write_frame(&Frame::Ping { ts: now_ms() }).await.is_err() {
+                    break;
+                }
+            }
+        });
+    }
+    tokio::spawn(async move {
+        while let Some(f) = ctrl.recv().await {
+            match f {
+                Frame::Ping { ts } => {
+                    let _ = t.write_frame(&Frame::Pong { ts }).await;
+                }
+                Frame::Pong { ts } => {
+                    if let Some(st) = &state {
+                        let rtt = now_ms().saturating_sub(ts).min(u32::MAX as u64) as u32;
+                        st.rtt.write().await.insert(peer_id.clone(), rtt);
+                    }
+                }
+                Frame::Control { payload } => {
+                    if let Some((acl, range)) = &ingress {
+                        if let Ok(ControlMsg::IngressPub { port, addr }) =
+                            yz_proto::decode_control(&payload)
+                        {
+                            let (ok, msg) = ingress::handle_pub_request(
+                                &state,
+                                acl,
+                                *range,
+                                &peer_id,
+                                port,
+                                &addr,
+                                t.clone(),
+                            )
+                            .await;
+                            let ack =
+                                yz_proto::encode_control(&ControlMsg::IngressPubAck { port, ok, msg });
+                            let _ = t.write_frame(&Frame::Control { payload: ack }).await;
+                        }
+                    } else if let Ok(ControlMsg::IngressPubAck { port, ok, msg }) =
+                        yz_proto::decode_control(&payload)
+                    {
+                        log::info!(
+                            "ingress :{port} {} ({msg})",
+                            if ok { "ok" } else { "failed" }
+                        );
+                    }
+                }
+                _ => {}
+            }
+        }
+    });
+}
+
+fn now_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64
+}
+
 /// 隧道收编: 排空控制消息 + 接管对端开流 + mesh 转发 + 注册到隧道表
 async fn adopt_tunnel(
     state: &Arc<NodeState>,
@@ -548,8 +707,13 @@ async fn adopt_tunnel(
     id_pub: [u8; 32],
 ) -> Arc<Tunnel> {
     let t = h.tunnel.clone();
-    let mut ctrl = h.ctrl_rx;
-    tokio::spawn(async move { while ctrl.recv().await.is_some() {} });
+    spawn_ctrl_handler(
+        t.clone(),
+        h.ctrl_rx,
+        node_id.to_string(),
+        Some(state.clone()),
+        None,
+    );
     spawn_incoming_handler(
         t.clone(),
         h.accept_rx,
@@ -731,35 +895,14 @@ pub async fn handle_peer(h: TunnelHandle, ctx: &PeerCtx) -> Result<()> {
         st.tunnels.lock().await.insert(peer_id.clone(), t.clone());
     }
 
-    // peer 控制消息: 动态 ingress 发布
-    let mut ctrl = h.ctrl_rx;
-    {
-        let t = t.clone();
-        let peer_id = peer_id.clone();
-        let ingress_acl = ctx.ingress_acl.clone();
-        let range = ctx.ingress_ports;
-        let state = ctx.state.clone();
-        tokio::spawn(async move {
-            while let Some(f) = ctrl.recv().await {
-                let Frame::Control { payload } = f else { continue };
-                if let Ok(ControlMsg::IngressPub { port, addr }) = yz_proto::decode_control(&payload)
-                {
-                    let (ok, msg) = ingress::handle_pub_request(
-                        &state,
-                        &ingress_acl,
-                        range,
-                        &peer_id,
-                        port,
-                        &addr,
-                        t.clone(),
-                    )
-                    .await;
-                    let ack = yz_proto::encode_control(&ControlMsg::IngressPubAck { port, ok, msg });
-                    let _ = t.write_frame(&Frame::Control { payload: ack }).await;
-                }
-            }
-        });
-    }
+    // 控制消息: PING/PONG(延迟) + 动态 ingress 发布
+    spawn_ctrl_handler(
+        t.clone(),
+        h.ctrl_rx,
+        peer_id.clone(),
+        ctx.state.clone(),
+        Some((ctx.ingress_acl.clone(), ctx.ingress_ports)),
+    );
 
     spawn_incoming_handler(
         t.clone(),
@@ -830,8 +973,13 @@ pub(crate) fn spawn_incoming_handler(
                                 peer,
                             );
                             let t2 = h.tunnel.clone();
-                            let mut ctrl = h.ctrl_rx;
-                            tokio::spawn(async move { while ctrl.recv().await.is_some() {} });
+                            spawn_ctrl_handler(
+                                t2.clone(),
+                                h.ctrl_rx,
+                                pid.clone(),
+                                state.clone(),
+                                None,
+                            );
                             if let Some(st) = &state {
                                 crate::mesh::spawn_forward(h.mesh_rx, st.clone());
                             }
