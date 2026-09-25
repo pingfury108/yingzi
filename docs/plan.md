@@ -196,15 +196,13 @@ port_range = "8000-9000"
 - 时序整形：burst 聚合 + 随机微延迟
 - fallback：未通过握手的连接转发到本机真实站点，探测者看到正常网站
 
-## 8. NAT 打洞（yz-nat，P2）
+## 8. NAT 打洞（yz-rudp Endpoint，P2b ✔）
 
-1. 节点经隧道向 coordinator 报备（自研 STUN-like 拿公网映射，判断 NAT 类型）
-2. coordinator 撮合：交换双方 candidates（公网/内网/端口增量预测范围）
-3. UDP simultaneous open 同步发包
-4. 对称 NAT 兜底：端口预测 + birthday 多端口散射
-5. 全失败 → RELAY_OPEN 走 coordinator 中继（仍是端到端加密）
-
-打洞成功后，同一套握手+会话直接跑在 P2P UDP 上（传输层换成 udp-reliable）。
+1. 节点 UDP 端点与 TCP 同端口绑定；经 coordinator 的 UDP P / P+1 双端口探测公网映射，判定 cone/对称 NAT
+2. HELLO 携带 udp_addr 入目录；`tunnel_for` 优先 P2P：PunchReq → coordinator 互发 PunchStart(candidates)
+3. 双方散射 NS 认证的 PUNCH 包（对称 NAT 绕观察端口 ±64 采样 32 端口）
+4. 打通后同一 UDP 端点上跑 YZP 握手 → Rudp 可靠流隧道；失败回退 TCP 直连
+5. 中继（TURN-like）未实现，列入 P7
 
 ## 9. 目录结构
 
@@ -215,7 +213,7 @@ yingzi/
 │   ├── yz-proto/          # 帧编解码 (§3.4)            [P0 ✔]
 │   ├── yz-crypto/         # NS/身份/握手/会话 (§3.1-3.3) [P0 ✔]
 │   ├── yz-node/           # 节点二进制 (dial/serve)      [P0 ✔]
-│   ├── yz-transport/      # 传输抽象 + tcp/wss/udp       [P2]
+│   ├── yz-rudp/           # UDP 可靠传输 (P2a ✔)                       │
 │   ├── yz-nat/            # 打洞                          [P2]
 │   ├── yz-mesh/           # 目录同步/路由/虚拟IP          [P1/P6]
 │   ├── yz-policy/         # 出口策略 + 入口发布 + ACL           [P3]
@@ -229,7 +227,8 @@ yingzi/
 |---|---|---|
 | **P0** 协议地基 ✔ | yz-proto + yz-crypto + yz-node(dial/serve, TCP承载, 单流) | 两节点加密转发 TCP |
 | **P1** 组网骨架 ✔ | node 统一角色 + coordinator + 目录同步(HELLO/DIR_SYNC) + 一隧道多流复用 | 多节点互相可见, 并发流复用 |
-| **P2** UDP+打洞 | 传输抽象、udp-reliable(ARQ/SACK/FEC)、yz-nat | NAT 后两节点 P2P 直连 |
+| **P2a** UDP 可靠传输 ✔ | yz-rudp(加密元数据/SACK/快速重传/AIMD) + 隧道双承载(TCP/UDP) + serve/dial --udp | 20MB 经 UDP 隧道 MD5 一致 |
+| **P2b** NAT 打洞 ✔ | probe(双端口判定 cone/对称) + PUNCH_REQ/START 撮合 + 散射 + P2P UDP 直连, TCP 兜底 | 节点间无 TCP 连接的纯 UDP 代理成功 |
 | **P3** 出口/入口体系 ✔ | exit + 策略路由 + ACL + SOCKS5 入口 + ingress 静态/动态端口发布 | 任选节点出流量/公网反代组网服务 |
 | **P4** Web UI ✔(轮询版) | yz-web: status/nodes/exit/routes API + 内嵌单页控制台 | 浏览器可看全网节点、切换出口、增删规则 |
 | **P5** 隐匿增强 | 噪声/模仿双模式、fallback、时序整形 | 抓包无结构可识别 |

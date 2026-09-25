@@ -15,6 +15,7 @@ use yz_proto::{ControlMsg, Frame, NodeEntry};
 struct NodeRec {
     name: String,
     addr: String,
+    udp_addr: String,
     caps: u8,
     tunnel: Arc<Tunnel>,
 }
@@ -24,6 +25,21 @@ type Registry = Arc<Mutex<HashMap<String, NodeRec>>>;
 pub async fn run(bind: &str, ns: &NetworkSecret, id_pub: [u8; 32]) -> Result<()> {
     let listener = TcpListener::bind(bind).await?;
     log::info!("coordinator on {bind}, node_id = {}", yz_crypto::node_id(&id_pub));
+
+    // NAT 探测应答器: UDP bind端口 与 +1 (双端口判定对称NAT)
+    if let Ok(sa) = bind.parse::<std::net::SocketAddr>() {
+        for off in 0u16..=1 {
+            let addr = std::net::SocketAddr::new(sa.ip(), sa.port() + off);
+            match tokio::net::UdpSocket::bind(addr).await {
+                Ok(s) => match yz_rudp::probe_key(ns) {
+                    Ok(k) => yz_rudp::spawn_probe_responder(s, k),
+                    Err(e) => log::warn!("probe key: {e:#}"),
+                },
+                Err(e) => log::warn!("probe udp bind {addr}: {e}"),
+            }
+        }
+    }
+
     let registry: Registry = Default::default();
     loop {
         let (stream, from) = listener.accept().await?;
@@ -51,21 +67,22 @@ async fn handle(
     let first = timeout(Duration::from_secs(10), h.ctrl_rx.recv())
         .await?
         .context("expect HELLO")?;
-    let (name, addr, caps) = match first {
+    let (name, addr, udp_addr, caps) = match first {
         Frame::Control { payload } => match yz_proto::decode_control(&payload)? {
             ControlMsg::Hello {
                 version,
                 name,
                 addr,
+                udp_addr,
                 caps,
             } => {
                 // advertise 为通配地址时, 用观察到的源 IP 替代主机部分
                 let addr = fixup_advertise(&addr, &from);
                 log::info!(
-                    "node {} ({name}) joined from {from}, addr {addr}, proto v{version}",
+                    "node {} ({name}) joined from {from}, addr {addr}, udp {udp_addr}, proto v{version}",
                     &nid[..8]
                 );
-                (name, addr, caps)
+                (name, addr, udp_addr, caps)
             }
             _ => bail!("expect HELLO"),
         },
@@ -77,6 +94,7 @@ async fn handle(
         NodeRec {
             name,
             addr,
+            udp_addr,
             caps,
             tunnel: h.tunnel.clone(),
         },
@@ -88,6 +106,11 @@ async fn handle(
             f = h.ctrl_rx.recv() => match f {
                 Some(Frame::Ping { ts }) => {
                     let _ = h.tunnel.write_frame(&Frame::Pong { ts }).await;
+                }
+                Some(Frame::Control { payload }) => {
+                    if let Ok(ControlMsg::PunchReq { target }) = yz_proto::decode_control(&payload) {
+                        route_punch(&registry, &nid, &target).await;
+                    }
                 }
                 Some(_) => {}
                 None => break,
@@ -110,6 +133,7 @@ async fn broadcast(registry: &Registry) {
             node_id: id.clone(),
             name: r.name.clone(),
             addr: r.addr.clone(),
+            udp_addr: r.udp_addr.clone(),
             caps: r.caps,
         })
         .collect();
@@ -122,6 +146,40 @@ async fn broadcast(registry: &Registry) {
             })
             .await;
     }
+}
+
+/// 打洞撮合: 给双方互发对端 UDP candidates
+async fn route_punch(registry: &Registry, from_id: &str, target: &str) {
+    let (t_from, t_target, udp_from, udp_target) = {
+        let reg = registry.lock().await;
+        let (Some(a), Some(b)) = (reg.get(from_id), reg.get(target)) else {
+            log::debug!("punch req: {from_id} -> {target} 有一方不在线");
+            return;
+        };
+        (
+            a.tunnel.clone(),
+            b.tunnel.clone(),
+            a.udp_addr.clone(),
+            b.udp_addr.clone(),
+        )
+    };
+    let to_req = yz_proto::encode_control(&ControlMsg::PunchStart {
+        peer_id: target.to_string(),
+        initiator: true,
+        addrs: if udp_target.is_empty() {
+            vec![]
+        } else {
+            vec![udp_target]
+        },
+    });
+    let to_tgt = yz_proto::encode_control(&ControlMsg::PunchStart {
+        peer_id: from_id.to_string(),
+        initiator: false,
+        addrs: if udp_from.is_empty() { vec![] } else { vec![udp_from] },
+    });
+    let _ = t_from.write_frame(&Frame::Control { payload: to_req }).await;
+    let _ = t_target.write_frame(&Frame::Control { payload: to_tgt }).await;
+    log::debug!("punch撮合 {} <-> {}", &from_id[..8], &target[..8]);
 }
 
 /// advertise 主机为 0.0.0.0/空 时, 用观察到的源 IP 替代

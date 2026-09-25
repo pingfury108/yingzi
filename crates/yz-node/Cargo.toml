@@ -10,6 +10,7 @@ path = "src/main.rs"
 [dependencies]
 yz-proto = { path = "../yz-proto" }
 yz-crypto = { path = "../yz-crypto" }
+yz-rudp = { path = "../yz-rudp" }
 anyhow = "1"
 axum = "0.8"
 clap = { version = "4", features = ["derive", "env"] }

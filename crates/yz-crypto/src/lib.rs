@@ -120,6 +120,20 @@ impl PeerInfo {
     }
 }
 
+/// 会话角色: 决定使用双向密钥的方向
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Role {
+    Initiator,
+    Responder,
+}
+
+/// 握手产出的原始密钥材料
+pub struct SessionKeys {
+    pub c2s: [u8; 32],
+    pub s2c: [u8; 32],
+    pub mask: [u8; 16],
+}
+
 pub struct InitiatorState {
     eph: Option<EphemeralPrivateKey>,
     nonce_i: [u8; 16],
@@ -167,12 +181,12 @@ pub fn handshake_init(ns: &NetworkSecret, id_pub: &[u8; 32]) -> Result<(Vec<u8>,
     ))
 }
 
-/// 发起方: 处理 msg2, 产出会话
+/// 发起方: 处理 msg2, 产出会话密钥
 pub fn handshake_finish(
     ns: &NetworkSecret,
     mut st: InitiatorState,
     msg2: &[u8],
-) -> Result<(Session, PeerInfo)> {
+) -> Result<(SessionKeys, PeerInfo)> {
     if msg2.len() != MSG2_LEN {
         return Err(Error::BadMessage);
     }
@@ -203,20 +217,19 @@ pub fn handshake_finish(
     let material = agreement::agree_ephemeral(eph, &peer_pub, |shared| {
         derive_session(shared, &msg1, msg2)
     })?;
-    let (k_c2s, k_s2c, mask) = material?;
-    // 发起方: 发送用 c2s
+    let (c2s, s2c, mask) = material?;
     Ok((
-        Session::new(k_c2s, k_s2c, mask),
+        SessionKeys { c2s, s2c, mask },
         PeerInfo { id_pub: id_pub_r },
     ))
 }
 
-/// 响应方: 处理 msg1, 产出 msg2 与会话
+/// 响应方: 处理 msg1, 产出 msg2 与会话密钥
 pub fn handshake_accept(
     ns: &NetworkSecret,
     id_pub: &[u8; 32],
     msg1: &[u8],
-) -> Result<(Vec<u8>, Session, PeerInfo)> {
+) -> Result<(Vec<u8>, SessionKeys, PeerInfo)> {
     if msg1.len() != MSG1_LEN {
         return Err(Error::BadMessage);
     }
@@ -276,11 +289,10 @@ pub fn handshake_accept(
     let material = agreement::agree_ephemeral(eph, &peer_pub, |shared| {
         derive_session(shared, msg1, &msg2_ref)
     })?;
-    let (k_c2s, k_s2c, mask) = material?;
-    // 响应方: 发送用 s2c
+    let (c2s, s2c, mask) = material?;
     Ok((
         msg2,
-        Session::new(k_s2c, k_c2s, mask),
+        SessionKeys { c2s, s2c, mask },
         PeerInfo { id_pub: id_pub_i },
     ))
 }
@@ -347,6 +359,13 @@ impl Session {
         }
     }
 
+    pub fn from_keys(k: &SessionKeys, role: Role) -> Self {
+        match role {
+            Role::Initiator => Self::new(k.c2s, k.s2c, k.mask),
+            Role::Responder => Self::new(k.s2c, k.c2s, k.mask),
+        }
+    }
+
     /// 加密一帧, 输出完整 packet
     pub fn seal(&mut self, frame: &[u8]) -> Result<Vec<u8>> {
         let mut buf = frame.to_vec();
@@ -389,6 +408,82 @@ fn nonce_of(ctr: u64) -> Nonce {
     let mut n = [0u8; 12];
     n[4..].copy_from_slice(&ctr.to_be_bytes());
     Nonce::assume_unique_for_key(n)
+}
+
+/// UDP 数据报会话: 每报文随机 nonce, 报文自带长度边界, 无需掩码长度
+pub struct DgramSession {
+    send_key: LessSafeKey,
+    recv_key: LessSafeKey,
+}
+
+impl DgramSession {
+    pub fn from_keys(k: &SessionKeys, role: Role) -> Self {
+        let (send, recv) = match role {
+            Role::Initiator => (&k.c2s, &k.s2c),
+            Role::Responder => (&k.s2c, &k.c2s),
+        };
+        let mk = |b: &[u8; 32]| {
+            LessSafeKey::new(UnboundKey::new(&CHACHA20_POLY1305, b).expect("32-byte key"))
+        };
+        Self {
+            send_key: mk(send),
+            recv_key: mk(recv),
+        }
+    }
+
+    /// nonce(12) | ct+tag
+    pub fn seal(&self, plaintext: &[u8]) -> Result<Vec<u8>> {
+        dgram_seal(&self.send_key, plaintext)
+    }
+
+    pub fn open(&self, dgram: &[u8]) -> Result<Vec<u8>> {
+        dgram_open(&self.recv_key, dgram)
+    }
+}
+
+fn dgram_seal(key: &LessSafeKey, plaintext: &[u8]) -> Result<Vec<u8>> {
+    let rng = SystemRandom::new();
+    let mut nonce = [0u8; 12];
+    rng.fill(&mut nonce)?;
+    let mut buf = plaintext.to_vec();
+    key.seal_in_place_append_tag(
+        Nonce::assume_unique_for_key(nonce),
+        Aad::empty(),
+        &mut buf,
+    )?;
+    let mut out = Vec::with_capacity(12 + buf.len());
+    out.extend_from_slice(&nonce);
+    out.extend_from_slice(&buf);
+    Ok(out)
+}
+
+fn dgram_open(key: &LessSafeKey, dgram: &[u8]) -> Result<Vec<u8>> {
+    if dgram.len() < 12 + 16 {
+        return Err(Error::BadMessage);
+    }
+    let nonce: [u8; 12] = dgram[..12].try_into().unwrap();
+    let mut ct = dgram[12..].to_vec();
+    let plain = key
+        .open_in_place(Nonce::assume_unique_for_key(nonce), Aad::empty(), &mut ct)
+        .map_err(|_| Error::Auth)?;
+    Ok(plain.to_vec())
+}
+
+/// NS 派生的静态密钥: 用于 NAT 探测/打洞等会话前带外小包, 只有网络成员可解码
+pub struct StaticKey(LessSafeKey);
+
+impl StaticKey {
+    pub fn derive(ns: &NetworkSecret, salt: &[u8]) -> Result<Self> {
+        Ok(Self(hs_key(ns, salt)?))
+    }
+
+    pub fn seal(&self, plain: &[u8]) -> Result<Vec<u8>> {
+        dgram_seal(&self.0, plain)
+    }
+
+    pub fn open(&self, dgram: &[u8]) -> Result<Vec<u8>> {
+        dgram_open(&self.0, dgram)
+    }
 }
 
 fn now_secs() -> u64 {
@@ -451,12 +546,15 @@ mod tests {
         let (msg1, st) = handshake_init(&ns, &id_a).unwrap();
         assert_eq!(msg1.len(), MSG1_LEN);
 
-        let (msg2, mut sess_r, peer_r) = handshake_accept(&ns, &id_b, &msg1).unwrap();
+        let (msg2, keys_r, peer_r) = handshake_accept(&ns, &id_b, &msg1).unwrap();
         assert_eq!(msg2.len(), MSG2_LEN);
         assert_eq!(peer_r.node_id(), node_id(&id_a));
 
-        let (mut sess_i, peer_i) = handshake_finish(&ns, st, &msg2).unwrap();
+        let (keys_i, peer_i) = handshake_finish(&ns, st, &msg2).unwrap();
         assert_eq!(peer_i.node_id(), node_id(&id_b));
+
+        let mut sess_i = Session::from_keys(&keys_i, Role::Initiator);
+        let mut sess_r = Session::from_keys(&keys_r, Role::Responder);
 
         // i -> r
         let pkt = sess_i.seal(b"\x03\x00\x00\x00\x01hi").unwrap();
@@ -481,6 +579,14 @@ mod tests {
             let mut c = p[2..].to_vec();
             sess_r.open(m, &mut c).unwrap();
         }
+
+        // UDP 数据报会话
+        let d_i = DgramSession::from_keys(&keys_i, Role::Initiator);
+        let d_r = DgramSession::from_keys(&keys_r, Role::Responder);
+        let d = d_i.seal(b"udp hello").unwrap();
+        assert_eq!(d_r.open(&d).unwrap(), b"udp hello");
+        let d2 = d_r.seal(b"udp pong").unwrap();
+        assert_eq!(d_i.open(&d2).unwrap(), b"udp pong");
     }
 
     #[test]
@@ -499,8 +605,10 @@ mod tests {
     fn tampered_ciphertext_rejected() {
         let (ns, id_a, id_b) = pair();
         let (msg1, st) = handshake_init(&ns, &id_a).unwrap();
-        let (msg2, mut sess_r, _) = handshake_accept(&ns, &id_b, &msg1).unwrap();
-        let (mut sess_i, _) = handshake_finish(&ns, st, &msg2).unwrap();
+        let (msg2, keys_r, _) = handshake_accept(&ns, &id_b, &msg1).unwrap();
+        let (keys_i, _) = handshake_finish(&ns, st, &msg2).unwrap();
+        let mut sess_i = Session::from_keys(&keys_i, Role::Initiator);
+        let mut sess_r = Session::from_keys(&keys_r, Role::Responder);
         let mut pkt = sess_i.seal(b"data").unwrap();
         let last = pkt.len() - 1;
         pkt[last] ^= 1;

@@ -88,6 +88,9 @@ enum Cmd {
     Serve {
         #[arg(long, default_value = "0.0.0.0:9000")]
         bind: String,
+        /// 使用 UDP 可靠传输而非 TCP
+        #[arg(long)]
+        udp: bool,
     },
     /// 本地入口: 流量经隧道从 peer 出去
     Dial {
@@ -98,6 +101,9 @@ enum Cmd {
         /// 固定目标 host:port (P3 起由策略路由决定)
         #[arg(long)]
         target: String,
+        /// 使用 UDP 可靠传输而非 TCP
+        #[arg(long)]
+        udp: bool,
     },
 }
 
@@ -169,12 +175,13 @@ async fn main() -> Result<()> {
             )
             .await
         }
-        Cmd::Serve { bind } => node::serve(&bind, &ns, id_pub).await,
+        Cmd::Serve { bind, udp } => node::serve(&bind, &ns, id_pub, udp).await,
         Cmd::Dial {
             peer,
             listen,
             target,
-        } => dial::run(&peer, &listen, parse_addr(&target)?, &ns, id_pub).await,
+            udp,
+        } => dial::run(&peer, &listen, parse_addr(&target)?, &ns, id_pub, udp).await,
     }
 }
 

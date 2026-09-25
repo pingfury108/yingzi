@@ -17,9 +17,11 @@ pub async fn run(
     target: Addr,
     ns: &NetworkSecret,
     id_pub: [u8; 32],
+    udp: bool,
 ) -> Result<()> {
     let listener = TcpListener::bind(listen).await?;
-    log::info!("entry on {listen}, via {peer} -> {target}");
+    let proto = if udp { "udp" } else { "tcp" };
+    log::info!("entry on {listen}, via {proto}/{peer} -> {target}");
 
     let current: Arc<Mutex<Option<Arc<Tunnel>>>> = Default::default();
 
@@ -31,7 +33,12 @@ pub async fn run(
         tokio::spawn(async move {
             let mut backoff = Duration::from_secs(1);
             loop {
-                match tunnel::connect(&peer, &ns, &id_pub).await {
+                let h = if udp {
+                    tunnel::connect_udp(&peer, &ns, &id_pub).await
+                } else {
+                    tunnel::connect(&peer, &ns, &id_pub).await
+                };
+                match h {
                     Ok(h) => {
                         backoff = Duration::from_secs(1);
                         log::info!("tunnel to {} up", &h.peer.node_id()[..8]);

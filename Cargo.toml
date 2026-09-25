@@ -1,5 +1,5 @@
 [workspace]
-members = ["crates/yz-proto", "crates/yz-crypto", "crates/yz-node"]
+members = ["crates/yz-proto", "crates/yz-crypto", "crates/yz-node", "crates/yz-rudp"]
 
 [package]
 name = "yingzi"

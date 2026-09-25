@@ -313,8 +313,10 @@ fn decode_addr(b: &[u8]) -> Result<(Addr, usize), DecodeError> {
 pub struct NodeEntry {
     pub node_id: String,
     pub name: String,
-    /// 隧道监听地址 host:port (供其他节点直连)
+    /// 隧道监听地址 host:port (TCP)
     pub addr: String,
+    /// 探测到的公网 UDP 映射地址 (空 = 不支持 P2P)
+    pub udp_addr: String,
     /// 能力位: caps::EXIT 等
     pub caps: u8,
 }
@@ -326,15 +328,24 @@ pub mod caps {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ControlMsg {
-    /// 节点上线注册, addr 为隧道监听地址
+    /// 节点上线注册, addr 为隧道监听地址, udp_addr 为探测到的公网 UDP 映射
     Hello {
         version: u16,
         name: String,
         addr: String,
+        udp_addr: String,
         caps: u8,
     },
     /// 节点目录全量同步 (coordinator → node)
     DirSync { nodes: Vec<NodeEntry> },
+    /// 请求与目标节点打洞 (node → coordinator)
+    PunchReq { target: String },
+    /// 撮合结果: 对端 candidates (coordinator → 双方)
+    PunchStart {
+        peer_id: String,
+        initiator: bool,
+        addrs: Vec<String>,
+    },
     /// 动态入口发布请求 (node → 公网入口节点)
     IngressPub { port: u16, addr: String },
     /// 动态入口发布应答
@@ -343,6 +354,8 @@ pub enum ControlMsg {
 
 const C_HELLO: u8 = 0x01;
 const C_DIR_SYNC: u8 = 0x02;
+const C_PUNCH_REQ: u8 = 0x04;
+const C_PUNCH_START: u8 = 0x05;
 const C_INGRESS_PUB: u8 = 0x09;
 const C_INGRESS_PUB_ACK: u8 = 0x0a;
 
@@ -353,12 +366,14 @@ pub fn encode_control(m: &ControlMsg) -> Vec<u8> {
             version,
             name,
             addr,
+            udp_addr,
             caps,
         } => {
             out.push(C_HELLO);
             out.extend_from_slice(&version.to_be_bytes());
             push_str(&mut out, name);
             push_str(&mut out, addr);
+            push_str(&mut out, udp_addr);
             out.push(*caps);
         }
         ControlMsg::DirSync { nodes } => {
@@ -368,7 +383,25 @@ pub fn encode_control(m: &ControlMsg) -> Vec<u8> {
                 push_str(&mut out, &n.node_id);
                 push_str(&mut out, &n.name);
                 push_str(&mut out, &n.addr);
+                push_str(&mut out, &n.udp_addr);
                 out.push(n.caps);
+            }
+        }
+        ControlMsg::PunchReq { target } => {
+            out.push(C_PUNCH_REQ);
+            push_str(&mut out, target);
+        }
+        ControlMsg::PunchStart {
+            peer_id,
+            initiator,
+            addrs,
+        } => {
+            out.push(C_PUNCH_START);
+            push_str(&mut out, peer_id);
+            out.push(*initiator as u8);
+            out.extend_from_slice(&(addrs.len() as u16).to_be_bytes());
+            for a in addrs {
+                push_str(&mut out, a);
             }
         }
         ControlMsg::IngressPub { port, addr } => {
@@ -394,6 +427,7 @@ pub fn decode_control(b: &[u8]) -> Result<ControlMsg, DecodeError> {
             let version = take_u16(&mut cur)?;
             let name = take_str(&mut cur)?;
             let addr = take_str(&mut cur)?;
+            let udp_addr = take_str(&mut cur)?;
             let caps = *cur.first().ok_or(DecodeError::Truncated)?;
             if cur.len() != 1 {
                 return Err(DecodeError::Trailing);
@@ -402,6 +436,7 @@ pub fn decode_control(b: &[u8]) -> Result<ControlMsg, DecodeError> {
                 version,
                 name,
                 addr,
+                udp_addr,
                 caps,
             })
         }
@@ -412,12 +447,14 @@ pub fn decode_control(b: &[u8]) -> Result<ControlMsg, DecodeError> {
                 let node_id = take_str(&mut cur)?;
                 let name = take_str(&mut cur)?;
                 let addr = take_str(&mut cur)?;
+                let udp_addr = take_str(&mut cur)?;
                 let caps = *cur.first().ok_or(DecodeError::Truncated)?;
                 cur = &cur[1..];
                 nodes.push(NodeEntry {
                     node_id,
                     name,
                     addr,
+                    udp_addr,
                     caps,
                 });
             }
@@ -425,6 +462,35 @@ pub fn decode_control(b: &[u8]) -> Result<ControlMsg, DecodeError> {
                 return Err(DecodeError::Trailing);
             }
             Ok(ControlMsg::DirSync { nodes })
+        }
+        C_PUNCH_REQ => {
+            let target = take_str(&mut cur)?;
+            if !cur.is_empty() {
+                return Err(DecodeError::Trailing);
+            }
+            Ok(ControlMsg::PunchReq { target })
+        }
+        C_PUNCH_START => {
+            let peer_id = take_str(&mut cur)?;
+            let initiator = match cur.first() {
+                Some(0) => false,
+                Some(_) => true,
+                None => return Err(DecodeError::Truncated),
+            };
+            cur = &cur[1..];
+            let count = take_u16(&mut cur)? as usize;
+            let mut addrs = Vec::with_capacity(count);
+            for _ in 0..count {
+                addrs.push(take_str(&mut cur)?);
+            }
+            if !cur.is_empty() {
+                return Err(DecodeError::Trailing);
+            }
+            Ok(ControlMsg::PunchStart {
+                peer_id,
+                initiator,
+                addrs,
+            })
         }
         C_INGRESS_PUB => {
             let port = take_u16(&mut cur)?;
@@ -533,6 +599,7 @@ mod tests {
                 version: 1,
                 name: "nas-home".into(),
                 addr: "1.2.3.4:9100".into(),
+                udp_addr: "1.2.3.4:9100".into(),
                 caps: caps::EXIT,
             },
             ControlMsg::DirSync { nodes: vec![] },
@@ -542,15 +609,25 @@ mod tests {
                         node_id: "0123456789abcdef".into(),
                         name: "vps-tokyo".into(),
                         addr: "1.2.3.4:9000".into(),
+                        udp_addr: "1.2.3.4:9000".into(),
                         caps: caps::EXIT,
                     },
                     NodeEntry {
                         node_id: "fedcba9876543210".into(),
                         name: "nas-home".into(),
                         addr: "5.6.7.8:9000".into(),
+                        udp_addr: String::new(),
                         caps: 0,
                     },
                 ],
+            },
+            ControlMsg::PunchReq {
+                target: "0123456789abcdef".into(),
+            },
+            ControlMsg::PunchStart {
+                peer_id: "fedcba9876543210".into(),
+                initiator: true,
+                addrs: vec!["5.6.7.8:9000".into(), "[::1]:9000".into()],
             },
             ControlMsg::IngressPub {
                 port: 8080,
