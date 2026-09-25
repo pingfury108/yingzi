@@ -18,8 +18,8 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 tokio = { version = "1", features = ["full"] }
 tun = { version = "0.7", features = ["async"] }
-rustls = "0.23"
-tokio-rustls = "0.26"
+rustls = { version = "0.23", default-features = false, features = ["ring", "logging", "std", "tls12"] }
+tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "logging", "tls12"] }
 rustls-pemfile = "2"
 webpki-roots = "0.26"
 log = "0.4"

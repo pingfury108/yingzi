@@ -61,7 +61,19 @@
 
 <script>
 const $ = id => document.getElementById(id);
-const api = (p, opt) => fetch(p, opt).then(r => r.ok ? (r.status===204||r.status===201 ? null : r.json()) : Promise.reject(r.status));
+let TOK = localStorage.getItem('yz_token') || new URLSearchParams(location.search).get('token') || '';
+if (TOK) localStorage.setItem('yz_token', TOK);
+async function api(path, opt = {}) {
+  opt.headers = Object.assign({}, opt.headers, TOK ? { authorization: 'Bearer ' + TOK } : {});
+  const r = await fetch(path, opt);
+  if (r.status === 401) {
+    const t = prompt('该节点需要访问令牌:');
+    if (t) { localStorage.setItem('yz_token', t); TOK = t; location.reload(); }
+    throw 401;
+  }
+  if (!r.ok) throw r.status;
+  return (r.status === 204 || r.status === 201) ? null : r.json();
+}
 const short = id => id.slice(0, 8);
 
 async function refresh() {

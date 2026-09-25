@@ -10,14 +10,19 @@ use tokio::sync::mpsc;
 use yz_crypto::NetworkSecret;
 use yz_proto::Frame;
 
-/// node_id(16 hex) → 100.64.0.0/10 内的确定性虚拟 IP
+/// 虚拟网段: 100.64.0.0/14 (避开阿里云/华为云 100.100.x 元数据段)
+const VIP_NET: u32 = 0x6440_0000; // 100.64.0.0
+const VIP_BITS: u32 = 18; // /14 → 18 位主机位
+const VIP_MASK_BITS: u32 = (1 << VIP_BITS) - 1;
+
+/// node_id(16 hex) → 100.64.0.0/14 内的确定性虚拟 IP
 pub fn vip_of(node_id: &str) -> Ipv4Addr {
     let b = yz_crypto::from_hex(node_id).unwrap_or_else(|_| vec![0u8; 8]);
     let mut raw = [0u8; 8];
     let n = b.len().min(8);
     raw[8 - n..].copy_from_slice(&b[b.len() - n..]);
-    let low = (u64::from_be_bytes(raw) & 0x3F_FFFF) as u32; // 低 22 位
-    Ipv4Addr::from(0x6440_0000u32 | low) // 100.64.0.0/10
+    let low = (u64::from_be_bytes(raw) & VIP_MASK_BITS as u64) as u32;
+    Ipv4Addr::from(VIP_NET | low)
 }
 
 pub async fn run(
@@ -32,11 +37,13 @@ pub async fn run(
     cfg.tun_name(ifname)
         .mtu(1400)
         .address(vip)
-        .netmask(Ipv4Addr::new(255, 192, 0, 0))
+        .netmask(Ipv4Addr::new(255, 252, 0, 0)) // /14
         .up();
-    let dev = tun::create_as_async(&cfg).context("create tun (需要 root 或 CAP_NET_ADMIN)")?;
+    let dev = tun::create_as_async(&cfg).context(
+        "create tun (需要 root 或 CAP_NET_ADMIN, 可 sudo setcap cap_net_admin,cap_net_raw+ep <yz>)",
+    )?;
     let dev = Arc::new(dev);
-    log::info!("tun {ifname} up, virtual ip {vip}/10");
+    log::info!("tun {ifname} up, virtual ip {vip}/14");
 
     // 收编队列: 各隧道的 mesh 帧 → TUN
     let (tx, mut rx) = mpsc::channel::<Vec<u8>>(512);
@@ -113,7 +120,8 @@ mod tests {
         let b = vip_of("0123456789abcdef");
         assert_eq!(a, b);
         assert_eq!(a.octets()[0], 100);
-        assert!((64..128).contains(&a.octets()[1]));
+        // /14 → 第二字节 64..=67, 避开 100.100.x 云元数据段
+        assert!((64..=67).contains(&a.octets()[1]), "{a} 越出 100.64.0.0/14");
         assert_ne!(vip_of("0123456789abcdef"), vip_of("fedcba9876543210"));
     }
 

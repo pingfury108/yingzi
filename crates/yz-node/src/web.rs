@@ -5,9 +5,10 @@ use crate::ingress::IngressEntry;
 use crate::node::{resolve_node, tunnel_for, NodeState};
 use crate::policy::RouteRule;
 use anyhow::{Context, Result};
-use axum::extract::{Path, State};
-use axum::http::StatusCode;
-use axum::response::Html;
+use axum::extract::{Path, Request, State};
+use axum::http::{header, StatusCode};
+use axum::middleware::{self, Next};
+use axum::response::{Html, Response};
 use axum::routing::{delete, get};
 use axum::{Json, Router};
 use serde::{Deserialize, Serialize};
@@ -27,6 +28,8 @@ pub struct AppState {
     pub info: SelfInfo,
     pub ns: NetworkSecret,
     pub id_pub: [u8; 32],
+    /// 访问令牌 (None = 不校验; 挂公网必须设)
+    pub token: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -67,19 +70,52 @@ struct RouteAddReq {
 }
 
 pub async fn run(bind: &str, app: Arc<AppState>) -> Result<()> {
-    let router = Router::new()
-        .route("/", get(index))
+    let api = Router::new()
         .route("/api/status", get(status))
         .route("/api/nodes", get(nodes))
         .route("/api/exit", get(get_exit).post(set_exit))
         .route("/api/routes", get(list_routes).post(add_route))
         .route("/api/routes/{idx}", delete(del_route))
         .route("/api/ingress", get(list_ingress).post(req_ingress))
-        .with_state(app);
+        .layer(middleware::from_fn_with_state(app.clone(), auth_mw));
+    let router = Router::new()
+        .route("/", get(index))
+        .merge(api)
+        .with_state(app.clone());
     let listener = TcpListener::bind(bind).await?;
-    log::info!("web ui on http://{bind}");
+    if app.token.is_some() {
+        log::info!("web ui on http://{bind} (令牌鉴权已开启)");
+    } else {
+        log::info!("web ui on http://{bind}");
+    }
     axum::serve(listener, router).await?;
     Ok(())
+}
+
+/// 可选令牌鉴权: Authorization: Bearer <tok> 或 ?token=<tok>
+async fn auth_mw(
+    State(app): State<Arc<AppState>>,
+    req: Request,
+    next: Next,
+) -> std::result::Result<Response, StatusCode> {
+    if let Some(tok) = &app.token {
+        let by_header = req
+            .headers()
+            .get(header::AUTHORIZATION)
+            .and_then(|v| v.to_str().ok())
+            .and_then(|s| s.strip_prefix("Bearer "))
+            .map(|t| t == tok)
+            .unwrap_or(false);
+        let by_query = req
+            .uri()
+            .query()
+            .map(|q| q.split('&').any(|kv| kv == format!("token={tok}")))
+            .unwrap_or(false);
+        if !by_header && !by_query {
+            return Err(StatusCode::UNAUTHORIZED);
+        }
+    }
+    Ok(next.run(req).await)
 }
 
 async fn index() -> Html<&'static str> {

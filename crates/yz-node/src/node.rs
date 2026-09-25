@@ -27,9 +27,13 @@ pub struct NodeOpts {
     pub name: String,
     /// 对外公布的隧道监听地址
     pub advertise: String,
+    /// 手动指定对外公布的 UDP 映射地址 (VPS/云 NAT 场景, 探测会被回环误导)
+    pub udp_advertise: Option<String>,
     pub socks5: Option<String>,
     /// Web UI 监听地址
     pub web: Option<String>,
+    /// Web UI 访问令牌 (挂公网必须设)
+    pub web_token: Option<String>,
     /// 静态入口发布
     pub ingress: Vec<IngressRule>,
     /// 动态入口发布 ACL
@@ -119,6 +123,10 @@ pub async fn run(opts: NodeOpts, ns: &NetworkSecret, id_pub: [u8; 32]) -> Result
                 _ => log::warn!("nat probe failed, p2p disabled"),
             }
         }
+    }
+    if let Some(manual) = &opts.udp_advertise {
+        udp_addr = manual.clone();
+        log::info!("udp advertise overridden: {manual}");
     }
 
     // 1b) UDP 隧道接入 (P2P 被打入方)
@@ -221,6 +229,7 @@ pub async fn run(opts: NodeOpts, ns: &NetworkSecret, id_pub: [u8; 32]) -> Result
             },
             ns: ns.clone(),
             id_pub,
+            token: opts.web_token.clone(),
         });
         tokio::spawn(async move {
             if let Err(e) = crate::web::run(&web_bind, app).await {
@@ -331,7 +340,7 @@ pub async fn run(opts: NodeOpts, ns: &NetworkSecret, id_pub: [u8; 32]) -> Result
                                                     .collect();
                                                 if !cands.is_empty() {
                                                     let _ = ep
-                                                        .punch(&cands, Duration::from_secs(4))
+                                                        .punch(&cands, Duration::from_millis(2500))
                                                         .await;
                                                 }
                                             });
@@ -492,22 +501,42 @@ pub(crate) async fn tunnel_for(
             return Ok(adopt_tunnel(state, h, node_id, ns, *id_pub).await);
         }
     }
-    // TCP 兜底 → 中继兜底
-    match tunnel::connect(&entry.addr, ns, id_pub).await {
-        Ok(h) => Ok(adopt_tunnel(state, h, node_id, ns, *id_pub).await),
-        Err(e) => {
+    // TCP 兜底 → 中继兜底 (直连加快速超时, 避免被防火墙黑洞拖死降级链)
+    let direct = timeout(Duration::from_secs(6), tunnel::connect(&entry.addr, ns, id_pub)).await;
+    match direct {
+        Ok(Ok(h)) => Ok(adopt_tunnel(state, h, node_id, ns, *id_pub).await),
+        Ok(Err(e)) => {
             log::debug!("tcp direct {}: {e:#}", &node_id[..8.min(node_id.len())]);
-            let coord_t = state
-                .coord_tunnel
-                .read()
-                .await
-                .clone()
-                .context("no path: direct failed and no coordinator for relay")?;
-            let h = tunnel::connect_relayed(&coord_t, node_id, ns, id_pub).await?;
-            log::info!("relayed via coordinator to {}", &node_id[..8.min(node_id.len())]);
-            Ok(adopt_tunnel(state, h, node_id, ns, *id_pub).await)
+            relay_fallback(state, node_id, ns, id_pub).await
+        }
+        Err(_) => {
+            log::debug!("tcp direct {}: timeout", &node_id[..8.min(node_id.len())]);
+            relay_fallback(state, node_id, ns, id_pub).await
         }
     }
+}
+
+/// 中继兜底: 经 coordinator 建立嵌套隧道
+async fn relay_fallback(
+    state: &Arc<NodeState>,
+    node_id: &str,
+    ns: &NetworkSecret,
+    id_pub: &[u8; 32],
+) -> Result<Arc<Tunnel>> {
+    let coord_t = state
+        .coord_tunnel
+        .read()
+        .await
+        .clone()
+        .context("no path: direct failed and no coordinator for relay")?;
+    let h = timeout(
+        Duration::from_secs(10),
+        tunnel::connect_relayed(&coord_t, node_id, ns, id_pub),
+    )
+    .await
+    .context("relay timeout")??;
+    log::info!("relayed via coordinator to {}", &node_id[..8.min(node_id.len())]);
+    Ok(adopt_tunnel(state, h, node_id, ns, *id_pub).await)
 }
 
 /// 隧道收编: 排空控制消息 + 接管对端开流 + mesh 转发 + 注册到隧道表
@@ -581,7 +610,7 @@ async fn try_punch(
     if cands.is_empty() {
         return None;
     }
-    let punched = match ep.punch(&cands, Duration::from_secs(4)).await {
+    let punched = match ep.punch(&cands, Duration::from_millis(2500)).await {
         Ok(a) => a,
         Err(e) => {
             log::debug!("punch {}: {e:#}", &node_id[..8]);

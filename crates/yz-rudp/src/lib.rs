@@ -40,6 +40,9 @@ const MAX_PENDING_DIST: u32 = 4096;
 
 /// PUNCH 报文长度: nonce12 + 5 + tag16
 const PUNCH_PKT_LEN: usize = 12 + 5 + 16;
+/// 打孔请求 / 回射确认 (等长, 回射防止对称 NAT 下收不到对端包)
+const PUNCH_REQ: &[u8] = b"PUNCH";
+const PUNCH_ECHO: &[u8] = b"PUNKE";
 const PROBE_SALT: &[u8] = b"yz-probe-v1";
 
 /// NAT 探测/打洞共享的静态密钥
@@ -176,7 +179,7 @@ impl Endpoint {
     /// 打洞: 向 candidates 散射 PUNCH 并等待对端打孔包, 返回打通的地址。
     /// PUNCH 包经 NS 认证, 任一合法来源即可信 (对称 NAT 端口可能与目录不同)。
     pub async fn punch(&self, candidates: &[SocketAddr], dur: Duration) -> Result<SocketAddr> {
-        let pkt = self.inner.probe_key.seal(b"PUNCH")?;
+        let pkt = self.inner.probe_key.seal(PUNCH_REQ)?;
         let sock = self.inner.sock.clone();
         let cands = candidates.to_vec();
         let sprayer = tokio::spawn(async move {
@@ -222,10 +225,16 @@ async fn demux_loop(
             let _ = tx.send(dgram).await;
             continue;
         }
-        // 打洞包 (NS 认证)
+        // 打洞包 (NS 认证): PUNCH=请求(回射到达源), PUNKE=回射确认(不再回, 防风暴)
         if dgram.len() == PUNCH_PKT_LEN {
             if let Ok(plain) = inner.probe_key.open(&dgram) {
-                if plain == b"PUNCH" {
+                if plain == PUNCH_REQ {
+                    if let Ok(echo) = inner.probe_key.seal(PUNCH_ECHO) {
+                        let _ = inner.sock.send_to(&echo, from).await;
+                    }
+                    let _ = inner.punch_tx.send(from).await;
+                    continue;
+                } else if plain == PUNCH_ECHO {
                     let _ = inner.punch_tx.send(from).await;
                     continue;
                 }

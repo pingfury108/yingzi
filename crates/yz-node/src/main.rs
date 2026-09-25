@@ -64,12 +64,18 @@ enum Cmd {
         /// 对外公布的隧道监听地址 (默认取 bind; 通配地址由 coordinator 替换为观察到的源IP)
         #[arg(long)]
         advertise: Option<String>,
+        /// 手动指定对外公布的 UDP 映射地址 (VPS/云 NAT 场景)
+        #[arg(long)]
+        udp_advertise: Option<String>,
         /// 本地 SOCKS5 入口地址, 如 127.0.0.1:1080
         #[arg(long)]
         socks5: Option<String>,
         /// Web UI 监听地址, 如 127.0.0.1:9800
         #[arg(long)]
         web: Option<String>,
+        /// Web UI 访问令牌 (挂公网必须设)
+        #[arg(long)]
+        web_token: Option<String>,
         /// 静态入口发布 "listen=node/addr", 可多次; 例: 0.0.0.0:8080=nas-home/127.0.0.1:80
         #[arg(long = "ingress")]
         ingress: Vec<String>,
@@ -91,9 +97,12 @@ enum Cmd {
         /// 握手失败连接的伪装转发目标, 如 127.0.0.1:443
         #[arg(long)]
         fallback: Option<String>,
-        /// TUN 网卡名, 启用虚拟组网 (需 root/CAP_NET_ADMIN)
+        /// TUN 网卡名 (虚拟组网, 默认开启; 需 root 或 CAP_NET_ADMIN)
+        #[arg(long, default_value = "yz0")]
+        tun: String,
+        /// 关闭 TUN 虚拟组网
         #[arg(long)]
-        tun: Option<String>,
+        no_tun: bool,
     },
     /// 独立隧道出口(无 mesh)
     Serve {
@@ -161,8 +170,10 @@ async fn main() -> Result<()> {
             coordinator,
             name,
             advertise,
+            udp_advertise,
             socks5,
             web,
+            web_token,
             ingress,
             ingress_allow,
             ingress_ports,
@@ -171,6 +182,7 @@ async fn main() -> Result<()> {
             exit_allow,
             fallback,
             tun,
+            no_tun,
         } => {
             let routes = routes
                 .iter()
@@ -186,11 +198,13 @@ async fn main() -> Result<()> {
             node::run(
                 node::NodeOpts {
                     advertise: advertise.unwrap_or_else(|| bind.clone()),
+                    udp_advertise,
                     bind,
                     coord: coordinator,
                     name,
                     socks5,
                     web,
+                    web_token,
                     ingress,
                     ingress_acl: policy::ExitAcl::parse(&ingress_allow),
                     ingress_ports,
@@ -198,7 +212,7 @@ async fn main() -> Result<()> {
                     routes,
                     exit_acl: policy::ExitAcl::parse(&exit_allow),
                     fallback,
-                    tun,
+                    tun: if no_tun { None } else { Some(tun) },
                 },
                 &ns,
                 id_pub,
