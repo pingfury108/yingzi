@@ -1,7 +1,8 @@
 # yingzi 总体设计方案
 
 > 自研对等组网 + 流量隐匿 + 出口选择 + Web UI
-> 状态: v1 草案 (P0 已开工)
+>
+> 配套文档: [README](../README.md) ｜ [部署手册](deploy.md)
 
 ## 1. 目标与场景
 
@@ -211,7 +212,9 @@ port_range = "8000-9000"
 
 ```
 yingzi/
-├── docs/plan.md      # 本文档
+├── README.md         # 项目概览与快速开始
+├── docs/plan.md      # 本文档 (协议定义/路线图/决策)
+├── docs/deploy.md    # 部署手册 (runpulse/端口/排障)
 ├── mise.toml         # rdev 远端构建用的工具链声明 (rust 1.85)
 ├── scripts/          # udp_associate_test.py 等验证脚本
 ├── crates/
