@@ -98,7 +98,7 @@ enum Cmd {
         #[arg(long)]
         fallback: Option<String>,
         /// TUN 网卡名 (虚拟组网, 默认开启; 需 root 或 CAP_NET_ADMIN)
-        #[arg(long, default_value = "yz0")]
+        #[arg(long, default_value = mesh::DEFAULT_TUN_NAME)]
         tun: String,
         /// 关闭 TUN 虚拟组网
         #[arg(long)]

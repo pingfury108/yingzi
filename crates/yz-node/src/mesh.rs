@@ -10,6 +10,12 @@ use tokio::sync::mpsc;
 use yz_crypto::NetworkSecret;
 use yz_proto::Frame;
 
+/// 默认 TUN 网卡名: macOS 必须是 utun<N>
+#[cfg(target_os = "macos")]
+pub const DEFAULT_TUN_NAME: &str = "utun5";
+#[cfg(not(target_os = "macos"))]
+pub const DEFAULT_TUN_NAME: &str = "yz0";
+
 /// 虚拟网段: 100.64.0.0/14 (避开阿里云/华为云 100.100.x 元数据段)
 const VIP_NET: u32 = 0x6440_0000; // 100.64.0.0
 const VIP_BITS: u32 = 18; // /14 → 18 位主机位
@@ -39,9 +45,11 @@ pub async fn run(
         .address(vip)
         .netmask(Ipv4Addr::new(255, 252, 0, 0)) // /14
         .up();
-    let dev = tun::create_as_async(&cfg).context(
-        "create tun (需要 root 或 CAP_NET_ADMIN, 可 sudo setcap cap_net_admin,cap_net_raw+ep <yz>)",
-    )?;
+    let dev = tun::create_as_async(&cfg).context(if cfg!(target_os = "macos") {
+        "create tun (macOS 需 root: sudo 运行, 且网卡名需形如 utun<N>)"
+    } else {
+        "create tun (需要 root 或 CAP_NET_ADMIN, 可 sudo setcap cap_net_admin,cap_net_raw+ep <yz>)"
+    })?;
     let dev = Arc::new(dev);
     log::info!("tun {ifname} up, virtual ip {vip}/14");
 
@@ -52,6 +60,7 @@ pub async fn run(
         let dev = dev.clone();
         tokio::spawn(async move {
             while let Some(pkt) = rx.recv().await {
+                let pkt = wrap_tun(&pkt);
                 if let Err(e) = dev.send(&pkt).await {
                     log::debug!("tun write: {e}");
                 }
@@ -63,6 +72,8 @@ pub async fn run(
     loop {
         let n = dev.recv(&mut buf).await?;
         let pkt = &buf[..n];
+        let Some(off) = ip_packet_offset(pkt) else { continue };
+        let pkt = &pkt[off..];
         let Some(dst) = dst_v4(pkt) else { continue };
         if dst == vip {
             continue;
@@ -98,11 +109,44 @@ pub fn spawn_forward(mut rx: mpsc::Receiver<Vec<u8>>, state: Arc<NodeState>) {
     });
 }
 
+/// macOS utun 有 4 字节 AF 头 (be u32: 2=IPv4), Linux 无
+#[cfg(target_os = "macos")]
+const UTUN_HDR: usize = 4;
+#[cfg(not(target_os = "macos"))]
+const UTUN_HDR: usize = 0;
+
+/// 从 TUN 读到的原始缓冲中取出 IP 包起始偏移与目的地址
+fn ip_packet_offset(buf: &[u8]) -> Option<usize> {
+    if UTUN_HDR == 0 {
+        return Some(0);
+    }
+    // macOS: 校验 AF 头
+    if buf.len() >= UTUN_HDR + 20 && buf[..4] == [0, 0, 0, 2] {
+        Some(UTUN_HDR)
+    } else {
+        None
+    }
+}
+
 fn dst_v4(pkt: &[u8]) -> Option<Ipv4Addr> {
-    if pkt.len() < 20 || pkt[0] >> 4 != 4 {
+    let off = ip_packet_offset(pkt)?;
+    let ip = &pkt[off..];
+    if ip.len() < 20 || ip[0] >> 4 != 4 {
         return None;
     }
-    Some(Ipv4Addr::new(pkt[16], pkt[17], pkt[18], pkt[19]))
+    Some(Ipv4Addr::new(ip[16], ip[17], ip[18], ip[19]))
+}
+
+/// 写回 TUN 时按平台补 AF 头
+fn wrap_tun(pkt: &[u8]) -> Vec<u8> {
+    if UTUN_HDR == 0 {
+        pkt.to_vec()
+    } else {
+        let mut out = Vec::with_capacity(4 + pkt.len());
+        out.extend_from_slice(&[0, 0, 0, 2]);
+        out.extend_from_slice(pkt);
+        out
+    }
 }
 
 async fn find_node_by_vip(state: &Arc<NodeState>, dst: Ipv4Addr) -> Option<String> {
