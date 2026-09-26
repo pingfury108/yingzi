@@ -211,14 +211,24 @@ port_range = "8000-9000"
 
 ```
 yingzi/
-├── docs/plan.md           # 本文档
+├── docs/plan.md      # 本文档
+├── mise.toml         # rdev 远端构建用的工具链声明 (rust 1.85)
+├── scripts/          # udp_associate_test.py 等验证脚本
 ├── crates/
-│   ├── yz-proto/          # 帧编解码 (§3.4)            [P0 ✔]
-│   ├── yz-crypto/         # NS/身份/握手/会话 (§3.1-3.3) [P0 ✔]
-│   ├── yz-node/           # 节点二进制 (tunnel/coord/policy/socks5/ingress/web/mesh) │
-│   └── yz-rudp/           # UDP 可靠传输 + 探测/打洞 (P2 ✔)               │
-└── (legacy) src/ yingzi+benti  旧玩具, 仅供对照, 不再演进
+│   ├── yz-proto/     # 帧编解码 + 控制消息 (§3.4/§3.5)
+│   ├── yz-crypto/    # NS/身份/握手/会话/rekey (§3.1-3.3)
+│   ├── yz-rudp/      # UDP 可靠传输 + NAT 探测/打洞
+│   └── yz-node/      # 唯一二进制 `yz`
+│       ├── main.rs   # CLI: keygen/coord/node/serve/dial
+│       ├── tunnel.rs # 多路复用隧道 (TCP/UDP/WSS 承载, 流, 中继, rekey)
+│       ├── coord.rs  # 协调器: 注册表/目录广播/打洞撮合/中继数据面
+│       ├── node.rs   # 节点: 目录/出口策略/SOCKS5入口(含UDP)/ingress/统计
+│       ├── policy.rs socks5.rs ingress.rs mesh.rs(TUN) web.rs(控制台) wss.rs(模仿)
+│       └── static/   # 内嵌单页控制台
+└── (已删除) 旧玩具 src/yingzi+benti、yingzi.service —— 功能已全部由 yz-node 覆盖
 ```
+
+平台支持：Linux(x86_64/aarch64, musl 静态) 与 macOS(utun, 需 root)；Windows 待做。
 
 ## 10. 路线图
 

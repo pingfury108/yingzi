@@ -178,11 +178,6 @@ impl Tunnel {
         Ok((wire, keys))
     }
 
-    /// 应用新密钥 (供调用方在回包之后调用)
-    pub async fn apply_keys_public(&self, keys: &SessionKeys) {
-        self.apply_keys(keys).await;
-    }
-
     /// 收到对端 rekey 应答(作为发起方): 换钥
     pub async fn rekey_finish_with(&self, peer_wire: &[u8]) -> Result<()> {
         let st = self
@@ -236,14 +231,6 @@ impl Tunnel {
         match &self.link {
             Link::Tcp { sess, .. } => sess.lock().await.set_keys(keys, self.role),
             Link::Udp(r) => r.set_keys(keys, self.role).await,
-        }
-    }
-
-    /// UDP 链路已测得的平滑 RTT (诊断用)
-    pub fn link_rtt(&self) -> Option<Duration> {
-        match &self.link {
-            Link::Udp(r) => r.srtt(),
-            Link::Tcp { .. } => None,
         }
     }
 
