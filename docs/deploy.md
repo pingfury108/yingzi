@@ -46,6 +46,31 @@ cargo build --release -p yz-node     # → target/release/yz
 **为什么要 musl**：静态链接、零 glibc 依赖，同一个二进制能在任意 x86_64 Linux（含 CentOS 7 老内核）上跑。
 Linux↔macOS 不要交叉编译（macOS 目标需要 macOS SDK），各平台本机编即可。
 
+### 交叉编译到 aarch64（树莓派等）
+
+注意：**只 `rustup target add` 是不够的** —— 我们的依赖 `ring` 含 C 与汇编，链接需要目标平台的 C 工具链。
+用 musl.cc 的预编译 C 工具链（单包解压，无需 sudo）：
+
+```bash
+curl -sL https://musl.cc/aarch64-linux-musl-cross.tgz | tar xz -C ~/opt
+rustup target add aarch64-unknown-linux-musl
+export PATH=~/opt/aarch64-linux-musl-cross/bin:$PATH
+export CC_aarch64_unknown_linux_musl=aarch64-linux-musl-gcc
+export CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER=aarch64-linux-musl-gcc
+cargo build --release --target aarch64-unknown-linux-musl -p yz-node
+# runpulse 同理（rusqlite 自带 C 代码, 也要这套工具链）
+```
+（zig 的 `zig cc` 也能当交叉 CC，但需过滤 ring 传入的 `--target=` 参数，不如直接用 gcc 省心。）
+
+### 目标机器上的安装
+
+```bash
+mkdir -p ~/.local/bin ~/.local/yz
+scp target/<triple>/release/yz <host>:~/.local/yz/yz   # 置换二进制
+scp runpulse            <host>:~/.local/bin/runpulse
+ssh <host> 'chmod +x ~/.local/{yz/yz,bin/runpulse} && ~/.local/bin/runpulse service install'
+```
+
 ## 2. runpulse（进程守护）
 
 ### Linux
@@ -163,6 +188,8 @@ python3 scripts/udp_associate_test.py 8.8.8.8 53             # 期望 PASS
 
 # 4) 虚拟 IP 互通
 ping -c3 <对端 vIP>      # 100.64.x.x，Web 控制台的节点卡片上有
+#    注意: 第一次 ping 可能 1~2s(在建立隧道/打洞), 之后才是真实 RTT
+#    局域网内直连应 <1ms; 跨境节点 ~70-100ms; 同一台机器不同节点走本地回环 <0.5ms
 
 # 5) 走的哪条路（P2P / 直连 / 中继）
 ssh <host> 'runpulse logs yz-node | grep -E "p2p punched|relayed|tcp direct"'
@@ -207,6 +234,7 @@ runpulse list --json              # AI/脚本友好
 | 云主机上 `udp_addr` 是内网地址 | 探测被云 NAT 回环误导 → 加 `--udp-advertise <公网IP>:9100` |
 | 出口选了但没流量 / 全 timeout | 确认出口节点 `--exit-allow` 放行了你；节点目录里能看到对方（`directory: N nodes`） |
 | 换了二进制后 TUN 失效 | Linux 上 capability 被清 → 重跑 `setcap`（见 §5） |
+| 别人 ping 不通这台节点的 vIP | 该节点是否用了 `--no-tun`（无虚拟网卡就无法收发 IP 包）；macOS 非 root 也会这样 |
 | 节点崩了会不会掉 | runpulse 自动拉起；daemon 自己也重启也无损（会 adopt 存活子进程） |
 
 排障小抄（我踩过的坑）：

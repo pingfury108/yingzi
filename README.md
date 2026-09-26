@@ -104,6 +104,14 @@ docs/deploy.md     部署手册（三台真实机器为例）
 scripts/           验证脚本（如 SOCKS5 UDP ASSOCIATE 端到端测试）
 ```
 
+## 平台与构建
+
+| 平台 | 产物 | 说明 |
+|---|---|---|
+| Linux x86_64 | `--target x86_64-unknown-linux-musl` | 静态、零依赖，任意发行版可跑 |
+| Linux aarch64（树莓派） | `--target aarch64-unknown-linux-musl` | 需 C 交叉工具链（musl.cc 预编译包），见 deploy.md |
+| macOS | 本机 `cargo build --release` | utun 需 root；无权限时 `--no-tun` 只当代理用 |
+
 ## 状态
 
 已在真实环境跑通：3+ 节点组网（国内 VPS 协调器 + 海外出口 + 家庭机器 + macOS），P2P 打洞、任选出口翻墙、虚拟 IP 互 ping、SOCKS5（TCP+UDP）、Web 控制台、ingress 发布。
