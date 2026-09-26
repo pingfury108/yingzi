@@ -111,11 +111,11 @@ async function refresh() {
     $('streams').textContent = st.traffic[2];
 
     // ingress
-    const sel = $('pubNode');
-    const keep = sel.value;
-    sel.innerHTML = '<option value="">(选择出口节点)</option>' +
+    const selPub = $('pubNode');
+    const keep = selPub.value;
+    selPub.innerHTML = '<option value="">(选择出口节点)</option>' +
       ns.filter(n => !n.is_self).map(n => `<option value="${n.name}">${n.name}</option>`).join('');
-    if (keep) sel.value = keep;
+    if (keep) selPub.value = keep;
     $('pubEmpty').style.display = ig.published.length ? 'none' : 'block';
     $('pub').innerHTML = ig.published.map(e =>
       `<tr><td class="mono">:${e.port}</td><td class="mono">→ ${e.node}:${e.addr}</td><td>${e.dynamic ? '动态' : '静态'}</td></tr>`).join('');
