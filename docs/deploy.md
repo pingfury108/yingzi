@@ -188,8 +188,9 @@ python3 scripts/udp_associate_test.py 8.8.8.8 53             # 期望 PASS
 
 # 4) 虚拟 IP 互通
 ping -c3 <对端 vIP>      # 100.64.x.x，Web 控制台的节点卡片上有
-#    注意: 第一次 ping 可能 1~2s(在建立隧道/打洞), 之后才是真实 RTT
-#    局域网内直连应 <1ms; 跨境节点 ~70-100ms; 同一台机器不同节点走本地回环 <0.5ms
+#    同一局域网的对端: 直接 TCP 直连(优先于打洞), 首包 ~10ms
+#    跨网对端: 第一次 ping 可能 1~2s(在打洞/回落直连), 之后才是真实 RTT
+#    局域网内稳定 RTT <1ms; 跨境节点 ~70-100ms
 
 # 5) 走的哪条路（P2P / 直连 / 中继）
 ssh <host> 'runpulse logs yz-node | grep -E "p2p punched|relayed|tcp direct"'

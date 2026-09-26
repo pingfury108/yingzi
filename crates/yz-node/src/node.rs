@@ -552,6 +552,16 @@ async fn handle_socks5(
     }
 }
 
+/// 对端隧道地址是否私网/回环 (同网段可直连, 无需打洞)
+fn is_lan_addr(addr: &str) -> bool {
+    let host = addr.rsplit_once(':').map(|(h, _)| h).unwrap_or(addr);
+    match host.parse::<std::net::IpAddr>() {
+        Ok(std::net::IpAddr::V4(v4)) => v4.is_private() || v4.is_loopback() || v4.is_link_local(),
+        Ok(std::net::IpAddr::V6(v6)) => v6.is_loopback(),
+        Err(_) => false,
+    }
+}
+
 /// 解析 exit 配置为具体决策
 async fn resolve_exit(state: &Arc<NodeState>, exit: &str, self_id: &str) -> Exit {    match exit {
         "direct" => Exit::Direct,
@@ -815,6 +825,18 @@ pub(crate) async fn tunnel_for(
             .cloned()
             .with_context(|| format!("node {} not in directory", &node_id[..8.min(node_id.len())]))?
     };
+    // 局域网对端: 直连优先 (省掉打洞等待, 同网段通常 <1ms 可连)
+    if is_lan_addr(&entry.addr) {
+        if let Ok(Ok(h)) = timeout(
+            Duration::from_millis(1500),
+            tunnel::connect(&entry.addr, ns, id_pub),
+        )
+        .await
+        {
+            log::debug!("lan direct to {} ({})", &node_id[..8], entry.addr);
+            return Ok(adopt_tunnel(state, h, node_id, ns, *id_pub).await);
+        }
+    }
     // P2P 打洞优先
     if !entry.udp_addr.is_empty() {
         if let Some(h) = try_punch(state, ns, id_pub, &entry).await {
