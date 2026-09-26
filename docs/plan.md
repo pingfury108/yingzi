@@ -233,8 +233,11 @@ yingzi/
 | **P5a** 噪声强化 ✔ | 握手尺寸随机化 + UDP 尺寸桶填充 + fallback 伪装站点 | 探针看到真实 HTTP 服务 |
 | **P5b** WSS 模仿 ✔ | 真实 TLS + RFC6455 承载 YZP, 可挂 CDN | TLS 观察者看到真实证书, 隧道 200 |
 | **P6** 全局组网 ✔(默认开启) | TUN(默认 yz0) + 确定性虚拟IP(100.64.0.0/14 | node_id低18位) + Mesh帧路由(自动P2P/中继) | pcw↔VPS 双向 ping 0% 丢包 17ms |
-| **P7** 强健化(进行中) | 中继兜底 ✔(嵌套YZP隧道, coordinator零明文) | 对称NAT/直连失败仍可达 |
-| P7 剩余 | rekey、RTT 测量驱动的 RTO/拥塞、ingress ack 关联、多 coordinator | 长期真实环境运行 |
+| **P7a** 中继兜底 ✔ | 嵌套YZP隧道经coordinator转发, 零明文 | 对称NAT/直连失败仍可达 |
+| **P7b** rudp 强健化 ✔ | SRTT/RTTVAR驱动RTO + 慢启动/拥塞避免 + 交付不阻塞ACK | 高延迟链路稳定 |
+| **P7c** rekey ⛔ | 已实现但默认关闭(实验性): 切钥与rudp未确认队列有交互问题, 见 §13 | 待发送方向双钥窗口设计 |
+| **P8** 部署打磨 ✔ | 延迟测量+auto按RTT选路 + 配置持久化(--config) + SOCKS5 UDP ASSOCIATE + 流量统计 + ingress管理页 + 多coordinator容错 + WSS HTTP fallback | 已在真实双节点运行 |
+| P9 待做 | 海外节点部署; 跨平台(macOS utun头/Windows wintun); 节点间IPv6 | — |
 
 ## 11. 安全假设
 
