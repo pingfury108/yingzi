@@ -47,6 +47,25 @@
   <h2>网络节点 <span class="sub" id="peerCount"></span></h2>
   <div id="nodes"></div>
 
+  <h2>流量</h2>
+  <div class="card">
+    <span class="sub">发送: <b id="txB">-</b> · 接收: <b id="rxB">-</b> · 累计开流: <b id="streams">-</b></span>
+  </div>
+
+  <h2>入口发布 <span class="sub">公网端口 → 组网内服务</span></h2>
+  <div class="card">
+    <div class="sub" style="margin-bottom:6px">我发布的 (别的节点可访问)</div>
+    <table><tbody id="pub"></tbody></table><div id="pubEmpty" class="empty">无</div>
+    <div class="sub" style="margin:10px 0 6px">我申请的 (公网入口节点上)</div>
+    <table><tbody id="req"></tbody></table><div id="reqEmpty" class="empty">无</div>
+    <div class="row" style="margin-top:10px">
+      <select id="pubNode"></select>
+      <input id="pubPort" placeholder="公网端口" style="max-width:110px">
+      <input id="pubAddr" placeholder="本机服务, 如 127.0.0.1:80">
+      <button onclick="reqIngress()">申请发布</button>
+    </div>
+  </div>
+
   <h2>分流规则 <span class="sub">按顺序匹配, 未命中走默认出口</span></h2>
   <div class="card">
     <table><thead><tr><th>规则</th><th style="width:60px"></th></tr></thead>
@@ -78,14 +97,31 @@ const short = id => id.slice(0, 8);
 
 async function refresh() {
   try {
-    const [st, ns, rs] = await Promise.all([
-      api('/api/status'), api('/api/nodes'), api('/api/routes')
+    const [st, ns, rs, ig] = await Promise.all([
+      api('/api/status'), api('/api/nodes'), api('/api/routes'), api('/api/ingress')
     ]);
     $('title').textContent = `yingzi · ${st.name}`;
     $('subtitle').textContent =
       `node_id ${short(st.node_id)} · peers ${st.peers}` + (st.socks5 ? ` · socks5 ${st.socks5}` : '');
     $('exitCur').textContent = st.default_exit;
     $('peerCount').textContent = `(${ns.length} 在线)`;
+    const fmt = b => b > 1048576 ? (b/1048576).toFixed(1)+' MB' : b > 1024 ? (b/1024).toFixed(1)+' KB' : b+' B';
+    $('txB').textContent = fmt(st.traffic[0]);
+    $('rxB').textContent = fmt(st.traffic[1]);
+    $('streams').textContent = st.traffic[2];
+
+    // ingress
+    const sel = $('pubNode');
+    const keep = sel.value;
+    sel.innerHTML = '<option value="">(选择出口节点)</option>' +
+      ns.filter(n => !n.is_self).map(n => `<option value="${n.name}">${n.name}</option>`).join('');
+    if (keep) sel.value = keep;
+    $('pubEmpty').style.display = ig.published.length ? 'none' : 'block';
+    $('pub').innerHTML = ig.published.map(e =>
+      `<tr><td class="mono">:${e.port}</td><td class="mono">→ ${e.node}:${e.addr}</td><td>${e.dynamic ? '动态' : '静态'}</td></tr>`).join('');
+    $('reqEmpty').style.display = ig.requested.length ? 'none' : 'block';
+    $('req').innerHTML = ig.requested.map(e =>
+      `<tr><td class="mono">${e.node}:${e.port}</td><td class="mono">→ ${e.addr}</td><td>已申请</td></tr>`).join('');
 
     // 出口下拉: direct / auto / 可出口节点(非自己)
     const sel = $('exitSel');
@@ -141,6 +177,18 @@ async function addRoute() {
 
 async function delRoute(i) {
   await api(`/api/routes/${i}`, { method: 'DELETE' });
+  refresh();
+}
+
+async function reqIngress() {
+  const node = $('pubNode').value;
+  const port = parseInt($('pubPort').value, 10);
+  const addr = $('pubAddr').value.trim();
+  if (!node || !port || !addr) { alert('选择出口节点 + 填端口和服务地址'); return; }
+  try {
+    await api('/api/ingress', { method:'POST', headers:{'content-type':'application/json'},
+      body: JSON.stringify({ node, port, addr }) });
+  } catch (e) { alert('申请失败: ' + e); }
   refresh();
 }
 

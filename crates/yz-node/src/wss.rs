@@ -96,19 +96,51 @@ impl rustls::client::danger::ServerCertVerifier for NoVerify {
 
 // ---------- WebSocket 握手 ----------
 
-/// 服务端: TLS 终止 + WS 升级; 非 WS 请求直接断开 (对外就是个不爱说话的 HTTPS 站)
+enum Head {
+    /// WS 升级 (含 Sec-WebSocket-Key)
+    Ws(String),
+    /// 其它请求 (已读出的原始头)
+    Other(Vec<u8>),
+}
+
+/// 服务端: TLS 终止 + WS 升级; 非 WS 请求: 有 fallback 则按"TLS 终止的反向代理"转给真实站点
 pub async fn accept(
     stream: TcpStream,
     acceptor: &TlsAcceptor,
-) -> Result<WsStream<ServerTls<TcpStream>>> {
+    fallback: Option<&str>,
+) -> Result<Option<WsStream<ServerTls<TcpStream>>>> {
     let mut tls = acceptor.accept(stream).await?;
-    let key = read_http_key(&mut tls).await?;
-    let accept_key = b64encode(yz_crypto::sha1(format!("{key}{WS_GUID}").as_bytes()).as_slice());
-    let resp = format!(
-        "HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: {accept_key}\r\n\r\n"
-    );
-    tls.write_all(resp.as_bytes()).await?;
-    Ok(WsStream::new(tls, false)) // 服务端发送不掩码
+    match read_http_head(&mut tls).await? {
+        Head::Ws(key) => {
+            let accept_key =
+                b64encode(yz_crypto::sha1(format!("{key}{WS_GUID}").as_bytes()).as_slice());
+            let resp = format!(
+                "HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: {accept_key}\r\n\r\n"
+            );
+            tls.write_all(resp.as_bytes()).await?;
+            Ok(Some(WsStream::new(tls, false))) // 服务端发送不掩码
+        }
+        Head::Other(head) => {
+            if let Some(target) = fallback {
+                relay_plain(tls, head, target).await?;
+            }
+            Ok(None)
+        }
+    }
+}
+
+/// TLS 已由我们终止, 转发明文 HTTP 给 fallback 站点
+async fn relay_plain(tls: ServerTls<TcpStream>, head: Vec<u8>, target: &str) -> Result<()> {
+    let out = TcpStream::connect(target).await?;
+    let (mut tr, mut tw) = tokio::io::split(tls);
+    let (mut or, mut ow) = out.into_split();
+    ow.write_all(&head).await?;
+    tokio::spawn(async move {
+        let a = tokio::io::copy(&mut tr, &mut ow);
+        let b = tokio::io::copy(&mut or, &mut tw);
+        let _ = tokio::join!(a, b);
+    });
+    Ok(())
 }
 
 /// 客户端: TLS(SNI=真实域名) + WS 升级
@@ -147,26 +179,28 @@ pub async fn connect(
     Ok(WsStream::new(tls, true)) // 客户端发送必须掩码
 }
 
-async fn read_http_key<S: AsyncRead + Unpin>(io: &mut S) -> Result<String> {
+async fn read_http_head<S: AsyncRead + Unpin>(io: &mut S) -> Result<Head> {
     let mut buf = Vec::new();
     let mut tmp = [0u8; 1024];
     loop {
         let n = io.read(&mut tmp).await?;
         if n == 0 {
-            bail!("eof in ws handshake");
+            bail!("eof in http head");
         }
         buf.extend_from_slice(&tmp[..n]);
         if buf.windows(4).any(|w| w == b"\r\n\r\n") {
             let head = String::from_utf8_lossy(&buf);
-            return head
-                .lines()
-                .find_map(|l| {
-                    l.split_once(':').and_then(|(k, v)| {
-                        k.eq_ignore_ascii_case("sec-websocket-key")
-                            .then(|| v.trim().to_string())
-                    })
+            let is_ws = head.to_lowercase().contains("upgrade: websocket");
+            let key = head.lines().find_map(|l| {
+                l.split_once(':').and_then(|(k, v)| {
+                    k.eq_ignore_ascii_case("sec-websocket-key")
+                        .then(|| v.trim().to_string())
                 })
-                .context("no sec-websocket-key");
+            });
+            return match (is_ws, key) {
+                (true, Some(k)) => Ok(Head::Ws(k)),
+                _ => Ok(Head::Other(buf)),
+            };
         }
         if buf.len() > 16384 {
             bail!("http head too large");

@@ -26,7 +26,8 @@ use yz_proto::{caps, Addr, ControlMsg, Frame, NodeEntry};
 
 pub struct NodeOpts {
     pub bind: String,
-    pub coord: String,
+    /// 协调器列表 (多实例容错: 按序轮换)
+    pub coord: Vec<String>,
     pub name: String,
     /// 对外公布的隧道监听地址
     pub advertise: String,
@@ -91,6 +92,25 @@ pub struct PersistedConfig {
 }
 
 impl NodeState {
+    /// 汇总全网隧道流量统计: (tx字节, rx字节, 累计开流数)
+    pub async fn traffic(&self) -> (u64, u64, u64) {
+        let mut tx = 0u64;
+        let mut rx = 0u64;
+        let mut streams = 0u64;
+        let mut add = |s: (u64, u64, u64)| {
+            tx += s.0;
+            rx += s.1;
+            streams += s.2;
+        };
+        for t in self.tunnels.lock().await.values() {
+            add(t.stats());
+        }
+        if let Some(ct) = &*self.coord_tunnel.read().await {
+            add(ct.stats());
+        }
+        (tx, rx, streams)
+    }
+
     /// 将当前路由/默认出口写入配置文件
     pub async fn save_config(&self) {
         let Some(path) = &self.config_path else { return };
@@ -177,7 +197,7 @@ pub async fn run(opts: NodeOpts, ns: &NetworkSecret, id_pub: [u8; 32]) -> Result
     // 经 coordinator UDP (P 与 P+1) 探测公网映射与 NAT 类型
     let mut udp_addr = String::new();
     if let Some(ep) = &udp_ep {
-        if let Some(coord_addr) = tokio::net::lookup_host(&opts.coord)
+        if let Some(coord_addr) = tokio::net::lookup_host(&opts.coord[0])
             .await
             .ok()
             .and_then(|mut i| i.next())
@@ -335,15 +355,18 @@ pub async fn run(opts: NodeOpts, ns: &NetworkSecret, id_pub: [u8; 32]) -> Result
         });
     }
 
-    // 3) coordinator 注册 + 目录同步, 指数退避重连
+    // 3) coordinator 注册 + 目录同步, 多实例按序轮换 + 指数退避
     let mut backoff = Duration::from_secs(1);
+    let mut cur = 0usize;
     loop {
-        match tunnel::connect(&opts.coord, ns, &id_pub).await {
+        let coord = &opts.coord[cur % opts.coord.len()];
+        cur = cur.wrapping_add(1);
+        match tunnel::connect(coord, ns, &id_pub).await {
             Ok(mut h) => {
                 backoff = Duration::from_secs(1);
                 log::info!(
                     "registered to coordinator {} ({})",
-                    opts.coord,
+                    coord,
                     &h.peer.node_id()[..8]
                 );
                 *state.coord_tunnel.write().await = Some(h.tunnel.clone());
@@ -452,7 +475,7 @@ pub async fn run(opts: NodeOpts, ns: &NetworkSecret, id_pub: [u8; 32]) -> Result
                 state.tunnels.lock().await.retain(|_, t| !t.is_closed());
                 log::warn!("lost coordinator, reconnecting...");
             }
-            Err(e) => log::warn!("connect coordinator: {e:#}"),
+            Err(e) => log::warn!("connect coordinator {coord}: {e:#}"),
         }
         tokio::time::sleep(backoff).await;
         backoff = (backoff * 2).min(Duration::from_secs(30));
@@ -1128,7 +1151,7 @@ pub async fn serve(
             let ns = ns.clone();
             let ctx = ctx.clone();
             tokio::spawn(async move {
-                match tunnel::accept_wss(stream, &acceptor, &ns, &id_pub).await {
+                match tunnel::accept_wss(stream, &acceptor, &ns, &id_pub, ctx.fallback.as_deref()).await {
                     Ok(Some(h)) => {
                         if let Err(e) = handle_peer(h, &ctx).await {
                             log::debug!("wss conn from {from} closed: {e:#}");

@@ -39,6 +39,8 @@ struct StatusResp {
     socks5: Option<String>,
     default_exit: String,
     peers: usize,
+    /// (tx字节, rx字节, 累计开流数)
+    traffic: (u64, u64, u64),
 }
 
 #[derive(Serialize)]
@@ -127,12 +129,14 @@ async fn index() -> Html<&'static str> {
 async fn status(State(app): State<Arc<AppState>>) -> Json<StatusResp> {
     let peers = app.node.dir.read().await.len().saturating_sub(1);
     let default_exit = app.node.default_exit.read().await.clone();
+    let traffic = app.node.traffic().await;
     Json(StatusResp {
         node_id: app.info.node_id.clone(),
         name: app.info.name.clone(),
         socks5: app.info.socks5.clone(),
         default_exit,
         peers,
+        traffic,
     })
 }
 

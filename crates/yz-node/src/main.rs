@@ -55,9 +55,9 @@ enum Cmd {
     Node {
         #[arg(long, default_value = "0.0.0.0:9100")]
         bind: String,
-        /// coordinator 地址 host:port
-        #[arg(long)]
-        coordinator: String,
+        /// coordinator 地址, 可多次指定多个做容错 (第一个为优先)
+        #[arg(long, required = true)]
+        coordinator: Vec<String>,
         /// 节点名
         #[arg(long, default_value = "node")]
         name: String,

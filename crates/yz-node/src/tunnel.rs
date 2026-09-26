@@ -4,7 +4,7 @@
 
 use anyhow::{bail, Context, Result};
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf};
@@ -59,6 +59,10 @@ pub struct Tunnel {
     role: Role,
     /// 进行中的 rekey 状态 (发起方)
     rekey: Mutex<Option<RekeyState>>,
+    /// 统计: 发出的加密字节数 / 收到的数据字节数 / 开流总数
+    bytes_tx: AtomicU64,
+    bytes_rx: AtomicU64,
+    streams_total: AtomicU64,
     streams: Mutex<HashMap<u32, mpsc::Sender<Frame>>>,
     ctrl_tx: mpsc::Sender<Frame>,
     accept_tx: mpsc::Sender<Incoming>,
@@ -88,6 +92,9 @@ impl Tunnel {
             link,
             role,
             rekey: Mutex::new(None),
+            bytes_tx: AtomicU64::new(0),
+            bytes_rx: AtomicU64::new(0),
+            streams_total: AtomicU64::new(0),
             streams: Mutex::new(HashMap::new()),
             ctrl_tx,
             accept_tx,
@@ -108,14 +115,17 @@ impl Tunnel {
         match &self.link {
             Link::Tcp { sess, w } => {
                 let pkt = { sess.lock().await.seal(&yz_proto::encode(f))? };
+                self.bytes_tx.fetch_add(pkt.len() as u64, Ordering::Relaxed);
                 w.lock().await.write_all(&pkt).await?;
                 Ok(())
             }
             Link::Udp(r) => {
                 let f = yz_proto::encode(f);
-                let mut wire = Vec::with_capacity(f.len() + 2);
-                wire.extend_from_slice(&(f.len() as u16).to_be_bytes());
+                let n = f.len();
+                let mut wire = Vec::with_capacity(n + 2);
+                wire.extend_from_slice(&(n as u16).to_be_bytes());
                 wire.extend_from_slice(&f);
+                self.bytes_tx.fetch_add((n + 2) as u64, Ordering::Relaxed);
                 r.send(&wire).await
             }
         }
@@ -235,6 +245,15 @@ impl Tunnel {
             Link::Udp(r) => r.srtt(),
             Link::Tcp { .. } => None,
         }
+    }
+
+    /// (tx字节, rx字节, 累计开流数)
+    pub fn stats(&self) -> (u64, u64, u64) {
+        (
+            self.bytes_tx.load(Ordering::Relaxed),
+            self.bytes_rx.load(Ordering::Relaxed),
+            self.streams_total.load(Ordering::Relaxed),
+        )
     }
 
     pub fn is_closed(&self) -> bool {
@@ -409,9 +428,12 @@ pub async fn accept_wss(
     acceptor: &tokio_rustls::TlsAcceptor,
     ns: &NetworkSecret,
     id_pub: &[u8; 32],
+    fallback: Option<&str>,
 ) -> Result<Option<TunnelHandle>> {
     stream.set_nodelay(true).ok();
-    let mut ws = crate::wss::accept(stream, acceptor).await?;
+    let Some(mut ws) = crate::wss::accept(stream, acceptor, fallback).await? else {
+        return Ok(None);
+    };
     match hs_accept_io(&mut ws, ns, id_pub).await? {
         Some((keys, peer_info)) => Ok(Some(assemble_stream(ws, &keys, Role::Responder, 2, peer_info))),
         None => Ok(None),
@@ -496,6 +518,7 @@ async fn dispatch(t: &Arc<Tunnel>, f: Frame) -> bool {
             kind,
             addr,
         } => {
+            t.streams_total.fetch_add(1, Ordering::Relaxed);
             let (tx, rx) = mpsc::channel(CHAN_CAP);
             t.streams.lock().await.insert(stream_id, tx);
             let inc = Incoming {
@@ -507,6 +530,9 @@ async fn dispatch(t: &Arc<Tunnel>, f: Frame) -> bool {
             t.accept_tx.send(inc).await.is_ok()
         }
         f => {
+            if let Frame::Data { ref payload, .. } = f {
+                t.bytes_rx.fetch_add(payload.len() as u64, Ordering::Relaxed);
+            }
             let sid = f.stream_id();
             let tx = { t.streams.lock().await.get(&sid).cloned() };
             if let Some(tx) = tx {
