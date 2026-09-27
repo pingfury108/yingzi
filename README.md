@@ -2,6 +2,7 @@
 
 自研对等组网 + 流量隐匿 + 出口选择 + Web 控制台。一个二进制管全部：组网、翻墙出口、内网穿透、虚拟 IP。
 
+[![ci](https://github.com/pingfury108/yingzi/actions/workflows/ci.yml/badge.svg)](https://github.com/pingfury108/yingzi/actions/workflows/ci.yml)
 - 协议自研（握手/加密包/多路复用/可靠 UDP/打洞），无 QUIC/TLS/WireGuard 等已知指纹
 - 密码学原语用 `ring`（X25519 / Ed25519 / ChaCha20-Poly1305 / HKDF）
 - 设计文档：**[docs/plan.md](docs/plan.md)** ｜ 部署手册：**[docs/deploy.md](docs/deploy.md)**
@@ -21,7 +22,7 @@
 ## 快速开始
 
 ```bash
-# 0) 构建（本机）
+# 0) 获取二进制: 从 Releases 下载对应平台包, 或本机构建
 cargo build --release -p yz-node        # 产物 target/release/yz
 
 # 1) 第一个节点生成网络密钥（全网共用，只做一次）
@@ -103,6 +104,13 @@ docs/plan.md       总体设计（协议字节级定义、路线图、决策记�
 docs/deploy.md     部署手册（三台真实机器为例）
 scripts/           验证脚本（如 SOCKS5 UDP ASSOCIATE 端到端测试）
 ```
+
+## 下载
+
+打 tag（`v*`）后 GitHub Actions 自动产出全平台二进制并附在
+[Releases](https://github.com/pingfury108/yingzi/releases)：
+`yz-linux-x86_64` / `yz-linux-aarch64` / `yz-macos-aarch64` / `yz-macos-x86_64` /
+`yz-windows-x86_64`（untested，含 wintun.dll）。校验和见包内 `SHA256SUMS`。
 
 ## 平台与构建
 

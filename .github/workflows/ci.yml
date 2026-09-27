@@ -1,0 +1,23 @@
+name: ci
+
+on:
+  push:
+    branches: [master, main]
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: 测试 (全 workspace)
+        run: cargo test --workspace
+      - name: 构建 (release)
+        run: cargo build --release -p yz-node
+      - name: 零告警检查
+        run: |
+          warnings=$(cargo build --release -p yz-node 2>&1 | grep -c "^warning" || true)
+          echo "warnings=$warnings"
+          test "$warnings" -eq 0
