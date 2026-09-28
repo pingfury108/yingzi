@@ -145,6 +145,9 @@ enum Cmd {
     },
 }
 
+/// (待分析后决定)
+/// macOS 默认软限制仅 256, Linux 常见 1024 —— 浏览器级并发(SOCKS5 入口)很快打满,
+/// 表现为所有 accept 报 "Too many open files"。
 #[tokio::main]
 async fn main() -> Result<()> {
     env_logger::init();

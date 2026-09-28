@@ -14,7 +14,6 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::net::{TcpListener, TcpStream};
@@ -612,18 +611,19 @@ async fn udp_associate(
     socks5::reply_udp(&mut tcp, relay).await?;
     log::debug!("udp associate relay {relay}");
 
-    // TCP 连接关闭 = 关联结束
-    let alive = Arc::new(AtomicBool::new(true));
+    // TCP 连接关闭 = 关联结束: 用 watch 主动唤醒 UDP 循环 (否则中继/目标 socket 永不释放)
+    let (dead_tx, mut dead_rx) = tokio::sync::watch::channel(false);
     {
-        let alive = alive.clone();
+        let dead_tx = dead_tx.clone();
         tokio::spawn(async move {
             let mut b = [0u8; 64];
-            while let Ok(n) = tcp.read(&mut b).await {
-                if n == 0 {
-                    break;
+            loop {
+                match tcp.read(&mut b).await {
+                    Ok(0) | Err(_) => break,
+                    Ok(_) => {}
                 }
             }
-            alive.store(false, Ordering::Relaxed);
+            let _ = dead_tx.send(true);
         });
     }
 
@@ -631,12 +631,12 @@ async fn udp_associate(
     let routes: Arc<Mutex<HashMap<Addr, mpsc::Sender<Vec<u8>>>>> = Default::default();
     let mut buf = vec![0u8; 65536];
     loop {
-        if !alive.load(Ordering::Relaxed) {
-            break;
-        }
-        let (n, from) = match sock.recv_from(&mut buf).await {
-            Ok(x) => x,
-            Err(_) => break,
+        let (n, from) = tokio::select! {
+            r = sock.recv_from(&mut buf) => match r {
+                Ok(x) => x,
+                Err(_) => break,
+            },
+            _ = dead_rx.changed() => break, // 关联结束
         };
         {
             let mut c = client.lock().await;
@@ -664,6 +664,7 @@ async fn udp_associate(
                     &target,
                     sock.clone(),
                     client.clone(),
+                    dead_rx.clone(),
                 )
                 .await
                 {
@@ -681,6 +682,9 @@ async fn udp_associate(
             routes.lock().await.remove(&target);
         }
     }
+    // 广播结束: 所有目标通道关闭 → 任务/套接字全部释放
+    let _ = dead_tx.send(true);
+    drop(routes);
     Ok(())
 }
 
@@ -693,6 +697,7 @@ async fn open_udp_route(
     target: &Addr,
     client_sock: Arc<tokio::net::UdpSocket>,
     client: Arc<Mutex<Option<SocketAddr>>>,
+    dead_rx: tokio::sync::watch::Receiver<bool>,
 ) -> Result<mpsc::Sender<Vec<u8>>> {
     let key = {
         let routes = state.routes.read().await;
@@ -714,6 +719,7 @@ async fn open_udp_route(
             let (tx, mut rx) = mpsc::channel::<Vec<u8>>(256);
             let out2 = out.clone();
             let target = target.clone();
+            let mut dead = dead_rx.clone();
             tokio::spawn(async move {
                 let o = out2.clone();
                 let down = tokio::spawn(async move {
@@ -725,16 +731,20 @@ async fn open_udp_route(
                 });
                 let mut b = vec![0u8; 65536];
                 loop {
-                    match out2.recv(&mut b).await {
-                        Ok(n) => {
-                            if let Some(c) = *client.lock().await {
-                                let pkt = socks5::build_udp_header(&target, &b[..n]);
-                                if client_sock.send_to(&pkt, c).await.is_err() {
-                                    break;
+                    // 关联结束(对端 TCP 关闭)时主动退出, 否则 socket 永不释放
+                    tokio::select! {
+                        r = out2.recv(&mut b) => match r {
+                            Ok(n) => {
+                                if let Some(c) = *client.lock().await {
+                                    let pkt = socks5::build_udp_header(&target, &b[..n]);
+                                    if client_sock.send_to(&pkt, c).await.is_err() {
+                                        break;
+                                    }
                                 }
                             }
-                        }
-                        Err(_) => break,
+                            Err(_) => break,
+                        },
+                        _ = dead.changed() => break,
                     }
                 }
                 down.abort();
@@ -758,6 +768,7 @@ async fn open_udp_route(
             let (tx, mut out_rx) = mpsc::channel::<Vec<u8>>(256);
             let t2 = t.clone();
             let target = target.clone();
+            let mut dead = dead_rx.clone();
             tokio::spawn(async move {
                 let t3 = t2.clone();
                 let down = tokio::spawn(async move {
@@ -774,7 +785,12 @@ async fn open_udp_route(
                         }
                     }
                 });
-                while let Some(f) = rx.recv().await {
+                loop {
+                    // 关联结束: 停止回包并通知出口侧关掉数据报流
+                    let f = tokio::select! {
+                        f = rx.recv() => match f { Some(f) => f, None => break },
+                        _ = dead.changed() => Frame::Fin { stream_id: sid },
+                    };
                     match f {
                         Frame::Data { payload, .. } => {
                             if let Some(c) = *client.lock().await {
@@ -789,6 +805,8 @@ async fn open_udp_route(
                     }
                 }
                 down.abort();
+                // 通知出口侧关流
+                let _ = t2.write_frame(&Frame::Fin { stream_id: sid }).await;
                 t2.close_stream(sid).await;
             });
             Ok(tx)
