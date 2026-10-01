@@ -243,6 +243,14 @@ impl Tunnel {
         )
     }
 
+    /// 链路类型: "tcp" / "udp"
+    pub fn transport(&self) -> &'static str {
+        match &self.link {
+            Link::Tcp { .. } => "tcp",
+            Link::Udp(_) => "udp",
+        }
+    }
+
     pub fn is_closed(&self) -> bool {
         *self.closed_tx.borrow()
     }

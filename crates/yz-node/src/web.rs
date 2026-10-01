@@ -32,6 +32,17 @@ pub struct AppState {
     pub token: Option<String>,
 }
 
+/// 当前进程打开的 FD 数 (Linux: /proc/self/fd; macOS: /dev/fd)
+fn fd_count() -> u64 {
+    if let Ok(rd) = std::fs::read_dir("/proc/self/fd") {
+        return rd.count() as u64;
+    }
+    if let Ok(rd) = std::fs::read_dir("/dev/fd") {
+        return rd.count() as u64;
+    }
+    0
+}
+
 #[derive(Serialize)]
 struct StatusResp {
     node_id: String,
@@ -41,6 +52,7 @@ struct StatusResp {
     peers: usize,
     /// (tx字节, rx字节, 累计开流数)
     traffic: (u64, u64, u64),
+    fd_count: u64,
 }
 
 #[derive(Serialize)]
@@ -55,6 +67,8 @@ struct NodeResp {
     is_self: bool,
     /// 最近测得 RTT (ms, None = 未测量)
     rtt_ms: Option<u32>,
+    /// 本节点到该节点的隧道路径 (p2p/direct/relay)
+    path: Option<String>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -73,6 +87,14 @@ struct RouteAddReq {
     rule: String,
 }
 
+/// 事件 (最近 50 条)
+#[derive(Serialize)]
+struct EventResp {
+    ts: i64,
+    level: String,
+    msg: String,
+}
+
 pub async fn run(bind: &str, app: Arc<AppState>) -> Result<()> {
     let api = Router::new()
         .route("/api/status", get(status))
@@ -81,6 +103,7 @@ pub async fn run(bind: &str, app: Arc<AppState>) -> Result<()> {
         .route("/api/routes", get(list_routes).post(add_route))
         .route("/api/routes/{idx}", delete(del_route))
         .route("/api/ingress", get(list_ingress).post(req_ingress))
+        .route("/api/events", get(events))
         .layer(middleware::from_fn_with_state(app.clone(), auth_mw));
     let router = Router::new()
         .route("/", get(index))
@@ -137,11 +160,13 @@ async fn status(State(app): State<Arc<AppState>>) -> Json<StatusResp> {
         default_exit,
         peers,
         traffic,
+        fd_count: fd_count(),
     })
 }
 
 async fn nodes(State(app): State<Arc<AppState>>) -> Json<Vec<NodeResp>> {
     let dir = app.node.dir.read().await;
+    let paths = app.node.path.read().await;
     let rtt = app.node.rtt.read().await;
     let mut v: Vec<NodeResp> = dir
         .values()
@@ -153,6 +178,7 @@ async fn nodes(State(app): State<Arc<AppState>>) -> Json<Vec<NodeResp>> {
             p2p: !n.udp_addr.is_empty(),
             exit_capable: n.caps & caps::EXIT != 0,
             is_self: n.node_id == app.info.node_id,
+            path: paths.get(&n.node_id).cloned(),
             rtt_ms: rtt.get(&n.node_id).copied(),
         })
         .collect();
@@ -238,6 +264,21 @@ async fn list_ingress(State(app): State<Arc<AppState>>) -> Json<IngressListResp>
         published: app.node.ingress_pub.read().await.clone(),
         requested: app.node.ingress_req.read().await.clone(),
     })
+}
+
+async fn events(State(app): State<Arc<AppState>>) -> Json<Vec<EventResp>> {
+    let ev = app.node.events.read().await;
+    Json(
+        ev.iter()
+            .rev()
+            .take(50)
+            .map(|(ts, level, msg)| EventResp {
+                ts: *ts,
+                level: level.clone(),
+                msg: msg.clone(),
+            })
+            .collect(),
+    )
 }
 
 /// 请求远端节点发布端口: 向该节点的隧道发 INGRESS_PUB

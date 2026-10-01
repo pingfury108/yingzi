@@ -130,8 +130,35 @@ async fn handle(
                     let _ = h.tunnel.write_frame(&Frame::Pong { ts }).await;
                 }
                 Some(Frame::Control { payload }) => {
-                    if let Ok(ControlMsg::PunchReq { target }) = yz_proto::decode_control(&payload) {
-                        route_punch(&registry, &nid, &target).await;
+                    match yz_proto::decode_control(&payload) {
+                        // 迟到的 HELLO: 节点信息更新 (如 NAT 探测成功后获得 udp_addr)
+                        Ok(ControlMsg::Hello {
+                            name,
+                            addr,
+                            udp_addr,
+                            caps,
+                            ..
+                        }) => {
+                            let addr = fixup_advertise(&addr, &from);
+                            {
+                                let mut reg = registry.lock().await;
+                                if let Some(rec) = reg.get_mut(&nid) {
+                                    rec.name = name.clone();
+                                    rec.addr = addr.clone();
+                                    rec.udp_addr = udp_addr.clone();
+                                    rec.caps = caps;
+                                }
+                            }
+                            log::info!(
+                                "node {} info updated: addr {addr}, udp {udp_addr}",
+                                &nid[..8]
+                            );
+                            broadcast(&registry).await;
+                        }
+                        Ok(ControlMsg::PunchReq { target }) => {
+                            route_punch(&registry, &nid, &target).await;
+                        }
+                        _ => {}
                     }
                 }
                 Some(_) => {}

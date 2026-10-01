@@ -49,8 +49,11 @@
 
   <h2>流量</h2>
   <div class="card">
-    <span class="sub">发送: <b id="txB">-</b> · 接收: <b id="rxB">-</b> · 累计开流: <b id="streams">-</b></span>
+    <span class="sub">发送: <b id="txB">-</b> · 接收: <b id="rxB">-</b> · 累计开流: <b id="streams">-</b> · FD: <b id="fd">-</b></span>
   </div>
+
+  <h2>事件 <span class="sub">最近 50 条 (新→旧)</span></h2>
+  <div class="card mono" id="events" style="max-height:220px;overflow:auto"></div>
 
   <h2>入口发布 <span class="sub">公网端口 → 组网内服务</span></h2>
   <div class="card">
@@ -97,8 +100,8 @@ const short = id => id.slice(0, 8);
 
 async function refresh() {
   try {
-    const [st, ns, rs, ig] = await Promise.all([
-      api('/api/status'), api('/api/nodes'), api('/api/routes'), api('/api/ingress')
+    const [st, ns, rs, ig, ev] = await Promise.all([
+      api('/api/status'), api('/api/nodes'), api('/api/routes'), api('/api/ingress'), api('/api/events')
     ]);
     $('title').textContent = `yingzi · ${st.name}`;
     $('subtitle').textContent =
@@ -109,6 +112,15 @@ async function refresh() {
     $('txB').textContent = fmt(st.traffic[0]);
     $('rxB').textContent = fmt(st.traffic[1]);
     $('streams').textContent = st.traffic[2];
+    $('fd').textContent = st.fd_count;
+
+    $('events').innerHTML = ev.length
+      ? ev.map(e => {
+          const t = new Date(e.ts * 1000).toLocaleTimeString();
+          const c = e.level === 'warn' ? '#e5c07b' : '#8b90a0';
+          return `<div style="color:${c}">${t} [${e.level}] ${e.msg}</div>`;
+        }).join('')
+      : '<div class="empty">暂无事件</div>';
 
     // ingress
     const selPub = $('pubNode');
@@ -145,6 +157,7 @@ async function refresh() {
         <span class="mono sub">${n.addr}</span>
         ${n.rtt_ms != null ? `<span class="mono sub">${n.rtt_ms} ms</span>` : ''}
         <span class="grow"></span>
+        ${n.path ? `<span class="badge">${n.path}</span>` : ''}
         ${n.p2p ? '<span class="badge exit">p2p</span>' : ''}
         ${n.exit_capable ? '<span class="badge exit">exit</span>' : ''}
         ${n.is_self ? '<span class="badge self">本机</span>' : ''}

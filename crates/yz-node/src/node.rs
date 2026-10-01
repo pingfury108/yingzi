@@ -11,7 +11,7 @@ use crate::socks5;
 use crate::tunnel::{self, Incoming, Tunnel, TunnelHandle};
 use anyhow::{bail, Context, Result};
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -81,6 +81,27 @@ pub struct NodeState {
     pub rtt: RwLock<HashMap<String, u32>>,
     /// 持久化配置路径
     pub config_path: Option<PathBuf>,
+    /// 事件环形缓冲 (Web 展示)
+    pub events: RwLock<VecDeque<(i64, String, String)>>,
+    /// node_id → 隧道路径 (p2p/direct/relay)
+    pub path: RwLock<HashMap<String, String>>,
+    /// 当前对外 UDP 映射 (探测成功后更新)
+    pub udp_addr: RwLock<String>,
+}
+
+impl NodeState {
+    /// 追加事件 (环形, 上限 100 条)
+    pub async fn push_event(&self, level: &str, msg: String) {
+        let ts = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs() as i64;
+        let mut ev = self.events.write().await;
+        ev.push_back((ts, level.to_string(), msg));
+        while ev.len() > 100 {
+            ev.pop_front();
+        }
+    }
 }
 
 /// 落盘的最小配置面 (Web UI 可改的那部分)
@@ -195,6 +216,8 @@ pub async fn run(opts: NodeOpts, ns: &NetworkSecret, id_pub: [u8; 32]) -> Result
 
     // 经 coordinator UDP (P 与 P+1) 探测公网映射与 NAT 类型
     let mut udp_addr = String::new();
+    let probe_failed = std::sync::atomic::AtomicBool::new(false);
+    let probe_failed = &probe_failed;
     if let Some(ep) = &udp_ep {
         if let Some(coord_addr) = tokio::net::lookup_host(&opts.coord[0])
             .await
@@ -212,13 +235,48 @@ pub async fn run(opts: NodeOpts, ns: &NetworkSecret, id_pub: [u8; 32]) -> Result
                         log::info!("nat: symmetric ({a1} vs {a2})");
                     }
                 }
-                _ => log::warn!("nat probe failed, p2p disabled"),
+                _ => {
+                    log::warn!("nat probe failed, p2p disabled");
+                    probe_failed.store(true, std::sync::atomic::Ordering::Relaxed);
+                }
             }
         }
     }
     if let Some(manual) = &opts.udp_advertise {
         udp_addr = manual.clone();
         log::info!("udp advertise overridden: {manual}");
+    }
+    *state.udp_addr.write().await = udp_addr.clone();
+
+    // 探测失败: 每 5 分钟重试 (网络恢复后自动获得 P2P 并广播)
+    if udp_addr.is_empty() {
+        if let Some(ep) = &udp_ep {
+            let state2 = state.clone();
+            let coord = opts.coord.clone();
+            let ep = ep.clone();
+            tokio::spawn(async move {
+                loop {
+                    tokio::time::sleep(Duration::from_secs(300)).await;
+                    if !state2.udp_addr.read().await.is_empty() {
+                        break;
+                    }
+                    if let Some(ca) = tokio::net::lookup_host(coord.first().map(String::as_str).unwrap_or(""))
+                        .await
+                        .ok()
+                        .and_then(|mut i| i.next())
+                    {
+                        let mut ca2 = ca;
+                        ca2.set_port(ca.port() + 1);
+                        if let (Ok(a1), Ok(_)) = (ep.probe_via(ca).await, ep.probe_via(ca2).await) {
+                            *state2.udp_addr.write().await = a1.to_string();
+                            state2.push_event("info", format!("NAT 探测成功: {a1}")).await;
+                            log::info!("nat probe ok: {a1}");
+                            break;
+                        }
+                    }
+                }
+            });
+        }
     }
 
     // 1b) UDP 隧道接入 (P2P 被打入方)
@@ -249,6 +307,7 @@ pub async fn run(opts: NodeOpts, ns: &NetworkSecret, id_pub: [u8; 32]) -> Result
         let listener = bind_tcp_retry(&opts.bind).await?;
         log::info!("node [{}] serving peers on {}", opts.name, opts.bind);
         let ns = ns.clone();
+        let state = state.clone();
         let ctx = PeerCtx {
             exit_acl: opts.exit_acl.clone(),
             ingress_acl: opts.ingress_acl.clone(),
@@ -277,7 +336,15 @@ pub async fn run(opts: NodeOpts, ns: &NetworkSecret, id_pub: [u8; 32]) -> Result
                             }
                         });
                     }
-                    Err(e) => log::warn!("accept: {e}"),
+                    Err(e) => {
+                        // FD 耗尽时退避, 避免刷屏
+                        if e.raw_os_error() == Some(24) {
+                            state.push_event("warn", "FD 耗尽 (EMFILE), 1s 后重试 accept".into()).await;
+                            tokio::time::sleep(Duration::from_secs(1)).await;
+                        } else {
+                            log::warn!("accept: {e}");
+                        }
+                    }
                 }
             }
         });
@@ -304,7 +371,14 @@ pub async fn run(opts: NodeOpts, ns: &NetworkSecret, id_pub: [u8; 32]) -> Result
                             }
                         });
                     }
-                    Err(e) => log::warn!("socks5 accept: {e}"),
+                    Err(e) => {
+                        if e.raw_os_error() == Some(24) {
+                            state.push_event("warn", "FD 耗尽 (EMFILE), SOCKS5 accept 1s 后重试".into()).await;
+                            tokio::time::sleep(Duration::from_secs(1)).await;
+                        } else {
+                            log::warn!("socks5 accept: {e}");
+                        }
+                    }
                 }
             }
         });
@@ -510,6 +584,15 @@ async fn handle_socks5(
             None => state.default_exit.read().await.clone(),
         }
     };
+    // 显式出口节点但目录尚未同步 (刚启动/部署窗口): 等目录到位, 不静默走 direct
+    if !matches!(key.as_str(), "direct" | "auto") {
+        for _ in 0..8 {
+            if resolve_node(state, &key).await.is_some() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(500)).await;
+        }
+    }
     let decision = resolve_exit(state, &key, self_id).await;
 
     match decision {
@@ -531,7 +614,8 @@ async fn handle_socks5(
             Ok(())
         }
         Exit::Via(node_id) => {
-            let t = tunnel_for(state, ns, id_pub, &node_id).await?;
+            let t = tunnel_for_retry(state, ns, id_pub, &node_id, 2, Duration::from_millis(1200))
+                .await?;
             let (sid, mut rx) = t.open_stream(addr.clone()).await?;
             match timeout(Duration::from_secs(10), rx.recv()).await? {
                 Some(Frame::SynAck { ok: true, .. }) => {}
@@ -753,7 +837,8 @@ async fn open_udp_route(
         }
         Exit::Via(node_id) => {
             log::debug!("udp route {target} -> exit {}", &node_id[..8]);
-            let t = tunnel_for(state, ns, id_pub, &node_id).await?;
+            let t = tunnel_for_retry(state, ns, id_pub, &node_id, 2, Duration::from_millis(1200))
+                .await?;
             let (sid, mut rx) = t
                 .open_stream_kind(target.clone(), yz_proto::StreamKind::Udp)
                 .await?;
@@ -814,6 +899,28 @@ async fn open_udp_route(
     }
 }
 
+/// 建隧道带重试: 部署/重启窗口期目录或链路暂不可用时, 等待而不是立即失败
+async fn tunnel_for_retry(
+    state: &Arc<NodeState>,
+    ns: &NetworkSecret,
+    id_pub: &[u8; 32],
+    node_id: &str,
+    attempts: usize,
+    gap: Duration,
+) -> Result<Arc<Tunnel>> {
+    let mut last: Option<anyhow::Error> = None;
+    for i in 0..attempts {
+        if i > 0 {
+            tokio::time::sleep(gap).await;
+        }
+        match tunnel_for(state, ns, id_pub, node_id).await {
+            Ok(t) => return Ok(t),
+            Err(e) => last = Some(e),
+        }
+    }
+    Err(last.expect("attempts > 0"))
+}
+
 /// 按 node_id / 名字 / id 前缀解析目录条目
 pub(crate) async fn resolve_node(state: &Arc<NodeState>, key: &str) -> Option<NodeEntry> {
     let dir = state.dir.read().await;
@@ -852,19 +959,19 @@ pub(crate) async fn tunnel_for(
         .await
         {
             log::debug!("lan direct to {} ({})", &node_id[..8], entry.addr);
-            return Ok(adopt_tunnel(state, h, node_id, ns, *id_pub).await);
+            return Ok(adopt_tunnel(state, h, node_id, ns, *id_pub, "direct").await);
         }
     }
     // P2P 打洞优先
     if !entry.udp_addr.is_empty() {
         if let Some(h) = try_punch(state, ns, id_pub, &entry).await {
-            return Ok(adopt_tunnel(state, h, node_id, ns, *id_pub).await);
+            return Ok(adopt_tunnel(state, h, node_id, ns, *id_pub, "p2p").await);
         }
     }
     // TCP 兜底 → 中继兜底 (直连加快速超时, 避免被防火墙黑洞拖死降级链)
     let direct = timeout(Duration::from_secs(6), tunnel::connect(&entry.addr, ns, id_pub)).await;
     match direct {
-        Ok(Ok(h)) => Ok(adopt_tunnel(state, h, node_id, ns, *id_pub).await),
+        Ok(Ok(h)) => Ok(adopt_tunnel(state, h, node_id, ns, *id_pub, "direct").await),
         Ok(Err(e)) => {
             log::debug!("tcp direct {}: {e:#}", &node_id[..8.min(node_id.len())]);
             relay_fallback(state, node_id, ns, id_pub).await
@@ -896,7 +1003,7 @@ async fn relay_fallback(
     .await
     .context("relay timeout")??;
     log::info!("relayed via coordinator to {}", &node_id[..8.min(node_id.len())]);
-    Ok(adopt_tunnel(state, h, node_id, ns, *id_pub).await)
+    Ok(adopt_tunnel(state, h, node_id, ns, *id_pub, "relay").await)
 }
 
 /// 隧道控制消息统一处理: 延迟测量(PING/PONG) + 存活探测 + 可选 ingress 发布
@@ -1044,6 +1151,7 @@ async fn adopt_tunnel(
     node_id: &str,
     ns: &NetworkSecret,
     id_pub: [u8; 32],
+    path: &str,
 ) -> Arc<Tunnel> {
     let t = h.tunnel.clone();
     spawn_ctrl_handler(
@@ -1065,6 +1173,11 @@ async fn adopt_tunnel(
         false,
     );
     crate::mesh::spawn_forward(h.mesh_rx, state.clone());
+    state
+        .path
+        .write()
+        .await
+        .insert(node_id.to_string(), path.to_string());
     state
         .tunnels
         .lock()
@@ -1247,8 +1360,11 @@ pub async fn handle_peer(h: TunnelHandle, ctx: &PeerCtx) -> Result<()> {
     log::debug!("peer {} tunnel up", &peer_id[..8]);
     let t = h.tunnel.clone();
     // P2P 被接受的隧道也注册, 双向复用
+    let path = if h.tunnel.transport() == "udp" { "p2p" } else { "direct" };
     if let Some(st) = &ctx.state {
         st.tunnels.lock().await.insert(peer_id.clone(), t.clone());
+        st.path.write().await.insert(peer_id.clone(), path.to_string());
+        st.push_event("info", format!("隧道建立: {peer_id} ({path})")).await;
     }
 
     // 控制消息: PING/PONG(延迟) + 动态 ingress 发布
@@ -1278,6 +1394,8 @@ pub async fn handle_peer(h: TunnelHandle, ctx: &PeerCtx) -> Result<()> {
     let _ = closed.changed().await;
     if let Some(st) = &ctx.state {
         st.tunnels.lock().await.remove(&peer_id);
+        st.path.write().await.remove(&peer_id);
+        st.push_event("warn", format!("隧道断开: {peer_id}")).await;
     }
     Ok(())
 }

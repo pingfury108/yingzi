@@ -148,9 +148,33 @@ enum Cmd {
 /// (待分析后决定)
 /// macOS 默认软限制仅 256, Linux 常见 1024 —— 浏览器级并发(SOCKS5 入口)很快打满,
 /// 表现为所有 accept 报 "Too many open files"。
+/// 抬高 FD 软限制 (macOS 默认 256 / Linux 常见 1024, 代理级并发不够)
+fn raise_nofile() {
+    unsafe {
+        let mut lim = libc::rlimit { rlim_cur: 0, rlim_max: 0 };
+        if libc::getrlimit(libc::RLIMIT_NOFILE, &mut lim) != 0 {
+            log::warn!("getrlimit(RLIMIT_NOFILE) 失败");
+            return;
+        }
+        const TARGET: libc::rlim_t = 10240;
+        if lim.rlim_cur >= TARGET {
+            log::info!("RLIMIT_NOFILE 已足够 ({})", lim.rlim_cur);
+            return;
+        }
+        let old = lim.rlim_cur;
+        lim.rlim_cur = TARGET.min(lim.rlim_max);
+        if libc::setrlimit(libc::RLIMIT_NOFILE, &lim) == 0 {
+            log::info!("RLIMIT_NOFILE {old} -> {}", lim.rlim_cur);
+        } else {
+            log::warn!("setrlimit 失败 (cur {old} / max {})", lim.rlim_max);
+        }
+    }
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     env_logger::init();
+    raise_nofile();
     let cli = Cli::parse();
 
     if matches!(cli.cmd, Cmd::Keygen) {
