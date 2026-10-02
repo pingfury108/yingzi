@@ -965,6 +965,7 @@ pub(crate) async fn tunnel_for(
     // P2P 打洞优先
     if !entry.udp_addr.is_empty() {
         if let Some(h) = try_punch(state, ns, id_pub, &entry).await {
+            state.push_event("info", format!("P2P 打洞成功: {}", &node_id[..8.min(node_id.len())])).await;
             return Ok(adopt_tunnel(state, h, node_id, ns, *id_pub, "p2p").await);
         }
     }
@@ -1003,6 +1004,7 @@ async fn relay_fallback(
     .await
     .context("relay timeout")??;
     log::info!("relayed via coordinator to {}", &node_id[..8.min(node_id.len())]);
+    state.push_event("warn", format!("走中继: {}", &node_id[..8.min(node_id.len())])).await;
     Ok(adopt_tunnel(state, h, node_id, ns, *id_pub, "relay").await)
 }
 
@@ -1178,6 +1180,7 @@ async fn adopt_tunnel(
         .write()
         .await
         .insert(node_id.to_string(), path.to_string());
+    state.push_event("info", format!("隧道建立: {} ({path})", &node_id[..8.min(node_id.len())])).await;
     state
         .tunnels
         .lock()
