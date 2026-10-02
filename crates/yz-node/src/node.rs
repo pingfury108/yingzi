@@ -248,35 +248,57 @@ pub async fn run(opts: NodeOpts, ns: &NetworkSecret, id_pub: [u8; 32]) -> Result
     }
     *state.udp_addr.write().await = udp_addr.clone();
 
-    // 探测失败: 每 5 分钟重试 (网络恢复后自动获得 P2P 并广播)
-    if udp_addr.is_empty() {
-        if let Some(ep) = &udp_ep {
-            let state2 = state.clone();
-            let coord = opts.coord.clone();
-            let ep = ep.clone();
-            tokio::spawn(async move {
-                loop {
-                    tokio::time::sleep(Duration::from_secs(300)).await;
-                    if !state2.udp_addr.read().await.is_empty() {
+    // 探测失败: 指数退避重试 (10s→60s), 成功后更新 udp_addr 并重发 HELLO 让全网目录更新
+    if let Some(ep) = &udp_ep {
+        let state2 = state.clone();
+        let ep2 = ep.clone();
+        let coord_first = opts.coord.first().cloned().unwrap_or_default();
+        let hello_name = opts.name.clone();
+        let hello_addr = opts.advertise.clone();
+        let hello_caps = if opts.exit_acl.advertise() {
+            caps::EXIT
+        } else {
+            0
+        };
+        tokio::spawn(async move {
+            let mut wait = Duration::from_secs(10);
+            loop {
+                tokio::time::sleep(wait).await;
+                if !state2.udp_addr.read().await.is_empty() {
+                    break; // 已通过其它途径拿到映射
+                }
+                if let Some(ca) = tokio::net::lookup_host(coord_first.as_str())
+                    .await
+                    .ok()
+                    .and_then(|mut i| i.next())
+                {
+                    let mut ca2 = ca;
+                    ca2.set_port(ca.port() + 1);
+                    if let (Ok(a1), Ok(_)) = (ep2.probe_via(ca).await, ep2.probe_via(ca2).await) {
+                        *state2.udp_addr.write().await = a1.to_string();
+                        state2
+                            .push_event("info", format!("NAT 探测成功: {a1}"))
+                            .await;
+                        log::info!("nat probe ok: {a1}");
+                        // 重发 HELLO, 让协调器目录立刻带上 udp_addr
+                        if let Some(ct) = state2.coord_tunnel.read().await.clone() {
+                            let hello = yz_proto::encode_control(&ControlMsg::Hello {
+                                version: 1,
+                                name: hello_name.clone(),
+                                addr: hello_addr.clone(),
+                                udp_addr: a1.to_string(),
+                                caps: hello_caps,
+                            });
+                            let _ = ct
+                                .write_frame(&Frame::Control { payload: hello })
+                                .await;
+                        }
                         break;
                     }
-                    if let Some(ca) = tokio::net::lookup_host(coord.first().map(String::as_str).unwrap_or(""))
-                        .await
-                        .ok()
-                        .and_then(|mut i| i.next())
-                    {
-                        let mut ca2 = ca;
-                        ca2.set_port(ca.port() + 1);
-                        if let (Ok(a1), Ok(_)) = (ep.probe_via(ca).await, ep.probe_via(ca2).await) {
-                            *state2.udp_addr.write().await = a1.to_string();
-                            state2.push_event("info", format!("NAT 探测成功: {a1}")).await;
-                            log::info!("nat probe ok: {a1}");
-                            break;
-                        }
-                    }
                 }
-            });
-        }
+                wait = (wait * 2).min(Duration::from_secs(60));
+            }
+        });
     }
 
     // 1b) UDP 隧道接入 (P2P 被打入方)
