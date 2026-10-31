@@ -14,7 +14,7 @@ use yz_proto::{ControlMsg, Frame, NodeEntry};
 
 struct NodeRec {
     name: String,
-    addr: String,
+    addrs: Vec<String>,
     udp_addr: String,
     caps: u8,
     tunnel: Arc<Tunnel>,
@@ -71,22 +71,21 @@ async fn handle(
     let first = timeout(Duration::from_secs(10), h.ctrl_rx.recv())
         .await?
         .context("expect HELLO")?;
-    let (name, addr, udp_addr, caps) = match first {
+    let (name, addrs, udp_addr, caps) = match first {
         Frame::Control { payload } => match yz_proto::decode_control(&payload)? {
             ControlMsg::Hello {
                 version,
                 name,
-                addr,
+                addrs,
                 udp_addr,
                 caps,
             } => {
-                // advertise 为通配地址时, 用观察到的源 IP 替代主机部分
-                let addr = fixup_advertise(&addr, &from);
+                let addrs = fixup_addrs(addrs, &from);
                 log::info!(
-                    "node {} ({name}) joined from {from}, addr {addr}, udp {udp_addr}, proto v{version}",
+                    "node {} ({name}) joined from {from}, addrs {addrs:?}, udp {udp_addr}, proto v{version}",
                     &nid[..8]
                 );
-                (name, addr, udp_addr, caps)
+                (name, addrs, udp_addr, caps)
             }
             _ => bail!("expect HELLO"),
         },
@@ -97,7 +96,7 @@ async fn handle(
         nid.clone(),
         NodeRec {
             name,
-            addr,
+            addrs,
             udp_addr,
             caps,
             tunnel: h.tunnel.clone(),
@@ -134,23 +133,23 @@ async fn handle(
                         // 迟到的 HELLO: 节点信息更新 (如 NAT 探测成功后获得 udp_addr)
                         Ok(ControlMsg::Hello {
                             name,
-                            addr,
+                            addrs,
                             udp_addr,
                             caps,
                             ..
                         }) => {
-                            let addr = fixup_advertise(&addr, &from);
+                            let addrs = fixup_addrs(addrs, &from);
                             {
                                 let mut reg = registry.lock().await;
                                 if let Some(rec) = reg.get_mut(&nid) {
                                     rec.name = name.clone();
-                                    rec.addr = addr.clone();
+                                    rec.addrs = addrs.clone();
                                     rec.udp_addr = udp_addr.clone();
                                     rec.caps = caps;
                                 }
                             }
                             log::info!(
-                                "node {} info updated: addr {addr}, udp {udp_addr}",
+                                "node {} info updated: addrs {addrs:?}, udp {udp_addr}",
                                 &nid[..8]
                             );
                             broadcast(&registry).await;
@@ -181,7 +180,7 @@ async fn broadcast(registry: &Registry) {
         .map(|(id, r)| NodeEntry {
             node_id: id.clone(),
             name: r.name.clone(),
-            addr: r.addr.clone(),
+            addrs: r.addrs.clone(),
             udp_addr: r.udp_addr.clone(),
             caps: r.caps,
         })
@@ -286,15 +285,30 @@ async fn relay_stream(
     Ok(())
 }
 
-/// advertise 主机为 0.0.0.0/空 时, 用观察到的源 IP 替代
-fn fixup_advertise(addr: &str, from: &str) -> String {
-    let Some((host, port)) = addr.rsplit_once(':') else {
-        return addr.to_string();
-    };
-    if host.is_empty() || host == "0.0.0.0" || host == "::" || host == "[::]" {
-        let src_ip = from.rsplit_once(':').map(|(h, _)| h).unwrap_or(from);
-        format!("{src_ip}:{port}")
-    } else {
-        addr.to_string()
+/// 地址列表清洗: 去掉通配地址, 并用协调器观察到的源 IP 兜底
+fn fixup_addrs(addrs: Vec<String>, from: &str) -> Vec<String> {
+    let src_ip = from.rsplit_once(':').map(|(h, _)| h).unwrap_or(from);
+    let mut out: Vec<String> = Vec::new();
+    let mut port_hint: Option<u16> = None;
+    for a in addrs {
+        let Some((host, port)) = a.rsplit_once(':') else {
+            continue;
+        };
+        if let Ok(p) = port.parse::<u16>() {
+            port_hint = Some(p);
+        }
+        if host.is_empty() || host == "0.0.0.0" || host == "::" || host == "[::]" {
+            continue;
+        }
+        out.push(a);
     }
+    // 一个都没有时用观察到的源 IP 兜底
+    if out.is_empty() {
+        if let Some(p) = port_hint {
+            out.push(format!("{src_ip}:{p}"));
+        }
+    }
+    out.sort();
+    out.dedup();
+    out
 }

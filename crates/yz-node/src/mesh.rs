@@ -171,13 +171,28 @@ mod tests {
 
     #[test]
     fn parse_dst() {
-        let mut pkt = vec![0u8; 20];
-        pkt[0] = 0x45;
-        pkt[16..20].copy_from_slice(&[100, 70, 1, 2]);
-        assert_eq!(dst_v4(&pkt), Some(Ipv4Addr::new(100, 70, 1, 2)));
-        assert_eq!(dst_v4(&pkt[..10]), None);
-        let mut v6 = vec![0u8; 40];
-        v6[0] = 0x60;
+        // 按平台构造: macOS utun 有 4 字节 AF 头
+        let mut raw: Vec<u8> = Vec::new();
+        if UTUN_HDR == 4 {
+            raw.extend_from_slice(&[0, 0, 0, 2]);
+        }
+        let ip_off = raw.len();
+        raw.resize(ip_off + 20, 0);
+        raw[ip_off] = 0x45;
+        raw[ip_off + 16..ip_off + 20].copy_from_slice(&[100, 70, 1, 2]);
+        assert_eq!(dst_v4(&raw), Some(Ipv4Addr::new(100, 70, 1, 2)));
+        assert_eq!(dst_v4(&raw[..ip_off + 10]), None);
+
+        let mut v6: Vec<u8> = Vec::new();
+        if UTUN_HDR == 4 {
+            v6.extend_from_slice(&[0, 0, 0, 2]);
+        }
+        let off = v6.len();
+        v6.resize(off + 40, 0);
+        v6[off] = 0x60;
         assert_eq!(dst_v4(&v6), None);
+
+        // 写回时按平台补头
+        assert_eq!(wrap_tun(&[1, 2, 3]).len(), 3 + UTUN_HDR);
     }
 }

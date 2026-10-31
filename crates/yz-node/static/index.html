@@ -154,7 +154,7 @@ async function refresh() {
         <b>${n.name}</b>
         <span class="mono sub">${short(n.node_id)}</span>
         <span class="mono sub">${n.vip}</span>
-        <span class="mono sub">${n.addr}</span>
+        <span class="mono sub" title="${(n.addrs||[]).join('\n')}">${n.addr}</span>
         ${n.rtt_ms != null ? `<span class="mono sub">${n.rtt_ms} ms</span>` : ''}
         <span class="grow"></span>
         ${n.path ? `<span class="badge">${n.path}</span>` : ''}

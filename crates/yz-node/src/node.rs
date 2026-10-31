@@ -282,10 +282,15 @@ pub async fn run(opts: NodeOpts, ns: &NetworkSecret, id_pub: [u8; 32]) -> Result
                         log::info!("nat probe ok: {a1}");
                         // 重发 HELLO, 让协调器目录立刻带上 udp_addr
                         if let Some(ct) = state2.coord_tunnel.read().await.clone() {
+                            let port = hello_addr
+                                .rsplit_once(':')
+                                .and_then(|(_, p)| p.parse::<u16>().ok())
+                                .unwrap_or(9100);
+                            let addrs = local_addrs(port, Some(hello_addr.as_str()));
                             let hello = yz_proto::encode_control(&ControlMsg::Hello {
                                 version: 1,
                                 name: hello_name.clone(),
-                                addr: hello_addr.clone(),
+                                addrs,
                                 udp_addr: a1.to_string(),
                                 caps: hello_caps,
                             });
@@ -374,8 +379,18 @@ pub async fn run(opts: NodeOpts, ns: &NetworkSecret, id_pub: [u8; 32]) -> Result
 
     // 2) SOCKS5 入口 + 策略路由
     if let Some(listen) = opts.socks5.clone() {
+        // 绑通配地址 (0.0.0.0/::) = 对局域网开放, 此时自动只放行私网/回环来源,
+        // 避免无认证的 SOCKS5 被公网当作开放代理
+        let wildcard = {
+            let host = listen.rsplit_once(':').map(|(h, _)| h).unwrap_or("");
+            host.is_empty() || host == "0.0.0.0" || host == "[::]" || host == "::"
+        };
         let listener = TcpListener::bind(&listen).await?;
-        log::info!("socks5 entry on {listen}");
+        if wildcard {
+            log::info!("socks5 entry on {listen} (通配地址: 仅放行私网/回环来源)");
+        } else {
+            log::info!("socks5 entry on {listen}");
+        }
         let state = state.clone();
         let ns = ns.clone();
         let self_id = self_id.clone();
@@ -383,6 +398,11 @@ pub async fn run(opts: NodeOpts, ns: &NetworkSecret, id_pub: [u8; 32]) -> Result
             loop {
                 match listener.accept().await {
                     Ok((stream, from)) => {
+                        // 绑通配地址时只接受私网/回环来源
+                        if wildcard && !is_local_source(from.ip()) {
+                            log::warn!("socks5 拒绝非私网来源 {from}");
+                            continue;
+                        }
                         let state = state.clone();
                         let ns = ns.clone();
                         let self_id = self_id.clone();
@@ -465,10 +485,17 @@ pub async fn run(opts: NodeOpts, ns: &NetworkSecret, id_pub: [u8; 32]) -> Result
                     &h.peer.node_id()[..8]
                 );
                 *state.coord_tunnel.write().await = Some(h.tunnel.clone());
+                let port = opts
+                    .advertise
+                    .rsplit_once(':')
+                    .and_then(|(_, p)| p.parse::<u16>().ok())
+                    .unwrap_or(9100);
+                let addrs = local_addrs(port, Some(opts.advertise.as_str()));
+                log::info!("advertise addrs: {addrs:?}");
                 let hello = yz_proto::encode_control(&ControlMsg::Hello {
                     version: 1,
                     name: opts.name.clone(),
-                    addr: opts.advertise.clone(),
+                    addrs: addrs.clone(),
                     udp_addr: udp_addr.clone(),
                     caps: if opts.exit_acl.advertise() {
                         caps::EXIT
@@ -654,6 +681,142 @@ async fn handle_socks5(
             log::debug!("{addr} -> via {}", &node_id[..8]);
             tunnel::pump_stream(local, sid, rx, t).await
         }
+    }
+}
+
+/// 枚举本机可用于隧道连接的地址 (不含回环/通配):
+/// 把 --advertise 的端口应用到所有本地网卡 IP 上, 让不同网段的节点都能连到我们
+fn local_addrs(port: u16, explicit: Option<&str>) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    // 显式 advertise 优先 (通常是公网 IP)
+    if let Some(a) = explicit {
+        if let Some((host, p)) = a.rsplit_once(':') {
+            if !host.is_empty() && host != "0.0.0.0" && host != "::" {
+                out.push(format!("{host}:{p}"));
+            }
+        }
+    }
+    // 本机网卡地址 (通过 UDP connect 技巧拿到默认出口源 IP)
+    if let Ok(sock) = std::net::UdpSocket::bind("0.0.0.0:0") {
+        if sock.connect("8.8.8.8:53").is_ok() {
+            if let Ok(addr) = sock.local_addr() {
+                if let std::net::IpAddr::V4(v4) = addr.ip() {
+                    if !v4.is_loopback() {
+                        out.push(format!("{v4}:{port}"));
+                    }
+                }
+            }
+        }
+    }
+    // 遍历系统网卡 (Linux: /proc/net/route 太重; 用 getifaddrs 简化版: 读 /proc/net/fib_trie 太脏)
+    // 折中: 用 `hostname -I` 等外部命令不可靠, 这里靠上面两项 + 下面 /proc/net/route 的本机地址
+    #[cfg(target_os = "linux")]
+    {
+        // fib_trie 里混有网络地址/广播地址/容器网桥, 只保留像主机地址的
+        if let Ok(txt) = std::fs::read_to_string("/proc/net/fib_trie") {
+            for line in txt.lines() {
+                let t = line.trim();
+                let Some(rest) = t.strip_prefix("|-- ") else {
+                    continue;
+                };
+                let Ok(ip) = rest.parse::<std::net::Ipv4Addr>() else {
+                    continue;
+                };
+                if !ip.is_private() || ip.is_loopback() {
+                    continue;
+                }
+                let o = ip.octets();
+                // 跳过网络地址 / 广播地址
+                if o[3] == 0 || o[3] == 255 {
+                    continue;
+                }
+                // 跳过容器网桥段 (docker 默认 172.17-31.x)
+                if o[0] == 172 && (17..=31).contains(&o[1]) {
+                    continue;
+                }
+                out.push(format!("{ip}:{port}"));
+            }
+        }
+    }
+    out.sort();
+    out.dedup();
+    out
+}
+
+/// 本机所有地址 (用于同网段匹配)
+fn my_addrs() -> Vec<std::net::Ipv4Addr> {
+    let mut v = Vec::new();
+    if let Ok(sock) = std::net::UdpSocket::bind("0.0.0.0:0") {
+        if sock.connect("8.8.8.8:53").is_ok() {
+            if let Ok(a) = sock.local_addr() {
+                if let std::net::IpAddr::V4(v4) = a.ip() {
+                    v.push(v4);
+                }
+            }
+        }
+    }
+    #[cfg(target_os = "linux")]
+    {
+        if let Ok(txt) = std::fs::read_to_string("/proc/net/fib_trie") {
+            for line in txt.lines() {
+                let t = line.trim();
+                if let Some(rest) = t.strip_prefix("|-- ") {
+                    if let Ok(ip) = rest.parse::<std::net::Ipv4Addr>() {
+                        let o = ip.octets();
+                        if ip.is_private()
+                            && !ip.is_loopback()
+                            && o[3] != 0
+                            && o[3] != 255
+                            && !(o[0] == 172 && (17..=31).contains(&o[1]))
+                        {
+                            v.push(ip);
+                        }
+                    }
+                }
+            }
+        }
+    }
+    v
+}
+
+/// 从候选地址里挑一个: 与我方同 /24 网段优先, 其次任一私网, 最后第一个
+pub(crate) fn pick_addr(addrs: &[String], prefer_lan: bool) -> Option<String> {
+    if addrs.is_empty() {
+        return None;
+    }
+    let mine = my_addrs();
+    let same_subnet = |a: &String| -> bool {
+        let Some((host, _)) = a.rsplit_once(':') else {
+            return false;
+        };
+        let Ok(ip) = host.parse::<std::net::Ipv4Addr>() else {
+            return false;
+        };
+        let o = ip.octets();
+        mine.iter().any(|m| {
+            let mo = m.octets();
+            mo[0] == o[0] && mo[1] == o[1] && mo[2] == o[2]
+        })
+    };
+    // 同 /24 网段最优
+    if let Some(a) = addrs.iter().find(|a| same_subnet(a)) {
+        return Some(a.clone());
+    }
+    if prefer_lan {
+        if let Some(a) = addrs.iter().find(|a| is_lan_addr(a)) {
+            return Some(a.clone());
+        }
+    }
+    Some(addrs[0].clone())
+}
+
+/// 是否为私网/回环来源 (局域网 SOCKS5 只放行这些)
+fn is_local_source(ip: std::net::IpAddr) -> bool {
+    match ip {
+        std::net::IpAddr::V4(v4) => {
+            v4.is_private() || v4.is_loopback() || v4.is_link_local()
+        }
+        std::net::IpAddr::V6(v6) => v6.is_loopback() || (v6.segments()[0] & 0xfe00) == 0xfc00,
     }
 }
 
@@ -973,15 +1136,17 @@ pub(crate) async fn tunnel_for(
             .with_context(|| format!("node {} not in directory", &node_id[..8.min(node_id.len())]))?
     };
     // 局域网对端: 直连优先 (省掉打洞等待, 同网段通常 <1ms 可连)
-    if is_lan_addr(&entry.addr) {
-        if let Ok(Ok(h)) = timeout(
-            Duration::from_millis(1500),
-            tunnel::connect(&entry.addr, ns, id_pub),
-        )
-        .await
-        {
-            log::debug!("lan direct to {} ({})", &node_id[..8], entry.addr);
-            return Ok(adopt_tunnel(state, h, node_id, ns, *id_pub, "direct").await);
+    if let Some(a) = pick_addr(&entry.addrs, true) {
+        if is_lan_addr(&a) {
+            if let Ok(Ok(h)) = timeout(
+                Duration::from_millis(1500),
+                tunnel::connect(&a, ns, id_pub),
+            )
+            .await
+            {
+                log::debug!("lan direct to {} ({a})", &node_id[..8]);
+                return Ok(adopt_tunnel(state, h, node_id, ns, *id_pub, "direct").await);
+            }
         }
     }
     // P2P 打洞优先
@@ -991,19 +1156,24 @@ pub(crate) async fn tunnel_for(
             return Ok(adopt_tunnel(state, h, node_id, ns, *id_pub, "p2p").await);
         }
     }
-    // TCP 兜底 → 中继兜底 (直连加快速超时, 避免被防火墙黑洞拖死降级链)
-    let direct = timeout(Duration::from_secs(6), tunnel::connect(&entry.addr, ns, id_pub)).await;
-    match direct {
-        Ok(Ok(h)) => Ok(adopt_tunnel(state, h, node_id, ns, *id_pub, "direct").await),
-        Ok(Err(e)) => {
-            log::debug!("tcp direct {}: {e:#}", &node_id[..8.min(node_id.len())]);
-            relay_fallback(state, node_id, ns, id_pub).await
-        }
-        Err(_) => {
-            log::debug!("tcp direct {}: timeout", &node_id[..8.min(node_id.len())]);
-            relay_fallback(state, node_id, ns, id_pub).await
+    // TCP 兜底 → 中继兜底 (依次尝试各地址, 直连加快速超时避免黑洞拖死降级链)
+    let mut last_err: Option<anyhow::Error> = None;
+    for a in entry.addrs.iter() {
+        match timeout(Duration::from_secs(6), tunnel::connect(a, ns, id_pub)).await {
+            Ok(Ok(h)) => {
+                return Ok(adopt_tunnel(state, h, node_id, ns, *id_pub, "direct").await)
+            }
+            Ok(Err(e)) => {
+                log::debug!("tcp direct {a}: {e:#}");
+                last_err = Some(e);
+            }
+            Err(_) => log::debug!("tcp direct {a}: timeout"),
         }
     }
+    if let Some(e) = last_err {
+        log::debug!("tcp direct {} 全部失败: {e:#}", &node_id[..8.min(node_id.len())]);
+    }
+    relay_fallback(state, node_id, ns, id_pub).await
 }
 
 /// 中继兜底: 经 coordinator 建立嵌套隧道

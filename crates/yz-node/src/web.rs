@@ -59,7 +59,10 @@ struct StatusResp {
 struct NodeResp {
     node_id: String,
     name: String,
+    /// 首选地址 (同网段优先)
     addr: String,
+    /// 该节点上报的全部地址
+    addrs: Vec<String>,
     /// 确定性虚拟 IP (100.64.0.0/14)
     vip: String,
     p2p: bool,
@@ -173,7 +176,8 @@ async fn nodes(State(app): State<Arc<AppState>>) -> Json<Vec<NodeResp>> {
         .map(|n| NodeResp {
             node_id: n.node_id.clone(),
             name: n.name.clone(),
-            addr: n.addr.clone(),
+            addr: crate::node::pick_addr(&n.addrs, true).unwrap_or_default(),
+            addrs: n.addrs.clone(),
             vip: crate::mesh::vip_of(&n.node_id).to_string(),
             p2p: !n.udp_addr.is_empty(),
             exit_capable: n.caps & caps::EXIT != 0,
@@ -256,7 +260,10 @@ struct IngressReq {
     /// 入口节点 (名字/node_id前缀)
     node: String,
     port: u16,
+    /// 首选地址 (同网段优先)
     addr: String,
+    /// 该节点上报的全部地址
+    addrs: Vec<String>,
 }
 
 async fn list_ingress(State(app): State<Arc<AppState>>) -> Json<IngressListResp> {

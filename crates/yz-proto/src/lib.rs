@@ -357,8 +357,8 @@ fn decode_addr(b: &[u8]) -> Result<(Addr, usize), DecodeError> {
 pub struct NodeEntry {
     pub node_id: String,
     pub name: String,
-    /// 隧道监听地址 host:port (TCP)
-    pub addr: String,
+    /// 隧道监听地址列表 host:port (可能多个网卡; 连接方按同网段择优)
+    pub addrs: Vec<String>,
     /// 探测到的公网 UDP 映射地址 (空 = 不支持 P2P)
     pub udp_addr: String,
     /// 能力位: caps::EXIT 等
@@ -372,11 +372,11 @@ pub mod caps {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ControlMsg {
-    /// 节点上线注册, addr 为隧道监听地址, udp_addr 为探测到的公网 UDP 映射
+    /// 节点上线注册; addrs 为隧道监听地址(可多个), udp_addr 为探测到的公网 UDP 映射
     Hello {
         version: u16,
         name: String,
-        addr: String,
+        addrs: Vec<String>,
         udp_addr: String,
         caps: u8,
     },
@@ -415,14 +415,14 @@ pub fn encode_control(m: &ControlMsg) -> Vec<u8> {
         ControlMsg::Hello {
             version,
             name,
-            addr,
+            addrs,
             udp_addr,
             caps,
         } => {
             out.push(C_HELLO);
             out.extend_from_slice(&version.to_be_bytes());
             push_str(&mut out, name);
-            push_str(&mut out, addr);
+            push_list(&mut out, addrs);
             push_str(&mut out, udp_addr);
             out.push(*caps);
         }
@@ -432,7 +432,7 @@ pub fn encode_control(m: &ControlMsg) -> Vec<u8> {
             for n in nodes {
                 push_str(&mut out, &n.node_id);
                 push_str(&mut out, &n.name);
-                push_str(&mut out, &n.addr);
+                push_list(&mut out, &n.addrs);
                 push_str(&mut out, &n.udp_addr);
                 out.push(n.caps);
             }
@@ -486,7 +486,7 @@ pub fn decode_control(b: &[u8]) -> Result<ControlMsg, DecodeError> {
         C_HELLO => {
             let version = take_u16(&mut cur)?;
             let name = take_str(&mut cur)?;
-            let addr = take_str(&mut cur)?;
+            let addrs = take_list(&mut cur)?;
             let udp_addr = take_str(&mut cur)?;
             let caps = *cur.first().ok_or(DecodeError::Truncated)?;
             if cur.len() != 1 {
@@ -495,7 +495,7 @@ pub fn decode_control(b: &[u8]) -> Result<ControlMsg, DecodeError> {
             Ok(ControlMsg::Hello {
                 version,
                 name,
-                addr,
+                addrs,
                 udp_addr,
                 caps,
             })
@@ -506,14 +506,14 @@ pub fn decode_control(b: &[u8]) -> Result<ControlMsg, DecodeError> {
             for _ in 0..count {
                 let node_id = take_str(&mut cur)?;
                 let name = take_str(&mut cur)?;
-                let addr = take_str(&mut cur)?;
+                let addrs = take_list(&mut cur)?;
                 let udp_addr = take_str(&mut cur)?;
                 let caps = *cur.first().ok_or(DecodeError::Truncated)?;
                 cur = &cur[1..];
                 nodes.push(NodeEntry {
                     node_id,
                     name,
-                    addr,
+                    addrs,
                     udp_addr,
                     caps,
                 });
@@ -593,6 +593,22 @@ pub fn decode_control(b: &[u8]) -> Result<ControlMsg, DecodeError> {
 fn push_str(out: &mut Vec<u8>, s: &str) {
     out.push(s.len() as u8);
     out.extend_from_slice(s.as_bytes());
+}
+
+fn push_list(out: &mut Vec<u8>, items: &[String]) {
+    out.extend_from_slice(&(items.len() as u16).to_be_bytes());
+    for s in items {
+        push_str(out, s);
+    }
+}
+
+fn take_list(cur: &mut &[u8]) -> Result<Vec<String>, DecodeError> {
+    let count = take_u16(cur)? as usize;
+    let mut v = Vec::with_capacity(count);
+    for _ in 0..count {
+        v.push(take_str(cur)?);
+    }
+    Ok(v)
 }
 
 fn take_u16(cur: &mut &[u8]) -> Result<u16, DecodeError> {
@@ -681,7 +697,7 @@ mod tests {
             ControlMsg::Hello {
                 version: 1,
                 name: "nas-home".into(),
-                addr: "1.2.3.4:9100".into(),
+                addrs: vec!["1.2.3.4:9100".into(), "192.168.1.5:9100".into()],
                 udp_addr: "1.2.3.4:9100".into(),
                 caps: caps::EXIT,
             },
@@ -691,14 +707,14 @@ mod tests {
                     NodeEntry {
                         node_id: "0123456789abcdef".into(),
                         name: "vps-tokyo".into(),
-                        addr: "1.2.3.4:9000".into(),
+                        addrs: vec!["1.2.3.4:9000".into()],
                         udp_addr: "1.2.3.4:9000".into(),
                         caps: caps::EXIT,
                     },
                     NodeEntry {
                         node_id: "fedcba9876543210".into(),
                         name: "nas-home".into(),
-                        addr: "5.6.7.8:9000".into(),
+                        addrs: vec!["5.6.7.8:9000".into(), "10.0.0.9:9000".into()],
                         udp_addr: String::new(),
                         caps: 0,
                     },
