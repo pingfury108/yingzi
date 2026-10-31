@@ -87,6 +87,8 @@ pub struct NodeState {
     pub path: RwLock<HashMap<String, String>>,
     /// 当前对外 UDP 映射 (探测成功后更新)
     pub udp_addr: RwLock<String>,
+    /// P2P 连续失效计数: node_id → (次数, 降级截止时间)
+    pub p2p_fail: RwLock<HashMap<String, (u32, std::time::Instant)>>,
 }
 
 impl NodeState {
@@ -665,16 +667,45 @@ async fn handle_socks5(
         Exit::Via(node_id) => {
             let t = tunnel_for_retry(state, ns, id_pub, &node_id, 2, Duration::from_millis(1200))
                 .await?;
-            let (sid, mut rx) = t.open_stream(addr.clone()).await?;
-            match timeout(Duration::from_secs(10), rx.recv()).await? {
-                Some(Frame::SynAck { ok: true, .. }) => {}
-                Some(Frame::SynAck { ok: false, .. }) => {
+            let (sid, mut rx) = match t.open_stream(addr.clone()).await {
+                Ok(v) => v,
+                Err(e) => {
+                    // 开流失败通常意味着隧道已死: 淘汰缓存, 让下次请求重建
+                    log::debug!("open_stream 失败, 淘汰隧道 {}: {e:#}", &node_id[..8]);
+                    t.mark_closed();
+                    state.tunnels.lock().await.remove(&node_id);
+                    state.path.write().await.remove(&node_id);
                     socks5::reply_fail(&mut local).await;
-                    bail!("exit {node_id} connect {addr} failed");
+                    return Err(e);
                 }
-                _ => {
+            };
+            // SYN_ACK 短超时: 隧道若是僵尸(链路已死), 必须尽快失败并重建,
+            // 否则请求会卡满 10s (浏览器早已放弃)
+            let acked = match timeout(Duration::from_secs(3), rx.recv()).await {
+                Ok(Some(Frame::SynAck { ok, .. })) => Some(ok),
+                Ok(Some(_)) => Some(false),
+                Ok(None) => None,
+                Err(_) => None, // 超时 = 链路可能已死
+            };
+            match acked {
+                Some(true) => {}
+                other => {
+                    // 淘汰疑似僵尸隧道, 下次请求会重建
+                    t.mark_closed();
+                    state.tunnels.lock().await.remove(&node_id);
+                    state.path.write().await.remove(&node_id);
+                    state
+                        .push_event(
+                            "warn",
+                            format!(
+                                "隧道无响应, 已淘汰: {} ({})",
+                                &node_id[..8.min(node_id.len())],
+                                if other.is_some() { "拒绝" } else { "超时" }
+                            ),
+                        )
+                        .await;
                     socks5::reply_fail(&mut local).await;
-                    bail!("expect SYN_ACK");
+                    bail!("exit {node_id} 流建立失败 ({other:?}), 隧道已淘汰");
                 }
             }
             socks5::reply_ok(&mut local).await?;
@@ -1124,8 +1155,25 @@ pub(crate) async fn tunnel_for(
     {
         let tunnels = state.tunnels.lock().await;
         if let Some(t) = tunnels.get(node_id) {
-            if !t.is_closed() {
+            // 僵尸隧道判定: P2P UDP 会因 NAT 映射过期静默死亡, 必须按"无入向流量超时"淘汰
+            if !t.is_closed() && !t.is_dead(Duration::from_secs(45)).await {
                 return Ok(t.clone());
+            }
+            if t.is_closed() {
+                log::debug!("复用隧道已关闭, 重建: {}", &node_id[..8.min(node_id.len())]);
+            } else {
+                log::info!(
+                    "隧道无响应 {}s, 判定失效并重建: {}",
+                    t.idle_for().await.as_secs(),
+                    &node_id[..8.min(node_id.len())]
+                );
+                state
+                    .push_event(
+                        "warn",
+                        format!("隧道失效重建: {}", &node_id[..8.min(node_id.len())]),
+                    )
+                    .await;
+                t.mark_closed();
             }
         }
     }
@@ -1149,9 +1197,21 @@ pub(crate) async fn tunnel_for(
             }
         }
     }
+    // P2P 连续失效后短暂降级: 跳过打洞直接走 TCP (打洞在对称 NAT 下易反复失效)
+    let p2p_ok = {
+        let fails = state.p2p_fail.read().await;
+        match fails.get(node_id) {
+            Some((n, until)) if *n >= 1 && std::time::Instant::now() < *until => {
+                log::debug!("P2P 降级中 (连续失效 {} 次), 跳过打洞: {}", n, &node_id[..8.min(node_id.len())]);
+                false
+            }
+            _ => true,
+        }
+    };
     // P2P 打洞优先
-    if !entry.udp_addr.is_empty() {
+    if p2p_ok && !entry.udp_addr.is_empty() {
         if let Some(h) = try_punch(state, ns, id_pub, &entry).await {
+            state.p2p_fail.write().await.remove(node_id);
             state.push_event("info", format!("P2P 打洞成功: {}", &node_id[..8.min(node_id.len())])).await;
             return Ok(adopt_tunnel(state, h, node_id, ns, *id_pub, "p2p").await);
         }
@@ -1159,7 +1219,7 @@ pub(crate) async fn tunnel_for(
     // TCP 兜底 → 中继兜底 (依次尝试各地址, 直连加快速超时避免黑洞拖死降级链)
     let mut last_err: Option<anyhow::Error> = None;
     for a in entry.addrs.iter() {
-        match timeout(Duration::from_secs(6), tunnel::connect(a, ns, id_pub)).await {
+        match timeout(Duration::from_secs(4), tunnel::connect(a, ns, id_pub)).await {
             Ok(Ok(h)) => {
                 return Ok(adopt_tunnel(state, h, node_id, ns, *id_pub, "direct").await)
             }
@@ -1211,7 +1271,7 @@ fn spawn_ctrl_handler(
     state: Option<Arc<NodeState>>,
     ingress: Option<(ExitAcl, (u16, u16))>,
 ) {
-    // 每 10s 发一次 PING, 兼作存活探测 (对端不回则 RTT 不更新)
+    // 每 10s 发 PING: 兼作存活探测 + 维持 NAT 映射 (空闲也会发, 防止对称 NAT 映射过期)
     if let Some(st) = &state {
         let t2 = t.clone();
         let pid = peer_id.clone();
@@ -1221,6 +1281,37 @@ fn spawn_ctrl_handler(
                 tokio::time::sleep(Duration::from_secs(10)).await;
                 if t2.is_closed() {
                     st2.rtt.write().await.remove(&pid);
+                    break;
+                }
+                // 判定僵尸: 连续 45s 无任何入向数据 (PING 发出但无 PONG/数据回来)
+                if t2.is_dead(Duration::from_secs(45)).await {
+                    log::warn!("隧道无入向流量 45s, 判定失效: {}", &pid[..8.min(pid.len())]);
+                    st2.push_event("warn", format!("隧道失效: {}", &pid[..8.min(pid.len())]))
+                        .await;
+                    st2.rtt.write().await.remove(&pid);
+                    // 若是 P2P 路径, 累加失效计数并降级 5 分钟
+                    let was_p2p = st2
+                        .path
+                        .read()
+                        .await
+                        .get(&pid)
+                        .map(|p| p == "p2p")
+                        .unwrap_or(false);
+                    {
+                        let mut fails = st2.p2p_fail.write().await;
+                        let e = fails.entry(pid.clone()).or_insert((0, std::time::Instant::now()));
+                        e.0 += 1;
+                        // 首次失效即降级 2 分钟, 避免反复在打洞上耗时间
+                        e.1 = std::time::Instant::now() + Duration::from_secs(120);
+                        log::info!(
+                            "隧道失效({}) 计数 {} → 降级 2 分钟: {}",
+                            if was_p2p { "p2p" } else { "其它" },
+                            e.0,
+                            &pid[..8.min(pid.len())]
+                        );
+                    }
+                    st2.path.write().await.remove(&pid);
+                    t2.mark_closed();
                     break;
                 }
                 if t2.write_frame(&Frame::Ping { ts: now_ms() }).await.is_err() {

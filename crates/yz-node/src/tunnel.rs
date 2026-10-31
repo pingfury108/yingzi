@@ -5,6 +5,7 @@
 use anyhow::{bail, Context, Result};
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+use std::time::Instant;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf};
@@ -69,6 +70,8 @@ pub struct Tunnel {
     mesh_tx: mpsc::Sender<Vec<u8>>,
     closed_tx: watch::Sender<bool>,
     next_sid: AtomicU32,
+    /// 最后收到对端任何数据的时间 (链路健康判定)
+    last_rx: Mutex<Instant>,
 }
 
 impl Tunnel {
@@ -101,6 +104,7 @@ impl Tunnel {
             mesh_tx,
             closed_tx,
             next_sid: AtomicU32::new(sid_base),
+            last_rx: Mutex::new(Instant::now()),
         });
         match &t.link {
             Link::Tcp { sess, .. } => {
@@ -116,7 +120,11 @@ impl Tunnel {
             Link::Tcp { sess, w } => {
                 let pkt = { sess.lock().await.seal(&yz_proto::encode(f))? };
                 self.bytes_tx.fetch_add(pkt.len() as u64, Ordering::Relaxed);
-                w.lock().await.write_all(&pkt).await?;
+                if let Err(e) = w.lock().await.write_all(&pkt).await {
+                    // 写失败 = 链路已断 (对端重启/网络中断), 立即标记关闭以便重建
+                    self.mark_closed();
+                    return Err(e.into());
+                }
                 Ok(())
             }
             Link::Udp(r) => {
@@ -253,6 +261,22 @@ impl Tunnel {
 
     pub fn is_closed(&self) -> bool {
         *self.closed_tx.borrow()
+    }
+
+    /// 距上次收到对端数据的时间
+    pub async fn idle_for(&self) -> Duration {
+        self.last_rx.lock().await.elapsed()
+    }
+
+    /// 链路是否已失效 (僵尸): 长时间没有任何入向数据
+    /// P2P UDP 链路会因对称 NAT 映射过期而"静默死亡", 必须主动判定
+    pub async fn is_dead(&self, timeout: Duration) -> bool {
+        self.is_closed() || self.idle_for().await > timeout
+    }
+
+    /// 主动关闭 (供健康检查判定死亡后调用, 触发重建)
+    pub fn mark_closed(&self) {
+        let _ = self.closed_tx.send(true);
     }
 
     pub fn watch_closed(&self) -> watch::Receiver<bool> {
@@ -499,6 +523,7 @@ pub fn from_rudp_with_base(rudp: Rudp, peer_info: PeerInfo, sid_base: u32) -> Tu
 
 /// 分发一帧; 返回 false 终止 reader
 async fn dispatch(t: &Arc<Tunnel>, f: Frame) -> bool {
+    *t.last_rx.lock().await = Instant::now();
     match f {
         Frame::Control { .. } | Frame::Ping { .. } | Frame::Pong { .. } => {
             t.ctrl_tx.send(f).await.is_ok()
