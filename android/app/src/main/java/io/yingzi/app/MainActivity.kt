@@ -36,6 +36,10 @@ class MainActivity : AppCompatActivity() {
         nodes = findViewById(R.id.nodes)
         logs = findViewById(R.id.logs)
 
+        findViewById<Button>(R.id.settings).setOnClickListener {
+            startActivity(Intent(this, SettingsActivity::class.java))
+        }
+
         toggle.setOnClickListener {
             if (YzCore.nativeIsRunning()) stop() else start()
         }

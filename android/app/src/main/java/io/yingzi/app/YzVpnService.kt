@@ -2,6 +2,11 @@ package io.yingzi.app
 
 import android.app.*
 import android.content.Intent
+import android.content.BroadcastReceiver
+import android.content.Context
+import android.content.IntentFilter
+import android.net.ConnectivityManager
+import android.net.Network
 import android.net.VpnService
 import android.os.Build
 import android.os.ParcelFileDescriptor
@@ -24,6 +29,8 @@ class YzVpnService : VpnService() {
     }
 
     private var tun: ParcelFileDescriptor? = null
+    private var netCallback: ConnectivityManager.NetworkCallback? = null
+    private var lastRestart = 0L
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         when (intent?.action) {
@@ -82,6 +89,7 @@ class YzVpnService : VpnService() {
             put("mtu", 1400)
         }
 
+        registerNetworkCallback()
         val err = YzCore.nativeStart(config.toString(), this)
         if (err.isNotEmpty()) {
             Log.e(TAG, "nativeStart 失败: $err")
@@ -91,7 +99,54 @@ class YzVpnService : VpnService() {
         updateNotification("已连接 · 出口 ${cfg.defaultExit}")
     }
 
+    /** 网络切换（WiFi↔4G）：重建核心，避免 UDP 端点失效后长时间不可用 */
+    private fun registerNetworkCallback() {
+        val cm = getSystemService(ConnectivityManager::class.java)
+        val cb = object : ConnectivityManager.NetworkCallback() {
+            override fun onAvailable(network: Network) {
+                val now = System.currentTimeMillis()
+                // 防抖: 10 秒内只重建一次
+                if (now - lastRestart < 10_000) return
+                lastRestart = now
+                Log.i(TAG, "网络变化，重启核心")
+                restartCore()
+            }
+        }
+        netCallback = cb
+        try {
+            cm.registerDefaultNetworkCallback(cb)
+        } catch (e: Exception) {
+            Log.w(TAG, "注册网络回调失败: $e")
+        }
+    }
+
+    private fun restartCore() {
+        val pfd = tun ?: return
+        YzCore.nativeStop()
+        val cfg = NodeConfig.load(this)
+        val config = JSONObject().apply {
+            put("network_secret", cfg.networkSecret)
+            put("identity_file", File(filesDir, "node.key").absolutePath)
+            put("coordinator", cfg.coordinator)
+            put("name", cfg.name)
+            put("default_exit", cfg.defaultExit)
+            put("remote_dns", cfg.remoteDns)
+            put("direct_dns", cfg.directDns)
+            put("geoip", NodeConfig.geoipPath(this@YzVpnService))
+            put("geosite", NodeConfig.geositePath(this@YzVpnService))
+            put("rules", org.json.JSONArray(NodeConfig.rules()))
+            put("tun_fd", pfd.fd)
+            put("mtu", 1400)
+        }
+        val err = YzCore.nativeStart(config.toString(), this)
+        if (err.isNotEmpty()) Log.e(TAG, "重启核心失败: $err")
+    }
+
     private fun stopVpn() {
+        netCallback?.let {
+            try { getSystemService(ConnectivityManager::class.java).unregisterNetworkCallback(it) } catch (_: Exception) {}
+        }
+        netCallback = null
         YzCore.nativeStop()
         try { tun?.close() } catch (_: Exception) {}
         tun = null

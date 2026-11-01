@@ -22,14 +22,41 @@ data class NodeConfig(
 
         fun load(ctx: Context): NodeConfig {
             val prefs = ctx.getSharedPreferences("yz", Context.MODE_PRIVATE)
+            // NS 优先从 Keystore 加密存储读取
+            val secret = prefs.getString("secret_enc", null)
+                ?.let { SecureStore.decrypt(ctx, it) }
+                ?: prefs.getString("secret", null)
+                ?: DEFAULT_SECRET
             return NodeConfig(
-                networkSecret = prefs.getString("secret", DEFAULT_SECRET)!!,
+                networkSecret = secret,
                 coordinator = prefs.getString("coordinator", "47.109.61.89:9000")!!,
                 name = prefs.getString("name", "android")!!,
                 defaultExit = prefs.getString("exit", "overseas-hk")!!,
                 remoteDns = prefs.getString("remoteDns", "exit://overseas-hk/1.1.1.1:53")!!,
                 directDns = prefs.getString("directDns", "udp://223.5.5.5")!!,
             )
+        }
+
+        /** 保存配置（NS 走 Keystore 加密） */
+        fun save(
+            ctx: Context,
+            secret: String,
+            coordinator: String,
+            name: String,
+            exit: String,
+            remoteDns: String,
+            directDns: String,
+        ) {
+            ctx.getSharedPreferences("yz", Context.MODE_PRIVATE).edit().apply {
+                putString("secret_enc", SecureStore.encrypt(ctx, secret))
+                remove("secret") // 清掉明文
+                putString("coordinator", coordinator)
+                putString("name", name)
+                putString("exit", exit)
+                putString("remoteDns", remoteDns)
+                putString("directDns", directDns)
+                apply()
+            }
         }
 
         /** 规则：广告拦截 + 国内直连 + 其余走默认出口 */
