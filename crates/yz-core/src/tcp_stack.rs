@@ -1,10 +1,11 @@
 //! tcp_stack: TCP 用户态终结（基于 netstack-smoltcp，MIT）
 //!
-//! ⚠️ 状态: 实验性（P4b 未完成）
-//! 已验证: netstack-smoltcp 能接受任意目的地址的 TCP 连接（握手成功），
-//!         目标地址/客户端地址语义正确，决策与上游直连均能触发
-//! 未解决: 数据面（握手后客户端数据未贯通），客户端会反复重连
-//!         因此暂不接入 yz-node / Android
+//! 状态: 已验证可用（P4b 完成）
+//! 验证（pcw netns 真实网络）: HTTP 200 / HTTPS 200 (TLS 双向) / 5 并发全 200
+//!
+//! ⚠️ 部署注意: 栈自身的上游 socket **必须绕过 TUN**，否则会自环：
+//! - Android: `VpnService.protect(fd)`（通过 SocketProtect trait 注入）
+//! - Linux 桌面 TUN: 用 SO_MARK + ip rule，或给上游加指向物理网卡的路由
 //!
 //! 设计（方案 B）：成熟实现负责 smoltcp 的连接生命周期，我们只做
 //! "决策 + 上游适配"：
@@ -199,7 +200,7 @@ async fn handle_conn(
         }
         Action::Direct => {
             stat_direct.fetch_add(1, Ordering::Relaxed);
-            log::debug!("TCP {dst} -> direct ({})", decision.reason);
+            log::debug!("TCP {dst} <- {src} -> direct ({})", decision.reason);
             let up = connect_direct(dst, cfg.protect.as_ref())?;
             pipe(client, up).await
         }
@@ -248,8 +249,14 @@ where
         let mut buf = vec![0u8; 16 * 1024];
         loop {
             match ar.read(&mut buf).await {
-                Ok(0) => break,
+                Ok(0) => {
+                    log::debug!("pipe: 客户端 EOF");
+                    break;
+                }
                 Ok(n) => {
+                    if ub.load(Ordering::Relaxed) == 0 {
+                        log::debug!("pipe: 客户端首字节 {n}B");
+                    }
                     ub.fetch_add(n as u64, Ordering::Relaxed);
                     if bw.write_all(&buf[..n]).await.is_err() {
                         break;
@@ -264,8 +271,14 @@ where
         let mut buf = vec![0u8; 16 * 1024];
         loop {
             match br.read(&mut buf).await {
-                Ok(0) => break,
+                Ok(0) => {
+                    log::debug!("pipe: 上游 EOF");
+                    break;
+                }
                 Ok(n) => {
+                    if db.load(Ordering::Relaxed) == 0 {
+                        log::debug!("pipe: 上游首字节 {n}B");
+                    }
                     db.fetch_add(n as u64, Ordering::Relaxed);
                     if aw.write_all(&buf[..n]).await.is_err() {
                         break;
