@@ -33,6 +33,9 @@ class SettingsActivity : AppCompatActivity() {
         findViewById<android.view.View>(R.id.appsRow).setOnClickListener {
             startActivity(Intent(this, AppsActivity::class.java))
         }
+        findViewById<android.view.View>(R.id.diagRow).setOnClickListener {
+            startActivity(Intent(this, DiagnosticsActivity::class.java))
+        }
         val geoSub = findViewById<android.widget.TextView>(R.id.geoSub)
         val geoAction = findViewById<android.widget.TextView>(R.id.geoAction)
         geoSub.text = GeoData.info(this)

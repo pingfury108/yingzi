@@ -580,6 +580,28 @@ impl DnsService {
             .collect())
     }
 
+    /// 诊断用：绕过规则/fake-IP，直接问某一侧上游
+    pub async fn probe_raw(&self, name: &str, remote: bool) -> Result<Vec<IpAddr>> {
+        let ups = if remote { &self.cfg.remote } else { &self.cfg.direct };
+        let query = Message::query(name, 1);
+        for up in ups {
+            if let Ok(resp) =
+                resolve_upstream(up, &query, self.protect.as_ref(), self.exit.as_ref()).await
+            {
+                if let Ok(parsed) = Message::parse(&resp) {
+                    let ips: Vec<IpAddr> = parsed
+                        .answers
+                        .iter()
+                        .map(|(_, _, _, ip)| *ip)
+                        .filter(|ip| !ip.is_unspecified())
+                        .collect();
+                    return Ok(ips);
+                }
+            }
+        }
+        bail!("上游无应答")
+    }
+
     /// 注入"经出口节点解析"的通道
     pub fn with_exit_query(mut self, exit: Arc<dyn ExitDnsQuery>) -> Self {
         self.exit = Some(exit);

@@ -11,4 +11,5 @@ object YzCore {
     external fun nativeSetRules(json: String): Boolean
     external fun nativeIsRunning(): Boolean
     external fun nativePushEvent(level: String, msg: String)
+    external fun nativeDiagnose(): String
 }

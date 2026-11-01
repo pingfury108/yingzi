@@ -236,6 +236,9 @@ struct NodeRuntime {
     started: std::time::Instant,
     exit: String,
     self_id: String,
+    protect: Option<Arc<dyn SocketProtect>>,
+    ns: yz_crypto::NetworkSecret,
+    id_pub: [u8; 32],
     stop_tx: tokio::sync::watch::Sender<bool>,
     dns: Arc<DnsService>,
     tcp: Arc<TcpStack>,
@@ -524,7 +527,7 @@ fn start_async(cfg: StartConfig, protect: Option<Arc<dyn SocketProtect>>) -> Res
             fakeip: fakeip.clone(),
             dns: Some(dns.clone()),
             mtu: cfg.mtu,
-            protect,
+            protect: protect.clone(),
             exit: Some(exit_tcp),
             max_conns: 400,
         },
@@ -572,11 +575,146 @@ fn start_async(cfg: StartConfig, protect: Option<Arc<dyn SocketProtect>>) -> Res
         started: std::time::Instant::now(),
         exit: cfg.default_exit.clone().unwrap_or_default(),
         self_id: yz_crypto::node_id(&id_pub),
+        protect: protect.clone(),
+        ns,
+        id_pub,
         stop_tx,
         dns,
         tcp,
         udp,
     })
+}
+
+// ---------- 诊断 ----------
+
+async fn diagnose(
+    state: Arc<CoreState>,
+    dns: Arc<DnsService>,
+    protect: Option<Arc<dyn SocketProtect>>,
+    ns: yz_crypto::NetworkSecret,
+    id_pub: [u8; 32],
+    self_id: String,
+) -> serde_json::Value {
+    // 1) 各节点 TCP 连通性 / 延迟（连隧道端口即可测通路）
+    let nodes: Vec<(String, String, Vec<String>)> = {
+        let dir = state.dir.read().await;
+        dir.values()
+            .filter(|n| n.node_id != self_id)
+            .map(|n| (n.name.clone(), n.node_id.clone(), n.addrs.clone()))
+            .collect()
+    };
+    // 并发建隧道：耗时即"经该节点出网的建连延迟"
+    let mut tasks = Vec::new();
+    for (name, node_id, addrs) in nodes {
+        let state2 = state.clone();
+        let ns2 = ns.clone();
+        tasks.push(async move {
+            let started = std::time::Instant::now();
+            let res = tokio::time::timeout(
+                std::time::Duration::from_secs(10),
+                yz_core::peer::tunnel_for(&state2, &ns2, &id_pub, &node_id),
+            )
+            .await;
+            let (ms, err) = match res {
+                Ok(Ok(_)) => (started.elapsed().as_millis(), None),
+                Ok(Err(e)) => (0, Some(format!("{e:#}"))),
+                Err(_) => (0, Some("超时".to_string())),
+            };
+            serde_json::json!({
+                "name": name,
+                "addr": addrs.first().cloned().unwrap_or_default(),
+                "rtt_ms": ms,
+                "error": err,
+            })
+        });
+    }
+    let mut node_results: Vec<serde_json::Value> = futures::future::join_all(tasks).await;
+    // 隧道建好后等一下心跳，取更准的 RTT
+    tokio::time::sleep(std::time::Duration::from_millis(600)).await;
+    {
+        let rtt = state.rtt.read().await.clone();
+        let dir = state.dir.read().await;
+        for item in node_results.iter_mut() {
+            let name = item["name"].as_str().unwrap_or_default().to_string();
+            if let Some(n) = dir.values().find(|n| n.name == name) {
+                if let Some(v) = rtt.get(&n.node_id) {
+                    if *v > 0 {
+                        item["rtt_ms"] = serde_json::json!(*v as u128);
+                    }
+                }
+            }
+        }
+    }
+
+    // 2) DNS 检测：直连 vs 出口，看是否被污染；再查随机域名看是否被劫持
+    let probe_domain = "www.google.com";
+    let direct = dns_probe(&dns, probe_domain, false).await;
+    let remote = dns_probe(&dns, probe_domain, true).await;
+    let rand_domain = format!(
+        "yz{}.example.com",
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis())
+            .unwrap_or(0)
+    );
+    let hijack = dns_probe(&dns, &rand_domain, false).await;
+
+    let polluted = match (&direct, &remote) {
+        (Some(d), Some(r)) => {
+            // 直连结果与出口结果完全不相交 → 很可能被污染
+            !d.0.is_empty() && !r.0.is_empty() && d.0.iter().all(|ip| !r.0.contains(ip))
+        }
+        _ => false,
+    };
+    let hijacked = hijack.map(|h| !h.0.is_empty()).unwrap_or(false);
+
+    serde_json::json!({
+        "nodes": node_results,
+        "dns": {
+            "domain": probe_domain,
+            "direct": direct.map(|d| serde_json::json!({"ips": d.0, "ms": d.1})),
+            "exit": remote.map(|d| serde_json::json!({"ips": d.0, "ms": d.1})),
+            "polluted": polluted,
+            "hijacked": hijacked,
+        },
+    })
+}
+
+/// 测 TCP 连接耗时（毫秒）；失败返回错误描述
+fn tcp_probe(addr: &str, protect: Option<&Arc<dyn SocketProtect>>, timeout_ms: u64) -> Result<u128, String> {
+    use std::net::ToSocketAddrs;
+    let sock_addr = addr
+        .to_socket_addrs()
+        .map_err(|e| format!("解析失败: {e}"))?
+        .next()
+        .ok_or_else(|| "无法解析地址".to_string())?;
+    let start = std::time::Instant::now();
+    let s = std::net::TcpStream::connect_timeout(
+        &sock_addr,
+        std::time::Duration::from_millis(timeout_ms),
+    )
+    .map_err(|e| format!("{e}"))?;
+    if let Some(p) = protect {
+        p.protect_tcp(&s);
+    }
+    let _ = s.set_nodelay(true);
+    Ok(start.elapsed().as_millis())
+}
+
+/// 直接问某一侧上游（绕过规则与 fake-IP），返回 (IP 列表, 耗时 ms)
+async fn dns_probe(
+    dns: &Arc<DnsService>,
+    domain: &str,
+    want_exit: bool,
+) -> Option<(Vec<String>, u128)> {
+    let start = std::time::Instant::now();
+    let ips = dns.probe_raw(domain, want_exit).await.ok()?;
+    let list: Vec<String> = ips
+        .iter()
+        .filter(|ip| matches!(ip, std::net::IpAddr::V4(_)))
+        .map(|ip| ip.to_string())
+        .collect();
+    Some((list, start.elapsed().as_millis()))
 }
 
 // ---------- JNI ----------
@@ -723,6 +861,33 @@ pub extern "system" fn Java_io_yingzi_app_YzCore_nativeSetRules(
 }
 
 /// nativePushEvent(level, msg) —— 由 Kotlin 侧写入事件（启停/网络切换/规则更新）
+/// nativeDiagnose() —— 一键诊断：各节点 TCP 连通/延迟 + DNS 污染与劫持检测
+/// 阻塞调用（几秒），Kotlin 侧需放后台线程。
+#[no_mangle]
+pub extern "system" fn Java_io_yingzi_app_YzCore_nativeDiagnose(
+    mut env: JNIEnv,
+    _class: JClass,
+) -> jstring {
+    let out = {
+        let guard = NODE.lock().unwrap();
+        match guard.as_ref() {
+            Some(node) => {
+                let state = node.state.clone();
+                let dns = node.dns.clone();
+                let protect = node.protect.clone();
+                let self_id = node.self_id.clone();
+                let ns = node.ns.clone();
+                let id_pub = node.id_pub;
+                rt().block_on(async move {
+                    diagnose(state, dns, protect, ns, id_pub, self_id).await
+                })
+            }
+            None => serde_json::json!({"error": "核心未运行"}),
+        }
+    };
+    to_jstring(&mut env, &serde_json::to_string(&out).unwrap_or_default())
+}
+
 #[no_mangle]
 pub extern "system" fn Java_io_yingzi_app_YzCore_nativePushEvent(
     mut env: JNIEnv,

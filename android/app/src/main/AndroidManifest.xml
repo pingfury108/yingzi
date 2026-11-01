@@ -29,6 +29,10 @@
         </activity>
 
         <activity
+            android:name=".DiagnosticsActivity"
+            android:exported="false" />
+
+        <activity
             android:name=".ShareActivity"
             android:exported="false" />
 
