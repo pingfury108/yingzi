@@ -1450,6 +1450,7 @@ name = "yz-core"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "env_logger",
  "log",
  "rustls",
  "rustls-pemfile",

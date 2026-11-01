@@ -103,3 +103,57 @@ impl UdpRelay for TunnelUdpRelay {
         })
     }
 }
+
+// ---------- 出口 TCP ----------
+
+use crate::tcp_stack::{ExitTcp, UpstreamIo};
+
+pub struct TunnelExitTcp {
+    pub state: Arc<CoreState>,
+    pub ns: NetworkSecret,
+    pub id_pub: [u8; 32],
+}
+
+impl TunnelExitTcp {
+    pub fn new(state: Arc<CoreState>, ns: NetworkSecret, id_pub: [u8; 32]) -> Self {
+        Self {
+            state,
+            ns,
+            id_pub,
+        }
+    }
+}
+
+impl ExitTcp for TunnelExitTcp {
+    fn open<'a>(
+        &'a self,
+        node: &'a str,
+        dst: SocketAddr,
+    ) -> std::pin::Pin<
+        Box<dyn std::future::Future<Output = Result<Box<dyn UpstreamIo>>> + Send + 'a>,
+    > {
+        Box::pin(async move {
+            let node_id = {
+                let dir = self.state.dir.read().await;
+                dir.values()
+                    .find(|n| n.name == node || n.node_id == node || n.node_id.starts_with(node))
+                    .map(|n| n.node_id.clone())
+                    .with_context(|| format!("出口节点不在目录中: {node}"))?
+            };
+            let t = tunnel_for(&self.state, &self.ns, &self.id_pub, &node_id).await?;
+            let target = match dst.ip() {
+                std::net::IpAddr::V4(v4) => Addr::V4(v4.octets(), dst.port()),
+                std::net::IpAddr::V6(v6) => Addr::V6(v6.octets(), dst.port()),
+            };
+            let (sid, mut rx) = t.open_stream(target).await?;
+            match timeout(Duration::from_secs(8), rx.recv()).await? {
+                Some(Frame::SynAck { ok: true, .. }) => {}
+                _ => {
+                    t.close_stream(sid).await;
+                    bail!("出口 {node} TCP 流未就绪");
+                }
+            }
+            Ok(Box::new(crate::tunnel::StreamIo::new(t, sid, rx)) as Box<dyn UpstreamIo>)
+        })
+    }
+}

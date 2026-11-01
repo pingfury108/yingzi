@@ -36,6 +36,7 @@ impl PacketIo for TunIo {
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
+    env_logger::init();
     let args: Vec<String> = std::env::args().collect();
     let tun_name = args.get(1).cloned().unwrap_or("yzs0".into());
     let geoip_path = args.get(2).cloned().unwrap_or("/tmp/geodata/geoip.dat".into());
@@ -79,9 +80,10 @@ async fn main() -> anyhow::Result<()> {
     };
 
     // 需要出口通道时才连协调器
-    let mut state = Arc::new(yz_core::state::CoreState::default());
+    let state = Arc::new(yz_core::state::CoreState::default());
     let mut dns = DnsService::new(rs.clone(), dns_cfg, None);
     let mut exit_udp: Option<Arc<dyn yz_core::stack::ExitUdp>> = None;
+    let mut exit_tcp: Option<Arc<dyn yz_core::tcp_stack::ExitTcp>> = None;
 
     if exit_node.is_some() {
         let secret = std::env::var("YZ_NETWORK_SECRET")?;
@@ -128,6 +130,11 @@ async fn main() -> anyhow::Result<()> {
         )));
         exit_udp = Some(Arc::new(yz_core::exit_udp::TunnelExitUdp::new(
             state.clone(),
+            ns.clone(),
+            id_pub,
+        )));
+        exit_tcp = Some(Arc::new(yz_core::exit_udp::TunnelExitTcp::new(
+            state.clone(),
             ns,
             id_pub,
         )));
@@ -136,7 +143,7 @@ async fn main() -> anyhow::Result<()> {
 
     let dns = Arc::new(dns);
     let stack = Arc::new(Stack::new(
-        rs,
+        rs.clone(),
         state.clone(),
         StackConfig {
             dns: Some(dns.clone()),
@@ -147,10 +154,38 @@ async fn main() -> anyhow::Result<()> {
 
     let io: Arc<dyn PacketIo> = Arc::new(TunIo { dev });
     println!("栈启动");
+
+    // TCP 用户态栈：由主循环把 TCP 包分发进来
+    let (tcp_tx, tcp_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(256);
+    let tcp = Arc::new(yz_core::tcp_stack::TcpStack::new(
+        rs.clone(),
+        yz_core::tcp_stack::TcpStackConfig {
+            mtu: 1400,
+            local_ip: std::net::Ipv4Addr::new(10, 99, 0, 1),
+            protect: None,
+            exit: exit_tcp,
+            idle_timeout: std::time::Duration::from_secs(120),
+        },
+    ));
+    {
+        let tcp = tcp.clone();
+        let io2 = io.clone();
+        let de = exit_node.clone();
+        tokio::spawn(async move {
+            if let Err(e) = tcp.run(io2, tcp_rx, de).await {
+                eprintln!("TCP 栈退出: {e:#}");
+            }
+        });
+    }
+    // 单读循环分发：UDP → UDP 栈；TCP → tcp 栈
     let mut buf = vec![0u8; 2048];
     loop {
         let n = io.recv(&mut buf).await?;
         let pkt = buf[..n].to_vec();
+        if yz_core::stack::parse_udp(&pkt).is_none() {
+            let _ = tcp_tx.try_send(pkt);
+            continue;
+        }
         let stack = stack.clone();
         let io2 = io.clone();
         tokio::spawn(async move {

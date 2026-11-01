@@ -20,3 +20,4 @@ smoltcp = { version = "0.11", default-features = false, features = ["std", "medi
 
 [dev-dependencies]
 tun = { version = "0.7", features = ["async"] }
+env_logger = "0.11"

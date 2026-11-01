@@ -12,6 +12,7 @@ pub mod mesh;
 pub mod peer;
 pub mod policy;
 pub mod stack;
+pub mod tcp_stack;
 pub mod state;
 pub mod tunnel;
 pub mod util;
