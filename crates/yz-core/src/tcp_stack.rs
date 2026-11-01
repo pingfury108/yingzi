@@ -115,16 +115,6 @@ impl Device for QueueDevice {
     }
 }
 
-/// 轮询 smoltcp（写出的包落在 dev.tx 队列）
-fn poll_iface(
-    iface: &mut Interface,
-    dev: &mut QueueDevice,
-    sockets: &mut SocketSet<'_>,
-    now: SmolInstant,
-) {
-    iface.poll(now, dev, sockets);
-}
-
 // ---------- 连接 ----------
 
 struct Conn {
