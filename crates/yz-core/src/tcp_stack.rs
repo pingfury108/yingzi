@@ -183,9 +183,8 @@ impl TcpStack {
             .ok();
         let mut sockets = SocketSet::new(vec![]);
         let mut conns: HashMap<u32, Conn> = HashMap::new();
-        let mut listeners: HashMap<u16, SocketHandle> = HashMap::new();
-        // 已处理过的 SYN 4 元组（防重传风暴）
-        let mut seen_syn: HashMap<FourTuple, std::time::Instant> = HashMap::new();
+        // 4 元组 → 已创建的 socket（每连接一个，避免端口级监听遮蔽已连接 socket）
+        let mut pending: HashMap<FourTuple, SocketHandle> = HashMap::new();
         let mut next_id: u32 = 1;
         let mut ticker = tokio::time::interval(Duration::from_millis(5));
 
@@ -193,24 +192,18 @@ impl TcpStack {
             tokio::select! {
                 pkt = pkt_rx.recv() => {
                     let Some(pkt) = pkt else { return Ok(()) };
-                    // TCP SYN 到新端口 → 建监听 socket（必须在 poll 之前）
+                    // 每个新 4 元组的 SYN 建一个 socket；重传的同 4 元组不再新建
                     if let Some((tuple, is_syn)) = parse_tcp_meta(&pkt) {
-                        let dst_port = tuple.dst_port;
-                        if is_syn {
-                            seen_syn.retain(|_, t| t.elapsed() < Duration::from_secs(30));
-                        }
-                        if is_syn
-                            && !seen_syn.contains_key(&tuple)
-                            && !listeners.contains_key(&dst_port)
-                        {
-                            seen_syn.insert(tuple, std::time::Instant::now());
-                            let rx = tcp::SocketBuffer::new(vec![0u8; 64 * 1024]);
-                            let tx = tcp::SocketBuffer::new(vec![0u8; 64 * 1024]);
-                            let mut sock = tcp::Socket::new(rx, tx);
-                            sock.listen(dst_port).ok();
-                            let h = sockets.add(sock);
-                            listeners.insert(dst_port, h);
-                            log::debug!("新监听 socket: 端口 {dst_port} (dst {})", tuple.dst_ip);
+                        if is_syn && !pending.contains_key(&tuple) {
+                            let h = new_listener(&mut sockets, tuple.dst_port);
+                            pending.insert(tuple, h);
+                            log::debug!(
+                                "新连接 socket: {}:{} -> {}:{}",
+                                tuple.src_ip,
+                                tuple.src_port,
+                                tuple.dst_ip,
+                                tuple.dst_port
+                            );
                         }
                     }
                     dev.rx.push_back(pkt);
@@ -229,14 +222,18 @@ impl TcpStack {
                 unsafe {
                     if now_ms - LAST > 1000 {
                         LAST = now_ms;
-                        for (&port, &h) in listeners.iter() {
-                            let sk = sockets.get::<tcp::Socket>(h);
+                        log::debug!("pending={} txq={}", pending.len(),
+                            dev.tx.lock().map(|q| q.len()).unwrap_or(0));
+                        log::debug!("conns={}", conns.len());
+                        for (&id, c) in conns.iter() {
+                            let sk = sockets.get::<tcp::Socket>(c.handle);
                             log::debug!(
-                                "socket 端口 {port}: state={:?} active={} listen={} txq={}",
+                                "conn {id} {}: {:?} can_recv={} can_send={} pending={}",
+                                c.dst,
                                 sk.state(),
-                                sk.is_active(),
-                                sk.is_listening(),
-                                dev.tx.lock().map(|q| q.len()).unwrap_or(0)
+                                sk.can_recv(),
+                                sk.can_send(),
+                                c.pending.len()
                             );
                         }
                     }
@@ -246,15 +243,16 @@ impl TcpStack {
 
             // 1) 已建立但还没接上游的 socket → 建立连接
             let mut new_conns: Vec<(u32, Conn)> = Vec::new();
-            let accepted: Vec<(u16, SocketHandle)> = listeners
+            let accepted: Vec<(FourTuple, SocketHandle)> = pending
                 .iter()
-                .filter_map(|(&p, &h)| {
+                .filter_map(|(&t, &h)| {
                     let s = sockets.get::<tcp::Socket>(h);
-                    (s.is_active() && !s.is_listening()).then_some((p, h))
+                    (s.is_active() && !s.is_listening()).then_some((t, h))
                 })
                 .collect();
-            let mut drop_listeners: Vec<u16> = Vec::new();
-            for (port, h) in accepted {
+            let mut drop_pending: Vec<FourTuple> = Vec::new();
+            for (tuple, h) in accepted {
+                let port = tuple.dst_port;
                 let sock = sockets.get_mut::<tcp::Socket>(h);
                 if sock.is_active() && !sock.is_listening() {
                     // 已被 accept。透明代理下 socket 的 local_endpoint 才是"原始目标地址"
@@ -268,6 +266,13 @@ impl TcpStack {
                     let id = next_id;
                     next_id += 1;
 
+                    // 连接数上限保护（防 FD 耗尽）
+                    if conns.len() >= 400 {
+                        log::warn!("连接数达到上限, 拒绝 {}", dst);
+                        sock.abort();
+                        drop_pending.push(tuple);
+                        continue;
+                    }
                     let decision = self.rules.decide_ip(dst_ip);
                     let (to_up_tx, to_up_rx) = mpsc::channel::<Vec<u8>>(64);
                     let (from_up_tx, from_up_rx) = mpsc::unbounded_channel::<Vec<u8>>();
@@ -276,7 +281,7 @@ impl TcpStack {
                         Action::Block => {
                             self.stat_conn_blocked.fetch_add(1, Ordering::Relaxed);
                             sock.abort();
-                            drop_listeners.push(port);
+                            drop_pending.push(tuple);
                             continue;
                         }
                         Action::Direct => {
@@ -304,7 +309,7 @@ impl TcpStack {
                                         Err(e) => {
                                             log::warn!("出口 {node} 打开失败: {e:#}");
                                             sock.abort();
-                                            drop_listeners.push(port);
+                                            drop_pending.push(tuple);
                                             continue;
                                         }
                                     }
@@ -331,11 +336,11 @@ impl TcpStack {
                             closed: false,
                         },
                     ));
-                    drop_listeners.push(port);
+                    drop_pending.push(tuple);
                 }
             }
-            for p in drop_listeners {
-                listeners.remove(&p);
+            for t in drop_pending {
+                pending.remove(&t);
             }
             for (id, c) in new_conns {
                 log::debug!("TCP 连接 {id} -> {} ({:?})", c.dst, "ok");
@@ -386,6 +391,11 @@ impl TcpStack {
                     }
                 }
                 if !sock.is_open() && c.pending.is_empty() {
+                    log::debug!(
+                        "conn {id} 判定关闭: state={:?} pending={}",
+                        sock.state(),
+                        c.pending.len()
+                    );
                     c.closed = true;
                     dead.push(id);
                 }
@@ -413,7 +423,16 @@ impl TcpStack {
     }
 }
 
-/// TCP 4 元组（用于 SYN 去重，避免重传导致连接风暴）
+/// 为一个端口创建监听 socket
+fn new_listener(sockets: &mut SocketSet<'_>, port: u16) -> SocketHandle {
+    let rx = tcp::SocketBuffer::new(vec![0u8; 64 * 1024]);
+    let tx = tcp::SocketBuffer::new(vec![0u8; 64 * 1024]);
+    let mut sock = tcp::Socket::new(rx, tx);
+    sock.listen(port).ok();
+    sockets.add(sock)
+}
+
+/// TCP 4 元组（诊断用）
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct FourTuple {
     pub src_ip: Ipv4Addr,
