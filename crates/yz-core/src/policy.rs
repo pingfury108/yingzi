@@ -401,7 +401,7 @@ pub struct Decision {
 
 /// 规则集：规则按序匹配 → geo 预设 → 默认动作
 pub struct RuleSet {
-    rules: Vec<Rule>,
+    rules: std::sync::RwLock<Vec<Rule>>,
     geoip: Option<GeoIpDb>,
     geosite: Option<GeoSiteDb>,
     default_action: Action,
@@ -415,21 +415,32 @@ impl RuleSet {
         default_action: Action,
     ) -> Self {
         Self {
-            rules,
+            rules: std::sync::RwLock::new(rules),
             geoip,
             geosite,
             default_action,
         }
     }
 
-    pub fn rules(&self) -> &[Rule] {
-        &self.rules
+    /// 热更新规则（保留 geo 库与默认动作）
+    pub fn replace_rules(&self, rules: Vec<Rule>) {
+        if let Ok(mut w) = self.rules.write() {
+            *w = rules;
+        }
+    }
+
+    pub fn rules(&self) -> Vec<Rule> {
+        self.rules.read().map(|r| r.clone()).unwrap_or_default()
     }
 
     /// 域名判定（按序，跳过纯 IP 匹配器）
     pub fn decide_domain(&self, domain: &str) -> Decision {
         let d = domain.trim().to_ascii_lowercase();
-        for r in &self.rules {
+        let rules = match self.rules.read() {
+            Ok(r) => r,
+            Err(_) => return Decision { action: self.default_action.clone(), reason: "规则锁异常".into() },
+        };
+        for r in rules.iter() {
             if !r.matcher.is_domain_matcher() {
                 continue;
             }
@@ -460,7 +471,11 @@ impl RuleSet {
 
     /// IP 判定（按序，跳过纯域名匹配器）
     pub fn decide_ip(&self, ip: Ipv4Addr) -> Decision {
-        for r in &self.rules {
+        let rules = match self.rules.read() {
+            Ok(r) => r,
+            Err(_) => return Decision { action: self.default_action.clone(), reason: "规则锁异常".into() },
+        };
+        for r in rules.iter() {
             if !r.matcher.is_ip_matcher() {
                 continue;
             }

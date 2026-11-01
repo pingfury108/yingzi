@@ -1,0 +1,37 @@
+<?xml version="1.0" encoding="utf-8"?>
+<LinearLayout xmlns:android="http://schemas.android.com/apk/res/android"
+    android:layout_width="match_parent"
+    android:layout_height="match_parent"
+    android:orientation="vertical"
+    android:padding="12dp">
+
+    <TextView android:layout_width="match_parent" android:layout_height="wrap_content"
+        android:text="分流规则（自上而下匹配，先命中先生效）" android:textSize="12sp" />
+
+    <ScrollView android:layout_width="match_parent" android:layout_height="0dp"
+        android:layout_weight="1" android:layout_marginTop="8dp">
+        <LinearLayout android:id="@+id/ruleList" android:layout_width="match_parent"
+            android:layout_height="wrap_content" android:orientation="vertical" />
+    </ScrollView>
+
+    <LinearLayout android:layout_width="match_parent" android:layout_height="wrap_content"
+        android:orientation="horizontal" android:layout_marginTop="8dp">
+        <EditText android:id="@+id/ruleInput" android:layout_width="0dp"
+            android:layout_height="wrap_content" android:layout_weight="1"
+            android:hint="geosite:google=exit" android:textSize="13sp"
+            android:inputType="text" />
+        <com.google.android.material.button.MaterialButton
+            android:id="@+id/addRule" android:layout_width="wrap_content"
+            android:layout_height="wrap_content" android:text="添加" />
+    </LinearLayout>
+
+    <TextView android:layout_width="match_parent" android:layout_height="wrap_content"
+        android:layout_marginTop="8dp" android:text="常用模板" android:textSize="12sp" />
+    <LinearLayout android:id="@+id/presets" android:layout_width="match_parent"
+        android:layout_height="wrap_content" android:orientation="vertical" />
+
+    <com.google.android.material.button.MaterialButton
+        android:id="@+id/saveRules" android:layout_width="match_parent"
+        android:layout_height="wrap_content" android:layout_marginTop="8dp"
+        android:text="保存并立即生效" />
+</LinearLayout>

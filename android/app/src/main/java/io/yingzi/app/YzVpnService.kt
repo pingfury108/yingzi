@@ -84,7 +84,7 @@ class YzVpnService : VpnService() {
             put("direct_dns", cfg.directDns)
             put("geoip", NodeConfig.geoipPath(this@YzVpnService))
             put("geosite", NodeConfig.geositePath(this@YzVpnService))
-            put("rules", org.json.JSONArray(NodeConfig.rules()))
+            put("rules", org.json.JSONArray(Rules.load(this@YzVpnService)))
             put("tun_fd", pfd.fd)
             put("mtu", 1400)
         }
@@ -134,7 +134,7 @@ class YzVpnService : VpnService() {
             put("direct_dns", cfg.directDns)
             put("geoip", NodeConfig.geoipPath(this@YzVpnService))
             put("geosite", NodeConfig.geositePath(this@YzVpnService))
-            put("rules", org.json.JSONArray(NodeConfig.rules()))
+            put("rules", org.json.JSONArray(Rules.load(this@YzVpnService)))
             put("tun_fd", pfd.fd)
             put("mtu", 1400)
         }

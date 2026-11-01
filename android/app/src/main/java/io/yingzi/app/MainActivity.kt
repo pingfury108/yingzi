@@ -40,6 +40,10 @@ class MainActivity : AppCompatActivity() {
             startActivity(Intent(this, SettingsActivity::class.java))
         }
 
+        findViewById<Button>(R.id.rules).setOnClickListener {
+            startActivity(Intent(this, RulesActivity::class.java))
+        }
+
         toggle.setOnClickListener {
             if (YzCore.nativeIsRunning()) stop() else start()
         }

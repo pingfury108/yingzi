@@ -12,7 +12,7 @@
 
 use anyhow::{Context, Result};
 use jni::objects::{GlobalRef, JClass, JObject, JString, JValue};
-use jni::sys::{jboolean, jint, jstring, JNI_TRUE};
+use jni::sys::{jboolean, jint, jstring, JNI_FALSE, JNI_TRUE};
 use jni::{JNIEnv, JavaVM};
 use serde::{Deserialize, Serialize};
 use std::os::unix::io::FromRawFd;
@@ -225,6 +225,7 @@ fn spawn_tun_reader(fd: i32) -> tokio::sync::mpsc::Receiver<Vec<u8>> {
 
 struct NodeRuntime {
     state: Arc<CoreState>,
+    ruleset: Arc<RuleSet>,
     stop_tx: tokio::sync::watch::Sender<bool>,
     dns: Arc<DnsService>,
     tcp: Arc<TcpStack>,
@@ -472,6 +473,7 @@ fn start_async(cfg: StartConfig, protect: Option<Arc<dyn SocketProtect>>) -> Res
 
     Ok(NodeRuntime {
         state,
+        ruleset,
         stop_tx,
         dns,
         tcp,
@@ -576,14 +578,38 @@ pub extern "system" fn Java_io_yingzi_app_YzCore_nativeEvents(
     to_jstring(&mut env, &serde_json::to_string(&arr).unwrap_or_default())
 }
 
-/// nativeSetRules(json) —— 预留：热更新规则（当前重启生效）
+/// nativeSetRules(json) —— 热更新规则（JSON 字符串数组），立即生效
 #[no_mangle]
 pub extern "system" fn Java_io_yingzi_app_YzCore_nativeSetRules(
     mut env: JNIEnv,
     _class: JClass,
-    _rules: JString,
+    rules: JString,
 ) -> jboolean {
-    // TODO(P6): 热更新 RuleSet
+    let Ok(text) = env.get_string(&rules) else {
+        return JNI_FALSE;
+    };
+    let text: String = text.into();
+    let Ok(list) = serde_json::from_str::<Vec<String>>(&text) else {
+        log::warn!("nativeSetRules: JSON 解析失败");
+        return JNI_FALSE;
+    };
+    let parsed: Vec<Rule> = list
+        .iter()
+        .filter_map(|r| match Rule::parse(r) {
+            Ok(rule) => Some(rule),
+            Err(e) => {
+                log::warn!("规则无效 {r}: {e}");
+                None
+            }
+        })
+        .collect();
+    let n = parsed.len();
+    let guard = NODE.lock().unwrap();
+    let Some(node) = guard.as_ref() else {
+        return JNI_FALSE;
+    };
+    node.ruleset.replace_rules(parsed);
+    log::info!("规则已热更新: {n} 条");
     JNI_TRUE
 }
 
