@@ -590,7 +590,7 @@ impl DnsService {
 
         // 2) 缓存
         {
-            let mut cache = self.cache.lock().await;
+            let cache = self.cache.lock().await;
             if let Some(e) = cache.get(&name, q.qtype) {
                 self.stat_cache_hit
                     .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
