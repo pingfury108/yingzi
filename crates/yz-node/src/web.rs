@@ -3,7 +3,7 @@
 
 use crate::ingress::IngressEntry;
 use crate::node::{resolve_node, tunnel_for, NodeState};
-use crate::policy::RouteRule;
+use yz_core::policy::RouteRule;
 use anyhow::{Context, Result};
 use axum::extract::{Path, Request, State};
 use axum::http::{header, StatusCode};

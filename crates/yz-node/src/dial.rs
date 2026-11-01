@@ -1,6 +1,6 @@
 //! dial: 本地入口。维持一条到 peer 的复用隧道(断线重连), 每个本地连接开一条流。
 
-use crate::tunnel::{self, Tunnel};
+use yz_core::tunnel::{self, Tunnel};
 use anyhow::{bail, Context, Result};
 use std::sync::Arc;
 use std::time::Duration;

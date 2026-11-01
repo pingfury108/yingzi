@@ -6,9 +6,9 @@
 //! serve 子命令复用 handle_peer (无 mesh 的独立出口, ACL=All)。
 
 use crate::ingress::{self, IngressEntry, IngressRule};
-use crate::policy::{match_route, ExitAcl, RouteRule};
+use yz_core::policy::{match_route, ExitAcl, RouteRule};
 use crate::socks5;
-use crate::tunnel::{self, Incoming, Tunnel, TunnelHandle};
+use yz_core::tunnel::{self, Incoming, Tunnel, TunnelHandle};
 use anyhow::{bail, Context, Result};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, VecDeque};
@@ -1581,7 +1581,7 @@ pub async fn serve(
         id_pub,
     };
     if let Some((cert, key)) = wss {
-        let acceptor = crate::wss::server_acceptor(Path::new(&cert), Path::new(&key))?;
+        let acceptor = yz_core::wss::server_acceptor(Path::new(&cert), Path::new(&key))?;
         let listener = bind_tcp_retry(bind).await?;
         log::info!("serving tunnel on wss/{bind}");
         loop {

@@ -1349,6 +1349,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "yz-core"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "log",
+ "rustls",
+ "rustls-pemfile",
+ "tokio",
+ "tokio-rustls",
+ "webpki-roots 0.26.11",
+ "yz-crypto",
+ "yz-proto",
+ "yz-rudp",
+]
+
+[[package]]
 name = "yz-crypto"
 version = "0.1.0"
 dependencies = [
@@ -1373,6 +1389,7 @@ dependencies = [
  "tokio-rustls",
  "tun",
  "webpki-roots 0.26.11",
+ "yz-core",
  "yz-crypto",
  "yz-proto",
  "yz-rudp",

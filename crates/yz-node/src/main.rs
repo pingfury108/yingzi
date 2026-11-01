@@ -12,11 +12,8 @@ mod dial;
 mod ingress;
 mod mesh;
 mod node;
-mod policy;
 mod socks5;
-mod tunnel;
 mod web;
-mod wss;
 
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
@@ -217,7 +214,7 @@ async fn main() -> Result<()> {
         } => {
             let routes = routes
                 .iter()
-                .map(|r| policy::RouteRule::parse(r))
+                .map(|r| yz_core::policy::RouteRule::parse(r))
                 .collect::<Result<Vec<_>, _>>()
                 .map_err(|e| anyhow::anyhow!("bad --route: {e}"))?;
             let ingress = ingress
@@ -237,11 +234,11 @@ async fn main() -> Result<()> {
                     web,
                     web_token,
                     ingress,
-                    ingress_acl: policy::ExitAcl::parse(&ingress_allow),
+                    ingress_acl: yz_core::policy::ExitAcl::parse(&ingress_allow),
                     ingress_ports,
                     default_exit,
                     routes,
-                    exit_acl: policy::ExitAcl::parse(&exit_allow),
+                    exit_acl: yz_core::policy::ExitAcl::parse(&exit_allow),
                     fallback,
                     tun: if no_tun { None } else { Some(tun) },
                     config: config.map(std::path::PathBuf::from),

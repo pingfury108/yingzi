@@ -1,0 +1,16 @@
+[package]
+name = "yz-core"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+yz-proto = { path = "../yz-proto" }
+yz-crypto = { path = "../yz-crypto" }
+yz-rudp = { path = "../yz-rudp" }
+anyhow = "1"
+tokio = { version = "1", features = ["full"] }
+log = "0.4"
+rustls = { version = "0.23", default-features = false, features = ["ring", "logging", "std", "tls12"] }
+tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "logging", "tls12"] }
+rustls-pemfile = "2"
+webpki-roots = "0.26"

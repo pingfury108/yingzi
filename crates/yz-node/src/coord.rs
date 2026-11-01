@@ -1,7 +1,7 @@
 //! coordinator: 节点注册表 + 目录广播。
 //! 只做控制信令, 不接触业务明文。
 
-use crate::tunnel::{self, Tunnel};
+use yz_core::tunnel::{self, Tunnel};
 use anyhow::{bail, Context, Result};
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -110,7 +110,7 @@ async fn handle(
         let t = h.tunnel.clone();
         let mut accept_rx = h.accept_rx;
         tokio::spawn(async move {
-            while let Some(crate::tunnel::Incoming { sid, addr, rx, .. }) = accept_rx.recv().await {
+            while let Some(yz_core::tunnel::Incoming { sid, addr, rx, .. }) = accept_rx.recv().await {
                 let registry = registry.clone();
                 let t = t.clone();
                 tokio::spawn(async move {
@@ -260,7 +260,7 @@ async fn relay_stream(
     };
     // 向目标开中继端点流
     let (sid_b, mut rx_b) = target_t
-        .open_stream(yz_proto::Addr::Domain(crate::tunnel::RELAY_MARK.into(), 0))
+        .open_stream(yz_proto::Addr::Domain(yz_core::tunnel::RELAY_MARK.into(), 0))
         .await?;
     match timeout(Duration::from_secs(10), rx_b.recv()).await? {
         Some(Frame::SynAck { ok: true, .. }) => {}
@@ -281,7 +281,7 @@ async fn relay_stream(
         })
         .await?;
     log::debug!("relay stream {sid} -> {target}");
-    crate::tunnel::pipe_streams(coord_t, sid, rx, target_t, sid_b, rx_b).await;
+    yz_core::tunnel::pipe_streams(coord_t, sid, rx, target_t, sid_b, rx_b).await;
     Ok(())
 }
 

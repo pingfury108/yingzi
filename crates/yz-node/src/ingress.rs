@@ -2,8 +2,8 @@
 //! 静态: CLI --ingress "listen=node/addr"; 动态: 对端发 INGRESS_PUB 控制消息。
 
 use crate::node::{resolve_node, tunnel_for, NodeState};
-use crate::policy::ExitAcl;
-use crate::tunnel::{self, Tunnel};
+use yz_core::policy::ExitAcl;
+use yz_core::tunnel::{self, Tunnel};
 use anyhow::{Context, Result};
 use serde::Serialize;
 use std::sync::Arc;

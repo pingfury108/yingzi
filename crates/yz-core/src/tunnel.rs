@@ -167,7 +167,7 @@ impl Tunnel {
         Ok((sid, rx))
     }
 
-    pub(crate) async fn close_stream(&self, sid: u32) {
+    pub async fn close_stream(&self, sid: u32) {
         self.streams.lock().await.remove(&sid);
     }
 
@@ -202,7 +202,7 @@ impl Tunnel {
     /// 响应方换钥: 立即切收钥(能解对端新钥), 延迟切发钥
     /// 理由: 发起方收到 ack 就切了; 若我们立刻切发钥, 我们发出的新钥帧对端(未切)解不开。
     /// 延迟期间我们仍用旧钥发送, 对端靠其"上一代收钥窗口"解出, 实现零丢包。
-    pub(crate) async fn apply_keys_responder(&self, keys: &SessionKeys) {
+    pub async fn apply_keys_responder(&self, keys: &SessionKeys) {
         log::info!(
             "rekey applied (responder, fp {})",
             yz_crypto::key_fingerprint(keys)
@@ -304,7 +304,7 @@ where
 }
 
 /// 任意字节流上的握手 (响应方); Ok(None) 表示认证失败
-pub(crate) async fn hs_accept_io<S>(
+pub async fn hs_accept_io<S>(
     io: &mut S,
     ns: &NetworkSecret,
     id_pub: &[u8; 32],
@@ -332,7 +332,7 @@ where
 }
 
 /// 字节流装配为隧道
-pub(crate) fn assemble_stream<S>(
+pub fn assemble_stream<S>(
     io: S,
     keys: &SessionKeys,
     role: Role,
