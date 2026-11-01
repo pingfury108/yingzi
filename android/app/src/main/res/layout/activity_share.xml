@@ -1,0 +1,60 @@
+<?xml version="1.0" encoding="utf-8"?>
+<LinearLayout xmlns:android="http://schemas.android.com/apk/res/android"
+    xmlns:app="http://schemas.android.com/apk/res-auto"
+    android:layout_width="match_parent" android:layout_height="match_parent"
+    android:orientation="vertical" android:background="@color/bg">
+
+    <LinearLayout android:layout_width="match_parent" android:layout_height="wrap_content"
+        android:orientation="horizontal" android:gravity="center_vertical"
+        android:paddingStart="18dp" android:paddingEnd="18dp"
+        android:paddingTop="14dp" android:paddingBottom="10dp">
+
+        <ImageButton android:id="@+id/back" android:layout_width="36dp" android:layout_height="36dp"
+            android:background="@drawable/bg_icon_btn" android:src="@drawable/ic_back"
+            app:tint="@color/text_2" android:contentDescription="返回" />
+
+        <TextView android:layout_width="wrap_content" android:layout_height="wrap_content"
+            android:layout_marginStart="10dp" android:text="配置分享"
+            android:textSize="13sp" android:fontFamily="monospace"
+            android:letterSpacing="0.2" android:textColor="@color/text_2" />
+    </LinearLayout>
+
+    <ScrollView android:layout_width="match_parent" android:layout_height="0dp"
+        android:layout_weight="1" android:scrollbars="none" android:overScrollMode="never">
+        <LinearLayout android:layout_width="match_parent" android:layout_height="wrap_content"
+            android:orientation="vertical"
+            android:paddingStart="18dp" android:paddingEnd="18dp" android:paddingBottom="18dp">
+
+            <LinearLayout android:layout_width="match_parent" android:layout_height="wrap_content"
+                android:orientation="vertical" android:gravity="center_horizontal"
+                android:background="@drawable/bg_card" android:padding="18dp">
+
+                <ImageView android:id="@+id/qr" android:layout_width="240dp"
+                    android:layout_height="240dp" android:background="#FFFFFFFF"
+                    android:contentDescription="配置二维码" />
+
+                <TextView android:id="@+id/summary" android:layout_width="wrap_content"
+                    android:layout_height="wrap_content" android:layout_marginTop="14dp"
+                    android:textSize="11sp" android:fontFamily="monospace"
+                    android:textColor="@color/text_3" android:gravity="center" />
+            </LinearLayout>
+
+            <TextView android:layout_width="match_parent" android:layout_height="wrap_content"
+                android:layout_marginTop="14dp"
+                android:text="二维码包含网络密钥，请只分享给自己的设备。另一台设备在「配置分享」里粘贴或扫码即可接入同一张网。"
+                android:textSize="11sp" android:lineSpacingExtra="4dp"
+                android:textColor="@color/text_3" />
+
+            <com.google.android.material.button.MaterialButton
+                android:id="@+id/copy" style="@style/CtaButton"
+                android:layout_width="match_parent" android:layout_height="wrap_content"
+                android:layout_marginTop="18dp" android:text="复制配置文本" />
+
+            <com.google.android.material.button.MaterialButton
+                android:id="@+id/paste" style="@style/CtaButton"
+                android:layout_width="match_parent" android:layout_height="wrap_content"
+                android:layout_marginTop="10dp" android:text="从剪贴板导入"
+                android:backgroundTint="@color/surface_2" android:textColor="@color/text" />
+        </LinearLayout>
+    </ScrollView>
+</LinearLayout>

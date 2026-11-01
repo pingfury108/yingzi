@@ -33,6 +33,9 @@ class SettingsActivity : AppCompatActivity() {
         findViewById<android.view.View>(R.id.appsRow).setOnClickListener {
             startActivity(Intent(this, AppsActivity::class.java))
         }
+        findViewById<android.view.View>(R.id.shareRow).setOnClickListener {
+            startActivity(Intent(this, ShareActivity::class.java))
+        }
         findViewById<android.view.View>(R.id.alwaysOnRow).setOnClickListener {
             try {
                 startActivity(Intent(android.provider.Settings.ACTION_VPN_SETTINGS))

@@ -161,6 +161,28 @@
             </LinearLayout>
 
             <TextView style="@style/SectionLabel" android:layout_width="wrap_content"
+                android:layout_height="wrap_content" android:text="分享" />
+
+            <LinearLayout android:id="@+id/shareRow" android:layout_width="match_parent"
+                android:layout_height="wrap_content" android:orientation="horizontal"
+                android:gravity="center_vertical" android:background="@drawable/bg_card"
+                android:padding="16dp">
+
+                <LinearLayout android:layout_width="0dp" android:layout_height="wrap_content"
+                    android:layout_weight="1" android:orientation="vertical">
+                    <TextView android:layout_width="wrap_content" android:layout_height="wrap_content"
+                        android:text="配置分享 / 导入" android:textSize="14sp" android:textColor="@color/text" />
+                    <TextView android:layout_width="wrap_content" android:layout_height="wrap_content"
+                        android:layout_marginTop="4dp" android:text="二维码或剪贴板，用于给另一台设备配网"
+                        android:textSize="11sp" android:fontFamily="monospace" android:textColor="@color/text_3" />
+                </LinearLayout>
+
+                <ImageView android:layout_width="16dp" android:layout_height="16dp"
+                    android:src="@drawable/ic_chevron" app:tint="@color/text_3"
+                    android:contentDescription="进入" />
+            </LinearLayout>
+
+            <TextView style="@style/SectionLabel" android:layout_width="wrap_content"
                 android:layout_height="wrap_content" android:text="保活" />
 
             <LinearLayout android:id="@+id/batteryRow" android:layout_width="match_parent"

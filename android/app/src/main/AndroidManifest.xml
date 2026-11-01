@@ -28,6 +28,10 @@
         </activity>
 
         <activity
+            android:name=".ShareActivity"
+            android:exported="false" />
+
+        <activity
             android:name=".AppsActivity"
             android:exported="false" />
 
