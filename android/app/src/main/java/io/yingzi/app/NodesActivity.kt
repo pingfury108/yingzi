@@ -22,18 +22,7 @@ class NodesActivity : AppCompatActivity() {
         list = findViewById(R.id.nodeList)
 
         findViewById<ImageButton>(R.id.back).setOnClickListener { finish() }
-        findViewById<com.google.android.material.bottomnavigation.BottomNavigationView>(R.id.nav)
-            .apply {
-                selectedItemId = R.id.nav_nodes
-                setOnItemSelectedListener { item ->
-                    when (item.itemId) {
-                        R.id.nav_status -> { finish() }
-                        R.id.nav_rules -> startActivity(Intent(this@NodesActivity, RulesActivity::class.java))
-                        R.id.nav_log -> startActivity(Intent(this@NodesActivity, LogActivity::class.java))
-                    }
-                    true
-                }
-            }
+        Nav.bind(this, findViewById(R.id.nav), R.id.nav_nodes)
         render()
     }
 

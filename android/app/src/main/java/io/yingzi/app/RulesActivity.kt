@@ -31,18 +31,7 @@ class RulesActivity : AppCompatActivity() {
         rules += Rules.load(this)
 
         findViewById<ImageButton>(R.id.back).setOnClickListener { finish() }
-        findViewById<com.google.android.material.bottomnavigation.BottomNavigationView>(R.id.nav)
-            .apply {
-                selectedItemId = R.id.nav_rules
-                setOnItemSelectedListener { item ->
-                    when (item.itemId) {
-                        R.id.nav_status -> finish()
-                        R.id.nav_nodes -> startActivity(Intent(this@RulesActivity, NodesActivity::class.java))
-                        R.id.nav_log -> startActivity(Intent(this@RulesActivity, LogActivity::class.java))
-                    }
-                    true
-                }
-            }
+        Nav.bind(this, findViewById(R.id.nav), R.id.nav_rules)
 
         findViewById<Button>(R.id.addRule).setOnClickListener {
             val r = input.text.toString().trim()

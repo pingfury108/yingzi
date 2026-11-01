@@ -184,7 +184,7 @@ class YzVpnService : VpnService() {
         return Notification.Builder(this, CHANNEL)
             .setContentTitle("yingzi")
             .setContentText(text)
-            .setSmallIcon(android.R.drawable.ic_menu_compass)
+            .setSmallIcon(R.drawable.ic_notif)
             .setContentIntent(pi)
             .setOngoing(true)
             .build()

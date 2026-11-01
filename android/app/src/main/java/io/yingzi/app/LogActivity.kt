@@ -44,18 +44,7 @@ class LogActivity : AppCompatActivity() {
             paused = !paused
             (it as ImageButton).setImageResource(if (paused) R.drawable.ic_play else R.drawable.ic_pause)
         }
-        findViewById<com.google.android.material.bottomnavigation.BottomNavigationView>(R.id.nav)
-            .apply {
-                selectedItemId = R.id.nav_log
-                setOnItemSelectedListener { item ->
-                    when (item.itemId) {
-                        R.id.nav_status -> finish()
-                        R.id.nav_nodes -> startActivity(Intent(this@LogActivity, NodesActivity::class.java))
-                        R.id.nav_rules -> startActivity(Intent(this@LogActivity, RulesActivity::class.java))
-                    }
-                    true
-                }
-            }
+        Nav.bind(this, findViewById(R.id.nav), R.id.nav_log)
 
         buildFilters()
         render()

@@ -70,17 +70,11 @@ class MainActivity : AppCompatActivity() {
             if (YzCore.nativeIsRunning()) stop() else start()
         }
 
-        findViewById<com.google.android.material.bottomnavigation.BottomNavigationView>(R.id.nav)
-            .setOnItemSelectedListener { item ->
-                when (item.itemId) {
-                    R.id.nav_nodes -> startActivity(Intent(this, NodesActivity::class.java))
-                    R.id.nav_rules -> startActivity(Intent(this, RulesActivity::class.java))
-                    R.id.nav_log -> startActivity(Intent(this, LogActivity::class.java))
-                }
-                true
-            }
-        findViewById<com.google.android.material.bottomnavigation.BottomNavigationView>(R.id.nav)
-            .selectedItemId = R.id.nav_status
+        Nav.bind(
+            this,
+            findViewById(R.id.nav),
+            R.id.nav_status,
+        )
 
         if (intent?.getBooleanExtra("autostart", false) == true) start()
     }
