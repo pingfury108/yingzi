@@ -2,10 +2,33 @@
 //!
 //! 平台相关的 TUN 设备读写在调用方实现（桌面: tun crate；Android: VpnService fd）。
 
+use crate::peer::tunnel_for;
 use crate::state::CoreState;
+use anyhow::Result;
 use std::net::Ipv4Addr;
 use std::sync::Arc;
 use tokio::sync::mpsc;
+use yz_crypto::NetworkSecret;
+use yz_proto::Frame;
+
+/// 虚拟网卡抽象: 桌面用 tun 设备路径, Android 用 VpnService 的 fd
+pub trait PacketIo: Send + Sync {
+    fn recv<'a>(
+        &'a self,
+        buf: &'a mut [u8],
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<usize>> + Send + 'a>>;
+    fn send<'a>(
+        &'a self,
+        pkt: &'a [u8],
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<()>> + Send + 'a>>;
+}
+
+/// mesh 路由配置
+pub struct MeshRouterConfig {
+    pub vip: Ipv4Addr,
+    /// macOS utun 有 4 字节 AF 头; Linux/Android 没有
+    pub af_header: bool,
+}
 
 /// 默认 TUN 网卡名: macOS 必须是 utun<N>
 #[cfg(target_os = "macos")]
@@ -44,4 +67,91 @@ pub fn spawn_forward(mut rx: mpsc::Receiver<Vec<u8>>, state: Arc<CoreState>) {
 pub async fn route_target(state: &Arc<CoreState>, dst: Ipv4Addr) -> Option<String> {
     let dir = state.dir.read().await;
     dir.keys().find(|id| vip_of(id) == dst).cloned()
+}
+
+/// 从 TUN 原始缓冲取 IP 包偏移 (macOS 需跳过 4 字节 AF 头)
+fn ip_offset(buf: &[u8], af_header: bool) -> Option<usize> {
+    if !af_header {
+        return Some(0);
+    }
+    if buf.len() >= 24 && buf[..4] == [0, 0, 0, 2] {
+        Some(4)
+    } else {
+        None
+    }
+}
+
+fn dst_v4(pkt: &[u8]) -> Option<Ipv4Addr> {
+    if pkt.len() < 20 || pkt[0] >> 4 != 4 {
+        return None;
+    }
+    Some(Ipv4Addr::new(pkt[16], pkt[17], pkt[18], pkt[19]))
+}
+
+fn wrap_tun(pkt: &[u8], af_header: bool) -> Vec<u8> {
+    if !af_header {
+        return pkt.to_vec();
+    }
+    let mut out = Vec::with_capacity(4 + pkt.len());
+    out.extend_from_slice(&[0, 0, 0, 2]);
+    out.extend_from_slice(pkt);
+    out
+}
+
+/// mesh 路由主循环: TUN 收包 → 查目的 vIP → 经隧道发给对应节点
+///
+/// 平台无关: 具体虚拟网卡由调用方以 `PacketIo` 提供。
+pub async fn run_router<T: PacketIo + 'static>(
+    io: Arc<T>,
+    state: Arc<CoreState>,
+    ns: NetworkSecret,
+    id_pub: [u8; 32],
+    cfg: MeshRouterConfig,
+) -> Result<()> {
+    let vip = cfg.vip;
+    let af_header = cfg.af_header;
+
+    // 隧道来的 mesh 帧 → 本地 TUN
+    let (tx, mut rx) = mpsc::channel::<Vec<u8>>(512);
+    *state.mesh_sink.write().await = Some(tx);
+    {
+        let io = io.clone();
+        tokio::spawn(async move {
+            while let Some(pkt) = rx.recv().await {
+                let pkt = wrap_tun(&pkt, af_header);
+                if let Err(e) = io.send(&pkt).await {
+                    log::debug!("tun write: {e}");
+                }
+            }
+        });
+    }
+
+    let mut buf = vec![0u8; 2048];
+    loop {
+        let n = io.recv(&mut buf).await?;
+        let Some(off) = ip_offset(&buf[..n], af_header) else {
+            continue;
+        };
+        let pkt = &buf[off..n];
+        let Some(dst) = dst_v4(pkt) else { continue };
+        if dst == vip {
+            continue;
+        }
+        let Some(nid) = route_target(&state, dst).await else {
+            continue; // 未知目的, 静默丢
+        };
+        match tunnel_for(&state, &ns, &id_pub, &nid).await {
+            Ok(t) => {
+                if let Err(e) = t
+                    .write_frame(&Frame::Mesh {
+                        payload: pkt.to_vec(),
+                    })
+                    .await
+                {
+                    log::debug!("mesh write {dst}: {e:#}");
+                }
+            }
+            Err(e) => log::debug!("mesh route {dst}: {e:#}"),
+        }
+    }
 }
