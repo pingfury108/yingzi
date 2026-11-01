@@ -9,7 +9,6 @@
 
 mod coord;
 mod dial;
-mod ingress;
 mod mesh;
 mod node;
 mod socks5;
@@ -219,7 +218,7 @@ async fn main() -> Result<()> {
                 .map_err(|e| anyhow::anyhow!("bad --route: {e}"))?;
             let ingress = ingress
                 .iter()
-                .map(|r| ingress::parse_rule(r))
+                .map(|r| yz_core::ingress::parse_rule(r))
                 .collect::<Result<Vec<_>, _>>()
                 .map_err(|e| anyhow::anyhow!("bad --ingress: {e}"))?;
             let ingress_ports = parse_port_range(&ingress_ports)?;

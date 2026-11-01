@@ -1,9 +1,10 @@
 //! 入口发布 (plan.md §5A): 公网端口 → 组网内节点的服务。
 //! 静态: CLI --ingress "listen=node/addr"; 动态: 对端发 INGRESS_PUB 控制消息。
 
-use crate::node::{resolve_node, tunnel_for, NodeState};
-use yz_core::policy::ExitAcl;
-use yz_core::tunnel::{self, Tunnel};
+use crate::peer::{resolve_node, tunnel_for};
+use crate::state::CoreState;
+use crate::policy::ExitAcl;
+use crate::tunnel::{self, Tunnel};
 use anyhow::{Context, Result};
 use serde::Serialize;
 use std::sync::Arc;
@@ -47,7 +48,7 @@ pub struct IngressEntry {
 /// 静态发布: 每个公网连接实时解析目标节点并开流
 pub async fn run_static(
     rule: IngressRule,
-    state: Arc<NodeState>,
+    state: Arc<CoreState>,
     ns: NetworkSecret,
     id_pub: [u8; 32],
     self_id: String,
@@ -80,7 +81,7 @@ pub async fn run_static(
 
 async fn forward_via_node(
     stream: TcpStream,
-    state: &Arc<NodeState>,
+    state: &Arc<CoreState>,
     ns: &NetworkSecret,
     id_pub: &[u8; 32],
     node_key: &str,
@@ -110,7 +111,7 @@ async fn open_and_pump(stream: TcpStream, addr: Addr, t: Arc<Tunnel>) -> Result<
 
 /// 处理对端的动态发布请求 (INGRESS_PUB), 返回 (ok, msg)
 pub async fn handle_pub_request(
-    state: &Option<Arc<NodeState>>,
+    state: &Option<Arc<CoreState>>,
     acl: &ExitAcl,
     range: (u16, u16),
     peer_id: &str,

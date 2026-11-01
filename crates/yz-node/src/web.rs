@@ -1,7 +1,7 @@
 //! 本地 Web UI (plan.md §6): 节点拓扑 / 出口选择 / 分流规则。
 //! 仅监听本地; 轮询模式 (WS 实时推送留待后续)。
 
-use crate::ingress::IngressEntry;
+use yz_core::ingress::IngressEntry;
 use crate::node::{resolve_node, tunnel_for, NodeState};
 use yz_core::policy::RouteRule;
 use anyhow::{Context, Result};
@@ -262,8 +262,6 @@ struct IngressReq {
     port: u16,
     /// 首选地址 (同网段优先)
     addr: String,
-    /// 该节点上报的全部地址
-    addrs: Vec<String>,
 }
 
 async fn list_ingress(State(app): State<Arc<AppState>>) -> Json<IngressListResp> {

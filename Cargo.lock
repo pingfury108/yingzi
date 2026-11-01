@@ -1356,6 +1356,8 @@ dependencies = [
  "log",
  "rustls",
  "rustls-pemfile",
+ "serde",
+ "serde_json",
  "tokio",
  "tokio-rustls",
  "webpki-roots 0.26.11",

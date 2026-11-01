@@ -97,17 +97,7 @@ pub async fn run(
     }
 }
 
-/// 隧道 mesh 帧 → 本地 TUN (每条隧道一个转发任务)
-pub fn spawn_forward(mut rx: mpsc::Receiver<Vec<u8>>, state: Arc<NodeState>) {
-    tokio::spawn(async move {
-        while let Some(pkt) = rx.recv().await {
-            let sink = state.mesh_sink.read().await.clone();
-            if let Some(sink) = sink {
-                let _ = sink.send(pkt).await;
-            }
-        }
-    });
-}
+
 
 /// macOS utun 有 4 字节 AF 头 (be u32: 2=IPv4), Linux 无
 #[cfg(target_os = "macos")]
