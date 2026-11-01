@@ -226,6 +226,9 @@ fn spawn_tun_reader(fd: i32) -> tokio::sync::mpsc::Receiver<Vec<u8>> {
 struct NodeRuntime {
     state: Arc<CoreState>,
     ruleset: Arc<RuleSet>,
+    started: std::time::Instant,
+    exit: String,
+    self_id: String,
     stop_tx: tokio::sync::watch::Sender<bool>,
     dns: Arc<DnsService>,
     tcp: Arc<TcpStack>,
@@ -234,13 +237,48 @@ struct NodeRuntime {
 
 impl NodeRuntime {
     fn status(&self) -> StatusJson {
-        let (tx_bytes, rx_bytes, streams) = {
-            let state = self.state.clone();
-            rt().block_on(async move { state.traffic().await })
-        };
+        let state = self.state.clone();
+        let (tx_bytes, rx_bytes, streams, peers, rtt_ms, nodes) = rt().block_on(async move {
+            let traffic = state.traffic().await;
+            let tunnels = state.tunnels.lock().await;
+            let peers = tunnels.len();
+            let rtt = state.rtt.read().await.clone();
+            let path = state.path.read().await.clone();
+            let dir = state.dir.read().await.clone();
+            let self_id = self.self_id.clone();
+            let mut nodes: Vec<NodeStatus> = dir
+                .values()
+                .filter(|n| n.node_id != self_id)
+                .map(|n| NodeStatus {
+                    node_id: n.node_id.clone(),
+                    name: n.name.clone(),
+                    vip: yz_core::util::vip_of(&n.node_id).to_string(),
+                    addrs: n.addrs.clone(),
+                    rtt: rtt.get(&n.node_id).copied().unwrap_or(0),
+                    path: path.get(&n.node_id).cloned().unwrap_or_default(),
+                    is_exit: n.caps & yz_proto::caps::EXIT != 0,
+                    connected: tunnels.contains_key(&n.node_id),
+                })
+                .collect();
+            nodes.sort_by_key(|n| (n.rtt == 0, n.rtt));
+            let rtt_ms = rtt
+                .get(&self.exit)
+                .copied()
+                .or_else(|| {
+                    dir.values()
+                        .find(|n| n.name == self.exit)
+                        .and_then(|n| rtt.get(&n.node_id).copied())
+                })
+                .unwrap_or(0);
+            (traffic.0, traffic.1, traffic.2, peers, rtt_ms, nodes)
+        });
         StatusJson {
             running: true,
-            peers: 0,
+            peers,
+            exit: self.exit.clone(),
+            rtt_ms,
+            uptime_s: self.started.elapsed().as_secs(),
+            nodes,
             tx_bytes,
             rx_bytes,
             streams,
@@ -267,9 +305,25 @@ impl NodeRuntime {
 }
 
 #[derive(Serialize)]
+struct NodeStatus {
+    node_id: String,
+    name: String,
+    vip: String,
+    addrs: Vec<String>,
+    rtt: u32,
+    path: String,
+    is_exit: bool,
+    connected: bool,
+}
+
+#[derive(Serialize)]
 struct StatusJson {
     running: bool,
     peers: usize,
+    exit: String,
+    rtt_ms: u32,
+    uptime_s: u64,
+    nodes: Vec<NodeStatus>,
     tx_bytes: u64,
     rx_bytes: u64,
     streams: u64,
@@ -428,6 +482,7 @@ fn start_async(cfg: StartConfig, protect: Option<Arc<dyn SocketProtect>>) -> Res
     let tcp = Arc::new(TcpStack::new(
         ruleset.clone(),
         TcpStackConfig {
+            events: Some(state.clone()),
             mtu: cfg.mtu,
             protect,
             exit: Some(exit_tcp),
@@ -474,6 +529,9 @@ fn start_async(cfg: StartConfig, protect: Option<Arc<dyn SocketProtect>>) -> Res
     Ok(NodeRuntime {
         state,
         ruleset,
+        started: std::time::Instant::now(),
+        exit: cfg.default_exit.clone().unwrap_or_default(),
+        self_id: yz_crypto::node_id(&id_pub),
         stop_tx,
         dns,
         tcp,
@@ -569,8 +627,19 @@ pub extern "system" fn Java_io_yingzi_app_YzCore_nativeEvents(
     mut env: JNIEnv,
     _class: JClass,
 ) -> jstring {
+    // 优先读核心事件环（真实事件），否则用本地缓冲
+    let from_core: Vec<(i64, String, String)> = {
+        let guard = NODE.lock().unwrap();
+        match guard.as_ref() {
+            Some(node) => {
+                let state = node.state.clone();
+                rt().block_on(async move { state.events.read().await.iter().cloned().collect() })
+            }
+            None => Vec::new(),
+        }
+    };
     let ev = EVENTS.get_or_init(|| Arc::new(std::sync::Mutex::new(Vec::new())));
-    let list = ev.lock().unwrap().clone();
+    let list = if from_core.is_empty() { ev.lock().unwrap().clone() } else { from_core };
     let arr: Vec<serde_json::Value> = list
         .into_iter()
         .map(|(ts, level, msg)| serde_json::json!({"ts": ts, "level": level, "msg": msg}))
@@ -611,6 +680,37 @@ pub extern "system" fn Java_io_yingzi_app_YzCore_nativeSetRules(
     node.ruleset.replace_rules(parsed);
     log::info!("规则已热更新: {n} 条");
     JNI_TRUE
+}
+
+/// nativePushEvent(level, msg) —— 由 Kotlin 侧写入事件（启停/网络切换/规则更新）
+#[no_mangle]
+pub extern "system" fn Java_io_yingzi_app_YzCore_nativePushEvent(
+    mut env: JNIEnv,
+    _class: JClass,
+    level: JString,
+    msg: JString,
+) {
+    let lvl: String = env.get_string(&level).map(Into::into).unwrap_or_else(|_| "INFO".into());
+    let text: String = env.get_string(&msg).map(Into::into).unwrap_or_default();
+    let guard = NODE.lock().unwrap();
+    match guard.as_ref() {
+        Some(node) => {
+            let state = node.state.clone();
+            rt().block_on(async move { state.push_event(&lvl, text).await });
+        }
+        None => {
+            let ev = EVENTS.get_or_init(|| Arc::new(std::sync::Mutex::new(Vec::new())));
+            let ts = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs() as i64)
+                .unwrap_or(0);
+            let mut v = ev.lock().unwrap();
+            v.push((ts, lvl, text));
+            while v.len() > 100 {
+                v.remove(0);
+            }
+        }
+    }
 }
 
 #[no_mangle]

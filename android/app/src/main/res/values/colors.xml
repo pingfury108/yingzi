@@ -1,0 +1,19 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <!-- 设计 token：暗色工程仪表 -->
+    <color name="bg">#FF07090B</color>
+    <color name="surface">#FF0F1317</color>
+    <color name="surface_2">#FF141A1F</color>
+    <color name="line">#14FFFFFF</color>
+    <color name="line_strong">#24FFFFFF</color>
+    <color name="text">#FFE8EEF4</color>
+    <color name="text_2">#FF93A1AF</color>
+    <color name="text_3">#FF5A6875</color>
+    <color name="accent">#FF38F0C6</color>
+    <color name="accent_soft">#1F38F0C6</color>
+    <color name="accent_line">#5238F0C6</color>
+    <color name="direct">#FF6FE39A</color>
+    <color name="exit">#FF5FA8FF</color>
+    <color name="block">#FFFF6B7A</color>
+    <color name="warn">#FFFFC24B</color>
+</resources>

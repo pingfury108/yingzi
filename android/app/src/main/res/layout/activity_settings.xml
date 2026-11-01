@@ -1,53 +1,130 @@
 <?xml version="1.0" encoding="utf-8"?>
-<ScrollView xmlns:android="http://schemas.android.com/apk/res/android"
-    android:layout_width="match_parent"
-    android:layout_height="match_parent"
-    android:padding="16dp">
+<LinearLayout xmlns:android="http://schemas.android.com/apk/res/android"
+    xmlns:app="http://schemas.android.com/apk/res-auto"
+    android:layout_width="match_parent" android:layout_height="match_parent"
+    android:orientation="vertical" android:background="@color/bg">
 
-    <LinearLayout
-        android:layout_width="match_parent"
-        android:layout_height="wrap_content"
-        android:orientation="vertical">
+    <LinearLayout android:layout_width="match_parent" android:layout_height="wrap_content"
+        android:orientation="horizontal" android:gravity="center_vertical"
+        android:paddingStart="18dp" android:paddingEnd="18dp"
+        android:paddingTop="14dp" android:paddingBottom="10dp">
 
-        <TextView android:layout_width="match_parent" android:layout_height="wrap_content"
-            android:text="协调器地址 (host:port)" android:textSize="12sp" />
-        <EditText android:id="@+id/coordinator" android:layout_width="match_parent"
-            android:layout_height="wrap_content" android:inputType="text"
-            android:hint="47.109.61.89:9000" />
+        <ImageButton android:id="@+id/back" android:layout_width="36dp" android:layout_height="36dp"
+            android:background="@drawable/bg_icon_btn" android:src="@drawable/ic_back"
+            app:tint="@color/text_2" android:contentDescription="返回" />
 
-        <TextView android:layout_width="match_parent" android:layout_height="wrap_content"
-            android:layout_marginTop="12dp" android:text="节点名" android:textSize="12sp" />
-        <EditText android:id="@+id/name" android:layout_width="match_parent"
-            android:layout_height="wrap_content" android:inputType="text" android:hint="android" />
-
-        <TextView android:layout_width="match_parent" android:layout_height="wrap_content"
-            android:layout_marginTop="12dp" android:text="默认出口节点" android:textSize="12sp" />
-        <EditText android:id="@+id/exit" android:layout_width="match_parent"
-            android:layout_height="wrap_content" android:inputType="text" android:hint="overseas-hk" />
-
-        <TextView android:layout_width="match_parent" android:layout_height="wrap_content"
-            android:layout_marginTop="12dp" android:text="代理域名 DNS（可 exit://节点/IP 或 tls://IP#SNI）"
-            android:textSize="12sp" />
-        <EditText android:id="@+id/remoteDns" android:layout_width="match_parent"
-            android:layout_height="wrap_content" android:inputType="text"
-            android:hint="exit://overseas-hk/1.1.1.1:53" />
-
-        <TextView android:layout_width="match_parent" android:layout_height="wrap_content"
-            android:layout_marginTop="12dp" android:text="直连域名 DNS" android:textSize="12sp" />
-        <EditText android:id="@+id/directDns" android:layout_width="match_parent"
-            android:layout_height="wrap_content" android:inputType="text"
-            android:hint="udp://223.5.5.5" />
-
-        <TextView android:layout_width="match_parent" android:layout_height="wrap_content"
-            android:layout_marginTop="12dp" android:text="网络密钥 (64 位 hex，加密存储)"
-            android:textSize="12sp" />
-        <EditText android:id="@+id/secret" android:layout_width="match_parent"
-            android:layout_height="wrap_content" android:inputType="textPassword"
-            android:hint="留空则不修改" />
-
-        <com.google.android.material.button.MaterialButton
-            android:id="@+id/save" android:layout_width="match_parent"
-            android:layout_height="wrap_content" android:layout_marginTop="20dp"
-            android:text="保存（重启 VPN 生效）" />
+        <TextView android:layout_width="wrap_content" android:layout_height="wrap_content"
+            android:layout_marginStart="10dp" android:text="设置"
+            android:textSize="13sp" android:fontFamily="monospace"
+            android:letterSpacing="0.2" android:textColor="@color/text_2" />
     </LinearLayout>
-</ScrollView>
+
+    <ScrollView android:layout_width="match_parent" android:layout_height="0dp"
+        android:layout_weight="1" android:scrollbars="none" android:overScrollMode="never">
+        <LinearLayout android:layout_width="match_parent" android:layout_height="wrap_content"
+            android:orientation="vertical"
+            android:paddingStart="18dp" android:paddingEnd="18dp" android:paddingBottom="18dp">
+
+            <TextView style="@style/SectionLabel" android:layout_width="wrap_content"
+                android:layout_height="wrap_content" android:text="连接" />
+
+            <LinearLayout android:layout_width="match_parent" android:layout_height="wrap_content"
+                android:orientation="vertical" android:background="@drawable/bg_card"
+                android:padding="16dp">
+
+                <TextView style="@style/Micro" android:layout_width="wrap_content"
+                    android:layout_height="wrap_content" android:text="协调器地址" />
+                <EditText android:id="@+id/coordinator" android:layout_width="match_parent"
+                    android:layout_height="wrap_content" android:layout_marginTop="6dp"
+                    android:background="@null" android:textColor="@color/text"
+                    android:textSize="13sp" android:fontFamily="monospace"
+                    android:hint="47.109.61.89:9000" android:textColorHint="@color/text_3"
+                    android:inputType="text" android:importantForAutofill="no" />
+
+                <View android:layout_width="match_parent" android:layout_height="1dp"
+                    android:layout_marginTop="10dp" android:layout_marginBottom="10dp"
+                    android:background="@color/line" />
+
+                <TextView style="@style/Micro" android:layout_width="wrap_content"
+                    android:layout_height="wrap_content" android:text="节点名" />
+                <EditText android:id="@+id/name" android:layout_width="match_parent"
+                    android:layout_height="wrap_content" android:layout_marginTop="6dp"
+                    android:background="@null" android:textColor="@color/text"
+                    android:textSize="13sp" android:fontFamily="monospace"
+                    android:hint="android" android:textColorHint="@color/text_3"
+                    android:inputType="text" android:importantForAutofill="no" />
+
+                <View android:layout_width="match_parent" android:layout_height="1dp"
+                    android:layout_marginTop="10dp" android:layout_marginBottom="10dp"
+                    android:background="@color/line" />
+
+                <TextView style="@style/Micro" android:layout_width="wrap_content"
+                    android:layout_height="wrap_content" android:text="网络密钥（留空不修改）" />
+                <EditText android:id="@+id/secret" android:layout_width="match_parent"
+                    android:layout_height="wrap_content" android:layout_marginTop="6dp"
+                    android:background="@null" android:textColor="@color/text"
+                    android:textSize="13sp" android:fontFamily="monospace"
+                    android:hint="64 位 hex，Keystore 加密存储" android:textColorHint="@color/text_3"
+                    android:inputType="textPassword" android:importantForAutofill="no" />
+            </LinearLayout>
+
+            <TextView style="@style/SectionLabel" android:layout_width="wrap_content"
+                android:layout_height="wrap_content" android:text="DNS" />
+
+            <LinearLayout android:layout_width="match_parent" android:layout_height="wrap_content"
+                android:orientation="vertical" android:background="@drawable/bg_card"
+                android:padding="16dp">
+
+                <TextView style="@style/Micro" android:layout_width="wrap_content"
+                    android:layout_height="wrap_content" android:text="代理域名" />
+                <EditText android:id="@+id/remoteDns" android:layout_width="match_parent"
+                    android:layout_height="wrap_content" android:layout_marginTop="6dp"
+                    android:background="@null" android:textColor="@color/text"
+                    android:textSize="13sp" android:fontFamily="monospace"
+                    android:hint="exit://overseas-hk/1.1.1.1:53" android:textColorHint="@color/text_3"
+                    android:inputType="text" android:importantForAutofill="no" />
+
+                <View android:layout_width="match_parent" android:layout_height="1dp"
+                    android:layout_marginTop="10dp" android:layout_marginBottom="10dp"
+                    android:background="@color/line" />
+
+                <TextView style="@style/Micro" android:layout_width="wrap_content"
+                    android:layout_height="wrap_content" android:text="直连域名" />
+                <EditText android:id="@+id/directDns" android:layout_width="match_parent"
+                    android:layout_height="wrap_content" android:layout_marginTop="6dp"
+                    android:background="@null" android:textColor="@color/text"
+                    android:textSize="13sp" android:fontFamily="monospace"
+                    android:hint="udp://223.5.5.5" android:textColorHint="@color/text_3"
+                    android:inputType="text" android:importantForAutofill="no" />
+            </LinearLayout>
+
+            <TextView style="@style/SectionLabel" android:layout_width="wrap_content"
+                android:layout_height="wrap_content" android:text="默认出口" />
+
+            <LinearLayout android:layout_width="match_parent" android:layout_height="wrap_content"
+                android:orientation="vertical" android:background="@drawable/bg_card"
+                android:padding="16dp">
+
+                <TextView style="@style/Micro" android:layout_width="wrap_content"
+                    android:layout_height="wrap_content" android:text="出口节点名" />
+                <EditText android:id="@+id/exit" android:layout_width="match_parent"
+                    android:layout_height="wrap_content" android:layout_marginTop="6dp"
+                    android:background="@null" android:textColor="@color/text"
+                    android:textSize="13sp" android:fontFamily="monospace"
+                    android:hint="overseas-hk" android:textColorHint="@color/text_3"
+                    android:inputType="text" android:importantForAutofill="no" />
+            </LinearLayout>
+
+            <com.google.android.material.button.MaterialButton
+                android:id="@+id/save" style="@style/CtaButton"
+                android:layout_width="match_parent" android:layout_height="wrap_content"
+                android:layout_marginTop="22dp" android:text="保存并重启核心" />
+
+            <TextView android:layout_width="match_parent" android:layout_height="wrap_content"
+                android:layout_marginTop="18dp" android:text="yingzi 0.1.0 · YZP"
+                android:textSize="10sp" android:fontFamily="monospace"
+                android:letterSpacing="0.12" android:textColor="@color/text_3"
+                android:gravity="center" />
+        </LinearLayout>
+    </ScrollView>
+</LinearLayout>

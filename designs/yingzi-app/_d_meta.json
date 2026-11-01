@@ -1,0 +1,18 @@
+{
+  "type": "design",
+  "designSystems": [],
+  "primaryDesignSystem": null,
+  "assets": {
+    "yingzi Android 客户端 UI": {
+      "versions": [
+        {
+          "path": "Yingzi App.html",
+          "createdAt": "2026-11-01T13:17:29.257Z",
+          "status": "needs-review"
+        }
+      ]
+    }
+  },
+  "createdAt": "2026-11-01T13:17:29.258Z",
+  "updatedAt": "2026-11-01T13:17:29.258Z"
+}

@@ -49,6 +49,19 @@ pub struct TcpStackConfig {
     pub exit: Option<Arc<dyn ExitTcp>>,
     /// 连接数上限
     pub max_conns: usize,
+    /// 可选事件出口（Android 日志页；桌面端为 None）
+    pub events: Option<Arc<crate::state::CoreState>>,
+}
+
+/// 事件上报（无 CoreState 时静默）
+fn emit(cfg: &TcpStackConfig, level: &str, msg: String) {
+    if let Some(state) = &cfg.events {
+        let state = state.clone();
+        let level = level.to_string();
+        if let Ok(handle) = tokio::runtime::Handle::try_current() {
+            handle.spawn(async move { state.push_event(&level, msg).await });
+        }
+    }
 }
 
 pub struct TcpStack {
@@ -168,6 +181,7 @@ impl TcpStackConfig {
             protect: self.protect.clone(),
             exit: self.exit.clone(),
             max_conns: self.max_conns,
+            events: self.events.clone(),
         }
     }
 }
@@ -195,12 +209,14 @@ async fn handle_conn(
         Action::Block => {
             stat_blocked.fetch_add(1, Ordering::Relaxed);
             log::debug!("拦截 TCP {dst} ({})", decision.reason);
+            emit(&cfg, "BLOCK", format!("拦截 {dst} ({})", decision.reason));
             drop(client);
             Ok(())
         }
         Action::Direct => {
             stat_direct.fetch_add(1, Ordering::Relaxed);
             log::debug!("TCP {dst} <- {src} -> direct ({})", decision.reason);
+            emit(&cfg, "TCP", format!("{dst} → direct ({})", decision.reason));
             let up = connect_direct(dst, cfg.protect.as_ref())?;
             pipe(client, up).await
         }
@@ -210,6 +226,7 @@ async fn handle_conn(
             match (node, cfg.exit.clone()) {
                 (Some(node), Some(exit)) => {
                     log::debug!("TCP {dst} -> exit {node}");
+                    emit(&cfg, "TCP", format!("{dst} → exit {node}"));
                     let up = exit.open(&node, dst).await?;
                     pipe(client, up).await
                 }

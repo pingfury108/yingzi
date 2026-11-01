@@ -10,4 +10,5 @@ object YzCore {
     external fun nativeEvents(): String
     external fun nativeSetRules(json: String): Boolean
     external fun nativeIsRunning(): Boolean
+    external fun nativePushEvent(level: String, msg: String)
 }

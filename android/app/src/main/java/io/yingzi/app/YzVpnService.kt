@@ -26,6 +26,7 @@ class YzVpnService : VpnService() {
         private const val NOTIF_ID = 1001
         const val ACTION_START = "io.yingzi.app.START"
         const val ACTION_STOP = "io.yingzi.app.STOP"
+        const val ACTION_RESTART = "io.yingzi.app.RESTART"
     }
 
     private var tun: ParcelFileDescriptor? = null
@@ -37,6 +38,10 @@ class YzVpnService : VpnService() {
             ACTION_STOP -> {
                 stopVpn()
                 return START_NOT_STICKY
+            }
+            ACTION_RESTART -> {
+                restartCore()
+                return START_STICKY
             }
             else -> startVpn()
         }
@@ -97,6 +102,7 @@ class YzVpnService : VpnService() {
             return
         }
         updateNotification("已连接 · 出口 ${cfg.defaultExit}")
+        YzCore.nativePushEvent("INFO", "隧道已建立 · 出口 ${cfg.defaultExit}")
     }
 
     /** 网络切换（WiFi↔4G）：重建核心，避免 UDP 端点失效后长时间不可用 */
@@ -109,6 +115,7 @@ class YzVpnService : VpnService() {
                 if (now - lastRestart < 10_000) return
                 lastRestart = now
                 Log.i(TAG, "网络变化，重启核心")
+                YzCore.nativePushEvent("WARN", "网络变化，正在重建核心")
                 restartCore()
             }
         }
@@ -143,6 +150,7 @@ class YzVpnService : VpnService() {
     }
 
     private fun stopVpn() {
+        if (tun != null) YzCore.nativePushEvent("INFO", "隧道已断开")
         netCallback?.let {
             try { getSystemService(ConnectivityManager::class.java).unregisterNetworkCallback(it) } catch (_: Exception) {}
         }

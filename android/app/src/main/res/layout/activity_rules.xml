@@ -1,37 +1,83 @@
 <?xml version="1.0" encoding="utf-8"?>
 <LinearLayout xmlns:android="http://schemas.android.com/apk/res/android"
-    android:layout_width="match_parent"
-    android:layout_height="match_parent"
-    android:orientation="vertical"
-    android:padding="12dp">
+    xmlns:app="http://schemas.android.com/apk/res-auto"
+    android:layout_width="match_parent" android:layout_height="match_parent"
+    android:orientation="vertical" android:background="@color/bg">
 
-    <TextView android:layout_width="match_parent" android:layout_height="wrap_content"
-        android:text="分流规则（自上而下匹配，先命中先生效）" android:textSize="12sp" />
+    <LinearLayout android:layout_width="match_parent" android:layout_height="wrap_content"
+        android:orientation="horizontal" android:gravity="center_vertical"
+        android:paddingStart="18dp" android:paddingEnd="18dp"
+        android:paddingTop="14dp" android:paddingBottom="10dp">
+
+        <ImageButton android:id="@+id/back" android:layout_width="36dp" android:layout_height="36dp"
+            android:background="@drawable/bg_icon_btn" android:src="@drawable/ic_back"
+            app:tint="@color/text_2" android:contentDescription="返回" />
+
+        <TextView android:layout_width="0dp" android:layout_height="wrap_content"
+            android:layout_weight="1" android:layout_marginStart="10dp" android:text="分流规则"
+            android:textSize="13sp" android:fontFamily="monospace"
+            android:letterSpacing="0.2" android:textColor="@color/text_2" />
+    </LinearLayout>
+
+    <HorizontalScrollView android:layout_width="match_parent" android:layout_height="wrap_content"
+        android:paddingStart="18dp" android:paddingEnd="18dp" android:paddingBottom="10dp"
+        android:scrollbars="none" android:overScrollMode="never">
+        <LinearLayout android:id="@+id/seg" android:layout_width="wrap_content"
+            android:layout_height="wrap_content" android:orientation="horizontal" />
+    </HorizontalScrollView>
 
     <ScrollView android:layout_width="match_parent" android:layout_height="0dp"
-        android:layout_weight="1" android:layout_marginTop="8dp">
-        <LinearLayout android:id="@+id/ruleList" android:layout_width="match_parent"
-            android:layout_height="wrap_content" android:orientation="vertical" />
+        android:layout_weight="1" android:scrollbars="none" android:overScrollMode="never">
+        <LinearLayout android:layout_width="match_parent" android:layout_height="wrap_content"
+            android:orientation="vertical"
+            android:paddingStart="18dp" android:paddingEnd="18dp">
+
+            <LinearLayout android:id="@+id/ruleList" android:layout_width="match_parent"
+                android:layout_height="wrap_content" android:orientation="vertical" />
+
+            <TextView style="@style/SectionLabel" android:layout_width="wrap_content"
+                android:layout_height="wrap_content" android:text="常用模板" />
+
+            <HorizontalScrollView android:layout_width="match_parent" android:layout_height="wrap_content"
+                android:scrollbars="none" android:overScrollMode="never">
+                <LinearLayout android:id="@+id/presets" android:layout_width="wrap_content"
+                    android:layout_height="wrap_content" android:orientation="horizontal" />
+            </HorizontalScrollView>
+
+            <TextView android:layout_width="match_parent" android:layout_height="wrap_content"
+                android:layout_marginTop="18dp" android:text="自上而下匹配 · 先命中先生效"
+                android:textSize="11sp" android:textColor="@color/text_3"
+                android:gravity="center" />
+
+            <View android:layout_width="match_parent" android:layout_height="12dp" />
+        </LinearLayout>
     </ScrollView>
 
     <LinearLayout android:layout_width="match_parent" android:layout_height="wrap_content"
-        android:orientation="horizontal" android:layout_marginTop="8dp">
+        android:orientation="horizontal" android:gravity="center_vertical"
+        android:paddingStart="18dp" android:paddingEnd="18dp" android:paddingBottom="8dp">
+
         <EditText android:id="@+id/ruleInput" android:layout_width="0dp"
-            android:layout_height="wrap_content" android:layout_weight="1"
-            android:hint="geosite:google=exit" android:textSize="13sp"
-            android:inputType="text" />
+            android:layout_height="46dp" android:layout_weight="1"
+            android:background="@drawable/bg_card_inset"
+            android:paddingStart="14dp" android:paddingEnd="14dp"
+            android:hint="geosite:google=exit" android:textColorHint="@color/text_3"
+            android:textColor="@color/text" android:textSize="12sp"
+            android:fontFamily="monospace" android:inputType="text"
+            android:importantForAutofill="no" />
+
         <com.google.android.material.button.MaterialButton
-            android:id="@+id/addRule" android:layout_width="wrap_content"
-            android:layout_height="wrap_content" android:text="添加" />
+            android:id="@+id/addRule" style="@style/CtaButton"
+            android:layout_width="wrap_content" android:layout_height="46dp"
+            android:layout_marginStart="8dp" android:minWidth="0dp"
+            android:insetTop="0dp" android:insetBottom="0dp"
+            android:text="添加" />
     </LinearLayout>
 
-    <TextView android:layout_width="match_parent" android:layout_height="wrap_content"
-        android:layout_marginTop="8dp" android:text="常用模板" android:textSize="12sp" />
-    <LinearLayout android:id="@+id/presets" android:layout_width="match_parent"
-        android:layout_height="wrap_content" android:orientation="vertical" />
-
-    <com.google.android.material.button.MaterialButton
-        android:id="@+id/saveRules" android:layout_width="match_parent"
-        android:layout_height="wrap_content" android:layout_marginTop="8dp"
-        android:text="保存并立即生效" />
+    <com.google.android.material.bottomnavigation.BottomNavigationView
+        android:id="@+id/nav" android:layout_width="match_parent" android:layout_height="wrap_content"
+        android:background="@color/bg" app:menu="@menu/nav_main"
+        app:labelVisibilityMode="labeled" app:itemIconTint="@color/nav_item"
+        app:itemTextColor="@color/nav_item" app:itemActiveIndicatorStyle="@null"
+        app:itemRippleColor="@color/accent_soft" />
 </LinearLayout>

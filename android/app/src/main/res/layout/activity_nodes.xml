@@ -1,0 +1,35 @@
+<?xml version="1.0" encoding="utf-8"?>
+<LinearLayout xmlns:android="http://schemas.android.com/apk/res/android"
+    xmlns:app="http://schemas.android.com/apk/res-auto"
+    android:layout_width="match_parent" android:layout_height="match_parent"
+    android:orientation="vertical" android:background="@color/bg">
+
+    <LinearLayout android:layout_width="match_parent" android:layout_height="wrap_content"
+        android:orientation="horizontal" android:gravity="center_vertical"
+        android:paddingStart="18dp" android:paddingEnd="18dp"
+        android:paddingTop="14dp" android:paddingBottom="10dp">
+
+        <ImageButton android:id="@+id/back" android:layout_width="36dp" android:layout_height="36dp"
+            android:background="@drawable/bg_icon_btn" android:src="@drawable/ic_back"
+            app:tint="@color/text_2" android:contentDescription="返回" />
+
+        <TextView android:layout_width="wrap_content" android:layout_height="wrap_content"
+            android:layout_marginStart="10dp" android:text="出口节点"
+            android:textSize="13sp" android:fontFamily="monospace"
+            android:letterSpacing="0.2" android:textColor="@color/text_2" />
+    </LinearLayout>
+
+    <ScrollView android:layout_width="match_parent" android:layout_height="0dp"
+        android:layout_weight="1" android:scrollbars="none" android:overScrollMode="never">
+        <LinearLayout android:id="@+id/nodeList" android:layout_width="match_parent"
+            android:layout_height="wrap_content" android:orientation="vertical"
+            android:paddingStart="18dp" android:paddingEnd="18dp" android:paddingBottom="18dp" />
+    </ScrollView>
+
+    <com.google.android.material.bottomnavigation.BottomNavigationView
+        android:id="@+id/nav" android:layout_width="match_parent" android:layout_height="wrap_content"
+        android:background="@color/bg" app:menu="@menu/nav_main"
+        app:labelVisibilityMode="labeled" app:itemIconTint="@color/nav_item"
+        app:itemTextColor="@color/nav_item" app:itemActiveIndicatorStyle="@null"
+        app:itemRippleColor="@color/accent_soft" />
+</LinearLayout>

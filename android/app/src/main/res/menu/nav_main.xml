@@ -1,0 +1,7 @@
+<?xml version="1.0" encoding="utf-8"?>
+<menu xmlns:android="http://schemas.android.com/apk/res/android">
+    <item android:id="@+id/nav_status" android:icon="@drawable/ic_bolt" android:title="状态" />
+    <item android:id="@+id/nav_nodes" android:icon="@drawable/ic_globe" android:title="节点" />
+    <item android:id="@+id/nav_rules" android:icon="@drawable/ic_rules" android:title="规则" />
+    <item android:id="@+id/nav_log" android:icon="@drawable/ic_log" android:title="日志" />
+</menu>

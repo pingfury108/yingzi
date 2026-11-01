@@ -1,10 +1,12 @@
 package io.yingzi.app
 
+import android.content.Intent
 import android.os.Bundle
-import android.widget.Button
 import android.widget.EditText
+import android.widget.ImageButton
 import android.widget.Toast
 import androidx.appcompat.app.AppCompatActivity
+import com.google.android.material.button.MaterialButton
 
 class SettingsActivity : AppCompatActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
@@ -18,7 +20,9 @@ class SettingsActivity : AppCompatActivity() {
         findViewById<EditText>(R.id.remoteDns).setText(cfg.remoteDns)
         findViewById<EditText>(R.id.directDns).setText(cfg.directDns)
 
-        findViewById<Button>(R.id.save).setOnClickListener {
+        findViewById<ImageButton>(R.id.back).setOnClickListener { finish() }
+
+        findViewById<MaterialButton>(R.id.save).setOnClickListener {
             val secretInput = findViewById<EditText>(R.id.secret).text.toString().trim()
             NodeConfig.save(
                 this,
@@ -29,6 +33,9 @@ class SettingsActivity : AppCompatActivity() {
                 remoteDns = findViewById<EditText>(R.id.remoteDns).text.toString().trim(),
                 directDns = findViewById<EditText>(R.id.directDns).text.toString().trim(),
             )
+            if (YzCore.nativeIsRunning()) {
+                startService(Intent(this, YzVpnService::class.java).setAction(YzVpnService.ACTION_RESTART))
+            }
             Toast.makeText(this, "已保存", Toast.LENGTH_SHORT).show()
             finish()
         }

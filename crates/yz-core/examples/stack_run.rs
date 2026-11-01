@@ -160,6 +160,7 @@ async fn main() -> anyhow::Result<()> {
     let tcp = Arc::new(yz_core::tcp_stack::TcpStack::new(
         rs.clone(),
         yz_core::tcp_stack::TcpStackConfig {
+            events: None,
             mtu: 1400,
             protect: None,
             exit: exit_tcp,

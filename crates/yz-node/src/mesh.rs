@@ -14,19 +14,9 @@ pub const DEFAULT_TUN_NAME: &str = "utun5";
 #[cfg(not(target_os = "macos"))]
 pub const DEFAULT_TUN_NAME: &str = "yz0";
 
-/// 虚拟网段: 100.64.0.0/14 (避开阿里云/华为云 100.100.x 元数据段)
-const VIP_NET: u32 = 0x6440_0000; // 100.64.0.0
-const VIP_BITS: u32 = 18; // /14 → 18 位主机位
-const VIP_MASK_BITS: u32 = (1 << VIP_BITS) - 1;
-
 /// node_id(16 hex) → 100.64.0.0/14 内的确定性虚拟 IP
 pub fn vip_of(node_id: &str) -> Ipv4Addr {
-    let b = yz_crypto::from_hex(node_id).unwrap_or_else(|_| vec![0u8; 8]);
-    let mut raw = [0u8; 8];
-    let n = b.len().min(8);
-    raw[8 - n..].copy_from_slice(&b[b.len() - n..]);
-    let low = (u64::from_be_bytes(raw) & VIP_MASK_BITS as u64) as u32;
-    Ipv4Addr::from(VIP_NET | low)
+    yz_core::util::vip_of(node_id)
 }
 
 /// 桌面 TUN 设备的 PacketIo 实现
