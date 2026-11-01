@@ -33,6 +33,23 @@ class SettingsActivity : AppCompatActivity() {
         findViewById<android.view.View>(R.id.appsRow).setOnClickListener {
             startActivity(Intent(this, AppsActivity::class.java))
         }
+        val geoSub = findViewById<android.widget.TextView>(R.id.geoSub)
+        val geoAction = findViewById<android.widget.TextView>(R.id.geoAction)
+        geoSub.text = GeoData.info(this)
+        findViewById<android.view.View>(R.id.geoRow).setOnClickListener {
+            geoAction.text = "更新中…"
+            geoSub.text = "正在下载 geoip / geosite…"
+            GeoData.update(this) { msg ->
+                geoAction.text = "更新"
+                geoSub.text = GeoData.info(this)
+                Toast.makeText(this, msg, Toast.LENGTH_SHORT).show()
+                if (YzCore.nativeIsRunning()) {
+                    startService(
+                        Intent(this, YzVpnService::class.java).setAction(YzVpnService.ACTION_REBUILD)
+                    )
+                }
+            }
+        }
         findViewById<android.view.View>(R.id.shareRow).setOnClickListener {
             startActivity(Intent(this, ShareActivity::class.java))
         }

@@ -71,22 +71,7 @@ data class NodeConfig(
             "geoip:private=direct",
         )
 
-        fun geoipPath(ctx: Context): String = assetToFile(ctx, "geoip.dat")
-        fun geositePath(ctx: Context): String = assetToFile(ctx, "geosite.dat")
-
-        /** 把 asset 里的 geo 数据解压到 files 目录（首次启动） */
-        private fun assetToFile(ctx: Context, name: String): String {
-            val out = File(ctx.filesDir, name)
-            if (out.exists() && out.length() > 0) return out.absolutePath
-            try {
-                ctx.assets.open(name).use { input ->
-                    out.outputStream().use { output -> input.copyTo(output) }
-                }
-            } catch (_: Exception) {
-                // 没有内置数据时返回空路径（核心会跳过 geo 规则）
-                return ""
-            }
-            return out.absolutePath
-        }
+        fun geoipPath(ctx: Context): String = GeoData.geoip(ctx)
+        fun geositePath(ctx: Context): String = GeoData.geosite(ctx)
     }
 }
