@@ -19,6 +19,7 @@ object Nav {
             when (item.itemId) {
                 R.id.nav_status -> home(activity)
                 R.id.nav_nodes -> open(activity, NodesActivity::class.java)
+                R.id.nav_stats -> open(activity, StatsActivity::class.java)
                 R.id.nav_rules -> open(activity, RulesActivity::class.java)
                 R.id.nav_log -> open(activity, LogActivity::class.java)
             }

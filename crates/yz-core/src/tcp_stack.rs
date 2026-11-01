@@ -235,6 +235,14 @@ async fn handle_conn(
         Some(h) => format!("{h}:{}", dst.port()),
         None => dst.to_string(),
     };
+    if let (Some(h), Some(state)) = (&host, &cfg.events) {
+        let action = match &decision.action {
+            Action::Block => "block",
+            Action::Direct => "direct",
+            Action::Exit(_) => "exit",
+        };
+        state.bump_domain(h, action).await;
+    }
 
     match decision.action {
         Action::Block => {

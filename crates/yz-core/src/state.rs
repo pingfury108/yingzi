@@ -44,6 +44,8 @@ pub struct CoreState {
     pub udp_addr: RwLock<String>,
     /// P2P 连续失效计数: node_id → (次数, 降级截止时间)
     pub p2p_fail: RwLock<HashMap<String, (u32, std::time::Instant)>>,
+    /// 域名访问统计: 域名 → (次数, 动作)
+    pub domains: RwLock<HashMap<String, (u64, String)>>,
 }
 
 impl CoreState {
@@ -69,6 +71,19 @@ pub struct PersistedConfig {
 }
 
 impl CoreState {
+    /// 域名访问计数（用于统计页 TOP 榜）
+    pub async fn bump_domain(&self, domain: &str, action: &str) {
+        let mut m = self.domains.write().await;
+        if m.len() > 500 {
+            m.clear();
+        }
+        let e = m
+            .entry(domain.to_ascii_lowercase())
+            .or_insert((0, action.to_string()));
+        e.0 += 1;
+        e.1 = action.to_string();
+    }
+
     /// 汇总全网隧道流量统计: (tx字节, rx字节, 累计开流数)
     pub async fn traffic(&self) -> (u64, u64, u64) {
         let mut tx = 0u64;

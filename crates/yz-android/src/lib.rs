@@ -245,7 +245,7 @@ struct NodeRuntime {
 impl NodeRuntime {
     fn status(&self) -> StatusJson {
         let state = self.state.clone();
-        let (tx_bytes, rx_bytes, streams, peers, rtt_ms, nodes) = rt().block_on(async move {
+        let (tx_bytes, rx_bytes, streams, peers, rtt_ms, nodes, domains) = rt().block_on(async move {
             let traffic = state.traffic().await;
             let tunnels = state.tunnels.lock().await;
             let peers = tunnels.len();
@@ -268,6 +268,19 @@ impl NodeRuntime {
                 })
                 .collect();
             nodes.sort_by_key(|n| (n.rtt == 0, n.rtt));
+            let mut domains: Vec<DomainStat> = state
+                .domains
+                .read()
+                .await
+                .iter()
+                .map(|(k, (hits, action))| DomainStat {
+                    name: k.clone(),
+                    hits: *hits,
+                    action: action.clone(),
+                })
+                .collect();
+            domains.sort_by(|a, b| b.hits.cmp(&a.hits));
+            domains.truncate(20);
             let rtt_ms = rtt
                 .get(&self.exit)
                 .copied()
@@ -277,7 +290,7 @@ impl NodeRuntime {
                         .and_then(|n| rtt.get(&n.node_id).copied())
                 })
                 .unwrap_or(0);
-            (traffic.0, traffic.1, traffic.2, peers, rtt_ms, nodes)
+            (traffic.0, traffic.1, traffic.2, peers, rtt_ms, nodes, domains)
         });
         StatusJson {
             running: true,
@@ -286,6 +299,7 @@ impl NodeRuntime {
             rtt_ms,
             uptime_s: self.started.elapsed().as_secs(),
             nodes,
+            domains,
             tx_bytes,
             rx_bytes,
             streams,
@@ -312,6 +326,13 @@ impl NodeRuntime {
 }
 
 #[derive(Serialize)]
+struct DomainStat {
+    name: String,
+    hits: u64,
+    action: String,
+}
+
+#[derive(Serialize)]
 struct NodeStatus {
     node_id: String,
     name: String,
@@ -331,6 +352,7 @@ struct StatusJson {
     rtt_ms: u32,
     uptime_s: u64,
     nodes: Vec<NodeStatus>,
+    domains: Vec<DomainStat>,
     tx_bytes: u64,
     rx_bytes: u64,
     streams: u64,
