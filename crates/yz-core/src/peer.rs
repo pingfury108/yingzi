@@ -153,21 +153,36 @@ pub fn spawn_ctrl_handler(
     state: Option<Arc<CoreState>>,
     ingress: Option<(ExitAcl, (u16, u16))>,
 ) {
-    // 每 10s 发 PING: 兼作存活探测 + 维持 NAT 映射 (空闲也会发, 防止对称 NAT 映射过期)
+    // 心跳: 兼作存活探测 + 维持 NAT 映射。
+    // 自适应间隔: 活跃 10s / 空闲 30s —— 手机端省电（避免 10s 一次唤醒射频）
+    const PING_ACTIVE: Duration = Duration::from_secs(10);
+    const PING_IDLE: Duration = Duration::from_secs(30);
     if let Some(st) = &state {
         let t2 = t.clone();
         let pid = peer_id.clone();
         let st2 = st.clone();
         tokio::spawn(async move {
+            let mut interval = PING_ACTIVE;
             loop {
-                tokio::time::sleep(Duration::from_secs(10)).await;
+                tokio::time::sleep(interval).await;
                 if t2.is_closed() {
                     st2.rtt.write().await.remove(&pid);
                     break;
                 }
-                // 判定僵尸: 连续 45s 无任何入向数据 (PING 发出但无 PONG/数据回来)
-                if t2.is_dead(Duration::from_secs(45)).await {
-                    log::warn!("隧道无入向流量 45s, 判定失效: {}", &pid[..8.min(pid.len())]);
+                // 空闲超过 20s 降频到 30s；有流量立刻回到 10s
+                interval = if t2.idle_for().await < Duration::from_secs(20) {
+                    PING_ACTIVE
+                } else {
+                    PING_IDLE
+                };
+                // 判定僵尸: 两个心跳周期无任何入向数据 (PING 发出但无 PONG/数据回来)
+                let dead_after = interval * 2 + Duration::from_secs(5);
+                if t2.is_dead(dead_after).await {
+                    log::warn!(
+                        "隧道无入向流量 {}s, 判定失效: {}",
+                        dead_after.as_secs(),
+                        &pid[..8.min(pid.len())]
+                    );
                     st2.push_event("warn", format!("隧道失效: {}", &pid[..8.min(pid.len())]))
                         .await;
                     st2.rtt.write().await.remove(&pid);

@@ -24,6 +24,21 @@ class SettingsActivity : AppCompatActivity() {
         findViewById<android.view.View>(R.id.appsRow).setOnClickListener {
             startActivity(Intent(this, AppsActivity::class.java))
         }
+        findViewById<android.view.View>(R.id.batteryRow).setOnClickListener {
+            val pm = getSystemService(android.os.PowerManager::class.java)
+            if (!pm.isIgnoringBatteryOptimizations(packageName)) {
+                try {
+                    startActivity(
+                        Intent(android.provider.Settings.ACTION_REQUEST_IGNORE_BATTERY_OPTIMIZATIONS)
+                            .setData(android.net.Uri.parse("package:$packageName"))
+                    )
+                } catch (e: Exception) {
+                    startActivity(Intent(android.provider.Settings.ACTION_IGNORE_BATTERY_OPTIMIZATION_SETTINGS))
+                }
+            } else {
+                Toast.makeText(this, "已忽略电池优化", Toast.LENGTH_SHORT).show()
+            }
+        }
 
         findViewById<MaterialButton>(R.id.save).setOnClickListener {
             val secretInput = findViewById<EditText>(R.id.secret).text.toString().trim()
@@ -55,5 +70,10 @@ class SettingsActivity : AppCompatActivity() {
         findViewById<android.widget.TextView>(R.id.appsMode).text = mode
         findViewById<android.widget.TextView>(R.id.appsSub).text =
             if (AppRules.mode(this) == AppRules.GLOBAL) "所有应用走 VPN" else "已选 $n 个应用"
+
+        val ignoring = getSystemService(android.os.PowerManager::class.java)
+            .isIgnoringBatteryOptimizations(packageName)
+        findViewById<android.widget.TextView>(R.id.batterySub).text =
+            if (ignoring) "已授权，核心可持续运行" else "未授权，系统可能随时结束核心"
     }
 }

@@ -33,6 +33,9 @@ class MainActivity : AppCompatActivity() {
 
     private val handler = Handler(Looper.getMainLooper())
     private val vpnPerm = 1001
+    /** 状态读取放到单独线程：nativeStatus 内部会 block_on，不能占用主线程 */
+    private val poller = java.util.concurrent.Executors.newSingleThreadExecutor()
+    @Volatile private var polling = false
 
     private var lastRx = 0L
     private var lastTx = 0L
@@ -41,8 +44,8 @@ class MainActivity : AppCompatActivity() {
 
     private val tick = object : Runnable {
         override fun run() {
-            refresh()
-            handler.postDelayed(this, 1200)
+            pollAsync()
+            handler.postDelayed(this, 1500)
         }
     }
 
@@ -113,21 +116,28 @@ class MainActivity : AppCompatActivity() {
             )
         }
         chipsBuilt = false
-        refresh()
+        pollAsync()
     }
 
     // ---------- 状态刷新 ----------
-    private fun refresh() {
-        val running = YzCore.nativeIsRunning()
-        applyState(running)
-        if (!running) return
-
-        val s = try {
-            JSONObject(YzCore.nativeStatus())
-        } catch (e: Exception) {
-            return
+    private fun pollAsync() {
+        if (polling) return
+        polling = true
+        poller.execute {
+            val running = YzCore.nativeIsRunning()
+            val json = if (running) YzCore.nativeStatus() else ""
+            handler.post {
+                polling = false
+                if (isFinishing) return@post
+                applyStatus(running, json)
+            }
         }
+    }
 
+    private fun applyStatus(running: Boolean, json: String) {
+        applyState(running)
+        if (!running || json.isEmpty()) return
+        val s = try { JSONObject(json) } catch (e: Exception) { return }
         // 速率（字节差 → MB/s）
         val now = System.currentTimeMillis()
         val rx = s.optLong("rx_bytes")
@@ -235,5 +245,10 @@ class MainActivity : AppCompatActivity() {
     override fun onPause() {
         super.onPause()
         handler.removeCallbacks(tick)
+    }
+
+    override fun onDestroy() {
+        poller.shutdownNow()
+        super.onDestroy()
     }
 }
