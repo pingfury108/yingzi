@@ -1,6 +1,6 @@
 # Android 客户端方案（路径 B · 流级分流）
 
-> 状态：P1 进行中 ｜ 目标设备：Xiaomi MIX 4 (odin) / Android 14 (SDK 34) / arm64-v8a
+> 状态：P1–P5 完成（Android 客户端已跑通） ｜ 目标设备：Xiaomi MIX 4 (odin) / Android 14 (SDK 34) / arm64-v8a
 > 关联文档：[plan.md](plan.md)（协议与桌面端）｜ [deploy.md](deploy.md)（部署）
 
 ## 1. 定位
@@ -155,7 +155,7 @@ nativeDnsQuery(...)
 | **P2** | 规则引擎 + geoip/geosite 解析（含命中追踪） | 真实 .dat 解析 + 规则单测 | 4–5 天 |
 | **P3** | DNS 代理（Block/Direct/Exit + 缓存） | DNS 用例集；拦截率；污染域 | 3–4 天 |
 | **P4** | smoltcp 栈（Linux 上用 TUN 验证） | 整机流量按规则分流 | 7–10 天 |
-| **P5** | `yz-android` JNI + Kotlin 壳 | 真机：翻墙 + vIP + App 绕过 | 5–7 天 |
+| **P5** ✔ | `yz-android` JNI + Kotlin 壳（VpnService 全隧道 + 前台服务 + 极简 UI） | 真机：curl 出口 IP = 149.129.41.181，google 204 | 已完成 |
 | **P6** | 网络切换自愈、保活、Keystore、Always-on | 24h 稳定、WiFi↔4G | 4–6 天 |
 | **P7** | fake-IP、SNI 嗅探、多出口、统计图表、二维码 | 体验完善 | 4–6 天 |
 
@@ -169,6 +169,27 @@ nativeDnsQuery(...)
 | 对称 NAT 打洞失败 | 中继兜底 + 短打洞快速降级 |
 | geo 数据许可 | 运行时下载；核对后决定是否内置 |
 | 电耗 | 空闲保活 30s、灭屏降频 |
+
+## 10.1 真机验证记录（P5）
+
+设备: Xiaomi MIX 4 (odin) / Android 14 / arm64-v8a，adb 在 pcw 上
+
+```
+安装: adb install app-debug.apk (20MB, 含 geo 数据)
+授权: adb shell cmd appops set io.yingzi.app ACTIVATE_VPN allow
+启动: adb shell am start -n io.yingzi.app/.MainActivity --ez autostart true
+
+验证:
+  curl ifconfig.me → 149.129.41.181   (海外出口节点)  ✓
+  curl google/generate_204 → 204                        ✓
+  关闭 VPN 后 → 123.139.9.92 (家庭 IP)                  ✓
+  分流统计: direct 36 / exit 3, DNS 0 失败               ✓
+```
+
+**踩坑记录**：
+- `VpnService.Builder.setBlocking(false)` 会让 TUN fd 非阻塞 → 读线程 EAGAIN 立即退出（必须保持阻塞读）
+- 服务 `exported=false` 时 adb 无法直接启动 → 用 Activity 的 `autostart` extra
+- `addDisallowedApplication` + `protect(fd)` 两者都要（前者排除自身进程，后者逐 socket 兜底）
 
 ## 11. 构建与测试环境
 
