@@ -5,11 +5,13 @@
 
 pub mod dns;
 pub mod exit_dns;
+pub mod exit_udp;
 pub mod geo;
 pub mod ingress;
 pub mod mesh;
 pub mod peer;
 pub mod policy;
+pub mod stack;
 pub mod state;
 pub mod tunnel;
 pub mod util;
