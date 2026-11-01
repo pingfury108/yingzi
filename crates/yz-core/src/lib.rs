@@ -6,6 +6,7 @@
 pub mod dns;
 pub mod exit_dns;
 pub mod exit_udp;
+pub mod fakeip;
 pub mod geo;
 pub mod ingress;
 pub mod mesh;

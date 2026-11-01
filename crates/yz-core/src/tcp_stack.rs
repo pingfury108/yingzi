@@ -51,6 +51,10 @@ pub struct TcpStackConfig {
     pub max_conns: usize,
     /// 可选事件出口（Android 日志页；桌面端为 None）
     pub events: Option<Arc<crate::state::CoreState>>,
+    /// fake-IP 池：命中则按域名分流，真实解析推迟到连接时
+    pub fakeip: Option<Arc<crate::fakeip::FakeIp>>,
+    /// 域名解析（fake-IP 模式下把假地址换成真实地址）
+    pub dns: Option<Arc<crate::dns::DnsService>>,
 }
 
 /// 事件上报（无 CoreState 时静默）
@@ -182,6 +186,8 @@ impl TcpStackConfig {
             exit: self.exit.clone(),
             max_conns: self.max_conns,
             events: self.events.clone(),
+            fakeip: self.fakeip.clone(),
+            dns: self.dns.clone(),
         }
     }
 }
@@ -198,26 +204,51 @@ async fn handle_conn(
     stat_exit: Arc<AtomicU64>,
     stat_blocked: Arc<AtomicU64>,
 ) -> Result<()> {
-    let decision = rules.decide_ip(match dst.ip() {
+    let dst_ip = match dst.ip() {
         std::net::IpAddr::V4(v4) => v4,
-        std::net::IpAddr::V6(_) => {
-            return Ok(()); // 暂只支持 IPv4
+        std::net::IpAddr::V6(_) => return Ok(()), // 暂只支持 IPv4
+    };
+
+    // fake-IP：命中则用域名决策，并把假地址解析成真实地址
+    let host = cfg.fakeip.as_ref().and_then(|p| p.domain(dst_ip));
+    let decision = match &host {
+        Some(h) => rules.decide_domain(h),
+        None => rules.decide_ip(dst_ip),
+    };
+    let mut target = dst;
+    if let Some(h) = &host {
+        if let Some(dns) = &cfg.dns {
+            match dns.resolve(h).await {
+                Ok(ips) => {
+                    if let Some(v4) = ips.iter().find_map(|ip| match ip {
+                        std::net::IpAddr::V4(v) => Some(*v),
+                        _ => None,
+                    }) {
+                        target = SocketAddr::new(std::net::IpAddr::V4(v4), dst.port());
+                    }
+                }
+                Err(e) => log::debug!("fake-ip 解析失败 {h}: {e:#}"),
+            }
         }
-    });
+    }
+    let label = match &host {
+        Some(h) => format!("{h}:{}", dst.port()),
+        None => dst.to_string(),
+    };
 
     match decision.action {
         Action::Block => {
             stat_blocked.fetch_add(1, Ordering::Relaxed);
-            log::debug!("拦截 TCP {dst} ({})", decision.reason);
-            emit(&cfg, "BLOCK", format!("拦截 {dst} ({})", decision.reason));
+            log::debug!("拦截 TCP {label} ({})", decision.reason);
+            emit(&cfg, "BLOCK", format!("拦截 {label} ({})", decision.reason));
             drop(client);
             Ok(())
         }
         Action::Direct => {
             stat_direct.fetch_add(1, Ordering::Relaxed);
-            log::debug!("TCP {dst} <- {src} -> direct ({})", decision.reason);
-            emit(&cfg, "TCP", format!("{dst} → direct ({})", decision.reason));
-            let up = connect_direct(dst, cfg.protect.as_ref())?;
+            log::debug!("TCP {label} <- {src} -> direct ({})", decision.reason);
+            emit(&cfg, "TCP", format!("{label} → direct ({})", decision.reason));
+            let up = connect_direct(target, cfg.protect.as_ref())?;
             pipe(client, up).await
         }
         Action::Exit(node) => {
@@ -225,14 +256,14 @@ async fn handle_conn(
             let node = node.or(default_exit);
             match (node, cfg.exit.clone()) {
                 (Some(node), Some(exit)) => {
-                    log::debug!("TCP {dst} -> exit {node}");
-                    emit(&cfg, "TCP", format!("{dst} → exit {node}"));
-                    let up = exit.open(&node, dst).await?;
+                    log::debug!("TCP {label} -> exit {node}");
+                    emit(&cfg, "TCP", format!("{label} → exit {node}"));
+                    let up = exit.open(&node, target).await?;
                     pipe(client, up).await
                 }
                 _ => {
-                    log::warn!("未配置出口通道, {dst} 回退直连");
-                    let up = connect_direct(dst, cfg.protect.as_ref())?;
+                    log::warn!("未配置出口通道, {label} 回退直连");
+                    let up = connect_direct(target, cfg.protect.as_ref())?;
                     pipe(client, up).await
                 }
             }

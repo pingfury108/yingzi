@@ -157,6 +157,7 @@ nativeDnsQuery(...)
 | **P4** | smoltcp 栈（Linux 上用 TUN 验证） | 整机流量按规则分流 | 7–10 天 |
 | **P5** ✔ | `yz-android` JNI + Kotlin 壳（VpnService 全隧道 + 前台服务 + 极简 UI） | 真机：curl 出口 IP = 149.129.41.181，google 204 | 已完成 |
 | **P6** | 网络切换自愈、保活、Keystore、Always-on | 24h 稳定、WiFi↔4G | 4–6 天 |
+| **P7a** ✔ | fake-IP（198.18.0.0/15，代理域名按域名分流） | 真机：google→198.18.0.1，baidu→真实 IP，日志显示域名决策 | 已完成 |
 | **P7** | fake-IP、SNI 嗅探、多出口、统计图表、二维码 | 体验完善 | 4–6 天 |
 
 ## 10. 风险

@@ -71,6 +71,13 @@ struct StartConfig {
     /// 直连域名用的 DNS
     #[serde(default)]
     direct_dns: Option<String>,
+    /// fake-IP 模式（被代理域名返回 198.18.x.x 假地址）
+    #[serde(default = "default_true")]
+    fake_ip: bool,
+}
+
+fn default_true() -> bool {
+    true
 }
 
 fn default_name() -> String {
@@ -442,7 +449,15 @@ fn start_async(cfg: StartConfig, protect: Option<Arc<dyn SocketProtect>>) -> Res
         direct: vec![Upstream::parse(&direct)?],
         ..Default::default()
     };
+    let fakeip = if cfg.fake_ip {
+        Some(Arc::new(yz_core::fakeip::FakeIp::new()))
+    } else {
+        None
+    };
     let mut dns = DnsService::new(ruleset.clone(), dns_cfg, protect.clone());
+    if let Some(pool) = &fakeip {
+        dns = dns.with_fake_ip(pool.clone());
+    }
     dns = dns.with_exit_query(Arc::new(yz_core::exit_dns::TunnelExitDns::new(
         state.clone(),
         ns.clone(),
@@ -474,6 +489,7 @@ fn start_async(cfg: StartConfig, protect: Option<Arc<dyn SocketProtect>>) -> Res
             dns: Some(dns.clone()),
             protect: protect.clone(),
             exit: Some(exit_udp),
+            fakeip: fakeip.clone(),
             ..Default::default()
         },
     ));
@@ -483,6 +499,8 @@ fn start_async(cfg: StartConfig, protect: Option<Arc<dyn SocketProtect>>) -> Res
         ruleset.clone(),
         TcpStackConfig {
             events: Some(state.clone()),
+            fakeip: fakeip.clone(),
+            dns: Some(dns.clone()),
             mtu: cfg.mtu,
             protect,
             exit: Some(exit_tcp),

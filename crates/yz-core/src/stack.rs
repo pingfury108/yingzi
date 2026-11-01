@@ -189,6 +189,8 @@ pub struct StackConfig {
     pub exit: Option<Arc<dyn ExitUdp>>,
     /// 空闲流回收时间
     pub idle_timeout: Duration,
+    /// fake-IP 池：命中则按域名分流
+    pub fakeip: Option<Arc<crate::fakeip::FakeIp>>,
 }
 
 impl Default for StackConfig {
@@ -199,6 +201,7 @@ impl Default for StackConfig {
             protect: None,
             exit: None,
             idle_timeout: Duration::from_secs(60),
+            fakeip: None,
         }
     }
 }
@@ -250,9 +253,23 @@ impl Stack {
             }
         }
 
-        // 2) 规则决策（按目的 IP）
-        let dst = SocketAddr::new(IpAddr::V4(u.dst), u.dst_port);
-        let decision = self.rules.decide_ip(u.dst);
+        // 2) 规则决策（fake-IP 命中时按域名，否则按目的 IP）
+        let mut dst = SocketAddr::new(IpAddr::V4(u.dst), u.dst_port);
+        let host = self.cfg.fakeip.as_ref().and_then(|p| p.domain(u.dst));
+        let decision = match &host {
+            Some(h) => self.rules.decide_domain(h),
+            None => self.rules.decide_ip(u.dst),
+        };
+        if let (Some(h), Some(dns)) = (&host, &self.cfg.dns) {
+            if let Ok(ips) = dns.resolve(h).await {
+                if let Some(v4) = ips.iter().find_map(|ip| match ip {
+                    IpAddr::V4(v) => Some(*v),
+                    _ => None,
+                }) {
+                    dst = SocketAddr::new(IpAddr::V4(v4), u.dst_port);
+                }
+            }
+        }
         match decision.action {
             Action::Block => {
                 self.stat_blocked.fetch_add(1, Ordering::Relaxed);

@@ -129,6 +129,7 @@ class YzVpnService : VpnService() {
             put("geosite", NodeConfig.geositePath(this@YzVpnService))
             put("rules", org.json.JSONArray(Rules.load(this@YzVpnService)))
             put("tun_fd", pfd.fd)
+            put("fake_ip", cfg.fakeIp)
             put("mtu", 1400)
         }
 
@@ -181,6 +182,7 @@ class YzVpnService : VpnService() {
             put("geosite", NodeConfig.geositePath(this@YzVpnService))
             put("rules", org.json.JSONArray(Rules.load(this@YzVpnService)))
             put("tun_fd", pfd.fd)
+            put("fake_ip", cfg.fakeIp)
             put("mtu", 1400)
         }
         val err = YzCore.nativeStart(config.toString(), this)

@@ -21,6 +21,15 @@ class SettingsActivity : AppCompatActivity() {
         findViewById<EditText>(R.id.directDns).setText(cfg.directDns)
 
         findViewById<ImageButton>(R.id.back).setOnClickListener { finish() }
+        findViewById<androidx.appcompat.widget.SwitchCompat>(R.id.fakeIpSwitch).apply {
+            isChecked = cfg.fakeIp
+            setOnCheckedChangeListener { _, v ->
+                NodeConfig.save(
+                    this@SettingsActivity, cfg.networkSecret, cfg.coordinator, cfg.name,
+                    cfg.defaultExit, cfg.remoteDns, cfg.directDns, v,
+                )
+            }
+        }
         findViewById<android.view.View>(R.id.appsRow).setOnClickListener {
             startActivity(Intent(this, AppsActivity::class.java))
         }

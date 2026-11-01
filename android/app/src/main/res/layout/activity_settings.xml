@@ -116,6 +116,27 @@
             </LinearLayout>
 
             <TextView style="@style/SectionLabel" android:layout_width="wrap_content"
+                android:layout_height="wrap_content" android:text="DNS" />
+
+            <LinearLayout android:layout_width="match_parent" android:layout_height="wrap_content"
+                android:orientation="horizontal" android:gravity="center_vertical"
+                android:background="@drawable/bg_card" android:padding="16dp">
+
+                <LinearLayout android:layout_width="0dp" android:layout_height="wrap_content"
+                    android:layout_weight="1" android:orientation="vertical">
+                    <TextView android:layout_width="wrap_content" android:layout_height="wrap_content"
+                        android:text="Fake-IP 模式" android:textSize="14sp" android:textColor="@color/text" />
+                    <TextView android:layout_width="wrap_content" android:layout_height="wrap_content"
+                        android:layout_marginTop="4dp" android:text="代理域名立即返回假地址，连接时按域名分流"
+                        android:textSize="11sp" android:fontFamily="monospace" android:textColor="@color/text_3" />
+                </LinearLayout>
+
+                <androidx.appcompat.widget.SwitchCompat
+                    android:id="@+id/fakeIpSwitch" android:layout_width="wrap_content"
+                    android:layout_height="wrap_content" />
+            </LinearLayout>
+
+            <TextView style="@style/SectionLabel" android:layout_width="wrap_content"
                 android:layout_height="wrap_content" android:text="应用分流" />
 
             <LinearLayout android:id="@+id/appsRow" android:layout_width="match_parent"

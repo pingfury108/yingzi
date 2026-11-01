@@ -530,6 +530,8 @@ impl Default for DnsConfig {
 }
 
 pub struct DnsService {
+    /// fake-IP 池（None = 关闭）
+    pub fakeip: Option<Arc<crate::fakeip::FakeIp>>,
     rules: Arc<RuleSet>,
     cfg: DnsConfig,
     cache: Mutex<DnsCache>,
@@ -545,6 +547,7 @@ pub struct DnsService {
 impl DnsService {
     pub fn new(rules: Arc<RuleSet>, cfg: DnsConfig, protect: Option<Arc<dyn SocketProtect>>) -> Self {
         Self {
+            fakeip: None,
             rules,
             cfg,
             cache: Mutex::new(DnsCache::default()),
@@ -557,6 +560,26 @@ impl DnsService {
         }
     }
 
+    /// 启用 fake-IP：被代理的域名立即返回假地址
+    pub fn with_fake_ip(mut self, pool: Arc<crate::fakeip::FakeIp>) -> Self {
+        self.fakeip = Some(pool);
+        self
+    }
+
+    /// 供 TCP/UDP 栈使用：解析域名（走本服务的规则与上游）
+    /// 注意：这里必须返回真实地址，不能再走 fake-IP 分支（否则死循环）
+    pub async fn resolve(&self, name: &str) -> Result<Vec<IpAddr>> {
+        let query = Message::query(name, 1);
+        let resp = self.handle_query_opt(&query, false).await?;
+        let parsed = Message::parse(&resp)?;
+        Ok(parsed
+            .answers
+            .iter()
+            .map(|(_, _, _, ip)| *ip)
+            .filter(|ip| !ip.is_unspecified())
+            .collect())
+    }
+
     /// 注入"经出口节点解析"的通道
     pub fn with_exit_query(mut self, exit: Arc<dyn ExitDnsQuery>) -> Self {
         self.exit = Some(exit);
@@ -565,6 +588,10 @@ impl DnsService {
 
     /// 处理一条 DNS 查询报文，返回应答报文
     pub async fn handle_query(&self, raw: &[u8]) -> Result<Vec<u8>> {
+        self.handle_query_opt(raw, true).await
+    }
+
+    async fn handle_query_opt(&self, raw: &[u8], allow_fake: bool) -> Result<Vec<u8>> {
         let msg = Message::parse(raw)?;
         let q = msg
             .questions
@@ -586,6 +613,17 @@ impl DnsService {
                 return Ok(build_response(msg.id, &q, &ans, 0));
             }
             _ => {}
+        }
+
+        // 1.5) fake-IP：被代理的域名直接给假地址（A 记录）
+        //      直连域名仍走真实解析，避免国内站点受假地址影响
+        if let Some(pool) = &self.fakeip {
+            if allow_fake && q.qtype == 1 && matches!(decision.action, Action::Exit(_)) {
+                let ip = pool.alloc(&name);
+                self.stat_remote
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                return Ok(build_response(msg.id, &q, &[(30u32, IpAddr::V4(ip))], 0));
+            }
         }
 
         // 2) 缓存

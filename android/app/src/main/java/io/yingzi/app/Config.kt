@@ -14,6 +14,7 @@ data class NodeConfig(
     val defaultExit: String,
     val remoteDns: String,
     val directDns: String,
+    val fakeIp: Boolean,
 ) {
     companion object {
         // 与现有 6 节点同一网络（部署时生成）
@@ -34,6 +35,7 @@ data class NodeConfig(
                 defaultExit = prefs.getString("exit", "overseas-hk")!!,
                 remoteDns = prefs.getString("remoteDns", "exit://overseas-hk/1.1.1.1:53")!!,
                 directDns = prefs.getString("directDns", "udp://223.5.5.5")!!,
+                fakeIp = prefs.getBoolean("fakeIp", true),
             )
         }
 
@@ -46,6 +48,7 @@ data class NodeConfig(
             exit: String,
             remoteDns: String,
             directDns: String,
+            fakeIp: Boolean = true,
         ) {
             ctx.getSharedPreferences("yz", Context.MODE_PRIVATE).edit().apply {
                 putString("secret_enc", SecureStore.encrypt(ctx, secret))
@@ -55,6 +58,7 @@ data class NodeConfig(
                 putString("exit", exit)
                 putString("remoteDns", remoteDns)
                 putString("directDns", directDns)
+                putBoolean("fakeIp", fakeIp)
                 apply()
             }
         }
