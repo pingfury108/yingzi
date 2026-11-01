@@ -183,6 +183,25 @@
                     android:contentDescription="设置" />
             </LinearLayout>
 
+            <LinearLayout android:id="@+id/alwaysOnRow" android:layout_width="match_parent"
+                android:layout_height="wrap_content" android:orientation="horizontal"
+                android:gravity="center_vertical" android:background="@drawable/bg_card"
+                android:padding="16dp">
+
+                <LinearLayout android:layout_width="0dp" android:layout_height="wrap_content"
+                    android:layout_weight="1" android:orientation="vertical">
+                    <TextView android:layout_width="wrap_content" android:layout_height="wrap_content"
+                        android:text="始终开启 VPN" android:textSize="14sp" android:textColor="@color/text" />
+                    <TextView android:layout_width="wrap_content" android:layout_height="wrap_content"
+                        android:layout_marginTop="4dp" android:text="在系统设置中开启后，开机与网络切换会自动连接"
+                        android:textSize="11sp" android:fontFamily="monospace" android:textColor="@color/text_3" />
+                </LinearLayout>
+
+                <ImageView android:layout_width="16dp" android:layout_height="16dp"
+                    android:src="@drawable/ic_chevron" app:tint="@color/text_3"
+                    android:contentDescription="打开系统设置" />
+            </LinearLayout>
+
             <com.google.android.material.button.MaterialButton
                 android:id="@+id/save" style="@style/CtaButton"
                 android:layout_width="match_parent" android:layout_height="wrap_content"

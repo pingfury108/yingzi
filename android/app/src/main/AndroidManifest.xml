@@ -48,6 +48,17 @@
             android:exported="false" />
 
         <service
+            android:name=".YzTileService"
+            android:exported="true"
+            android:icon="@drawable/ic_notif"
+            android:label="yingzi"
+            android:permission="android.permission.BIND_QUICK_SETTINGS_TILE">
+            <intent-filter>
+                <action android:name="android.service.quicksettings.action.QS_TILE" />
+            </intent-filter>
+        </service>
+
+        <service
             android:name=".YzVpnService"
             android:exported="false"
             android:permission="android.permission.BIND_VPN_SERVICE"

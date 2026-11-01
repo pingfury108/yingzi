@@ -615,6 +615,12 @@ impl DnsService {
             _ => {}
         }
 
+        // 1.4) IPv6：栈只支持 IPv4，AAAA/HTTPS(65) 直接返回空记录
+        //      —— 否则应用会先尝试 IPv6 连接、超时后才回退，明显拖慢首屏
+        if q.qtype == 28 || q.qtype == 65 {
+            return Ok(build_response(msg.id, &q, &[], 0));
+        }
+
         // 1.5) fake-IP：被代理的域名直接给假地址（A 记录）
         //      直连域名仍走真实解析，避免国内站点受假地址影响
         if let Some(pool) = &self.fakeip {

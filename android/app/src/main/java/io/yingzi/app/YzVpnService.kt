@@ -222,16 +222,24 @@ class YzVpnService : VpnService() {
     }
 
     private fun buildNotification(text: String): Notification {
-        val pi = PendingIntent.getActivity(
+        val open = PendingIntent.getActivity(
             this, 0, Intent(this, MainActivity::class.java),
             PendingIntent.FLAG_IMMUTABLE
         )
-        return Notification.Builder(this, CHANNEL)
+        val stop = PendingIntent.getService(
+            this, 1,
+            Intent(this, YzVpnService::class.java).setAction(ACTION_STOP),
+            PendingIntent.FLAG_IMMUTABLE
+        )
+        return androidx.core.app.NotificationCompat.Builder(this, CHANNEL)
             .setContentTitle("yingzi")
             .setContentText(text)
             .setSmallIcon(R.drawable.ic_notif)
-            .setContentIntent(pi)
+            .setContentIntent(open)
             .setOngoing(true)
+            .setPriority(androidx.core.app.NotificationCompat.PRIORITY_LOW)
+            .addAction(R.drawable.ic_power, "断开", stop)
+            .addAction(R.drawable.ic_globe, "打开", open)
             .build()
     }
 

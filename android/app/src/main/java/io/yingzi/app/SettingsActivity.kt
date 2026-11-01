@@ -33,6 +33,14 @@ class SettingsActivity : AppCompatActivity() {
         findViewById<android.view.View>(R.id.appsRow).setOnClickListener {
             startActivity(Intent(this, AppsActivity::class.java))
         }
+        findViewById<android.view.View>(R.id.alwaysOnRow).setOnClickListener {
+            try {
+                startActivity(Intent(android.provider.Settings.ACTION_VPN_SETTINGS))
+                Toast.makeText(this, "找到 yingzi，开启「始终开启 VPN」", Toast.LENGTH_LONG).show()
+            } catch (e: Exception) {
+                startActivity(Intent(android.provider.Settings.ACTION_SETTINGS))
+            }
+        }
         findViewById<android.view.View>(R.id.batteryRow).setOnClickListener {
             val pm = getSystemService(android.os.PowerManager::class.java)
             if (!pm.isIgnoringBatteryOptimizations(packageName)) {
