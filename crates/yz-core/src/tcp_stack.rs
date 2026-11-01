@@ -1,40 +1,31 @@
-//! tcp_stack: TCP 用户态终结（smoltcp）+ 按规则分流
+//! tcp_stack: TCP 用户态终结（基于 netstack-smoltcp，MIT）
 //!
 //! ⚠️ 状态: 实验性（P4b 未完成）
-//! 已验证: any_ip + 本地 IP/默认路由配置后，smoltcp 能接受任意目的地址的 SYN
-//!         并建立连接；上游连接地址取自 local_endpoint（透明代理语义正确）
-//! 未解决: SYN 重传会重复创建监听 socket → 连接风暴 + FD 耗尽
-//!         （需要按 4 元组复用 socket，或 accept 后立即补建监听并依赖 smoltcp 的 4 元组匹配）
-//!         因此暂不接入生产（yz-node / Android）。
+//! 已验证: netstack-smoltcp 能接受任意目的地址的 TCP 连接（握手成功），
+//!         目标地址/客户端地址语义正确，决策与上游直连均能触发
+//! 未解决: 数据面（握手后客户端数据未贯通），客户端会反复重连
+//!         因此暂不接入 yz-node / Android
 //!
-//! 数据流：
-//!   TUN 包 → smoltcp 终结 TCP 连接 → 决策（Direct/Exit/Block）
-//!        ├─ Direct → 真实 TCP（经 SocketProtect 绕过 VPN）
-//!        └─ Exit   → 出口节点的 TCP 隧道流
+//! 设计（方案 B）：成熟实现负责 smoltcp 的连接生命周期，我们只做
+//! "决策 + 上游适配"：
+//!   TUN 包 → netstack-smoltcp 终结成 TcpStream
+//!          → RuleSet 决策：Direct（本机 socket）/ Exit（出口隧道流）/ Block
+//!          → 双向 pipe
 //!
-//! 实现要点：
-//! - 任意目的端口：按 SYN 动态创建监听 socket（smoltcp 需要 per-port listen）
-//! - 单任务持有 Interface/SocketSet/Device（smoltcp 非 Send），
-//!   每条连接通过 channel 与上游任务通信
-//! - 5ms 轮询驱动（重传/ACK 依赖 poll）
+//! netstack-smoltcp 由 shadowsocks-rust 维护，解决了透明代理的经典问题：
+//! 任意目的 IP（any_ip）、每连接 socket 生命周期、SYN 重传、窗口/ACK 时序。
 
 use crate::dns::SocketProtect;
 use crate::mesh::PacketIo;
 use crate::policy::{Action, RuleSet};
-use anyhow::Result;
-use smoltcp::iface::{Config as IfaceConfig, Interface, SocketHandle, SocketSet};
-use smoltcp::phy::{Device, DeviceCapabilities, Medium, RxToken, TxToken};
-use smoltcp::socket::tcp;
-use smoltcp::time::Instant as SmolInstant;
-use smoltcp::wire::HardwareAddress;
-use std::collections::{HashMap, VecDeque};
-use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+use anyhow::{Context, Result};
+use futures::{SinkExt, StreamExt};
+use netstack_smoltcp::{StackBuilder, TcpListener, TcpStream};
+use std::net::SocketAddr;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
-use std::time::Duration;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
-use tokio::net::TcpStream;
-use tokio::sync::mpsc;
+use tokio::net::TcpStream as RealTcpStream;
 
 /// 上游流（直连 TCP 或出口隧道流）
 pub trait UpstreamIo: AsyncRead + AsyncWrite + Send + Unpin {}
@@ -51,97 +42,20 @@ pub trait ExitTcp: Send + Sync {
     >;
 }
 
-// ---------- smoltcp 设备（队列） ----------
-
-type TxQueue = Arc<std::sync::Mutex<VecDeque<Vec<u8>>>>;
-
-struct QueueDevice {
-    rx: VecDeque<Vec<u8>>,
-    tx: TxQueue,
-    mtu: usize,
-}
-
-impl QueueDevice {
-    fn new(mtu: usize) -> Self {
-        Self {
-            rx: VecDeque::new(),
-            tx: Arc::new(std::sync::Mutex::new(VecDeque::new())),
-            mtu,
-        }
-    }
-}
-
-struct RxTok(Vec<u8>);
-struct TxTok(TxQueue);
-
-impl RxToken for RxTok {
-    fn consume<R, F>(mut self, f: F) -> R
-    where
-        F: FnOnce(&mut [u8]) -> R,
-    {
-        f(&mut self.0)
-    }
-}
-
-impl TxToken for TxTok {
-    fn consume<R, F: FnOnce(&mut [u8]) -> R>(self, len: usize, f: F) -> R {
-        let mut buf = vec![0u8; len];
-        let r = f(&mut buf);
-        if let Ok(mut q) = self.0.lock() {
-            q.push_back(buf);
-        }
-        r
-    }
-}
-
-impl Device for QueueDevice {
-    type RxToken<'a> = RxTok;
-    type TxToken<'a> = TxTok;
-
-    fn receive(&mut self, _t: SmolInstant) -> Option<(Self::RxToken<'_>, Self::TxToken<'_>)> {
-        let pkt = self.rx.pop_front()?;
-        Some((RxTok(pkt), TxTok(self.tx.clone())))
-    }
-
-    fn transmit(&mut self, _t: SmolInstant) -> Option<Self::TxToken<'_>> {
-        Some(TxTok(self.tx.clone()))
-    }
-
-    fn capabilities(&self) -> DeviceCapabilities {
-        let mut caps = DeviceCapabilities::default();
-        caps.medium = Medium::Ip;
-        caps.max_transmission_unit = self.mtu;
-        caps
-    }
-}
-
-// ---------- 连接 ----------
-
-struct Conn {
-    handle: SocketHandle,
-    dst: SocketAddr,
-    to_up: mpsc::Sender<Vec<u8>>,
-    from_up: mpsc::UnboundedReceiver<Vec<u8>>,
-    /// 待写入客户端的缓冲
-    pending: VecDeque<Vec<u8>>,
-    closed: bool,
-}
-
 pub struct TcpStackConfig {
     pub mtu: usize,
-    /// 本机在 TUN 上的地址（any_ip 模式需要它作为默认路由网关）
-    pub local_ip: Ipv4Addr,
     pub protect: Option<Arc<dyn SocketProtect>>,
     pub exit: Option<Arc<dyn ExitTcp>>,
-    pub idle_timeout: Duration,
+    /// 连接数上限
+    pub max_conns: usize,
 }
 
 pub struct TcpStack {
     rules: Arc<RuleSet>,
     cfg: TcpStackConfig,
-    pub stat_conn_direct: AtomicU64,
-    pub stat_conn_exit: AtomicU64,
-    pub stat_conn_blocked: AtomicU64,
+    pub stat_direct: Arc<AtomicU64>,
+    pub stat_exit: Arc<AtomicU64>,
+    pub stat_blocked: Arc<AtomicU64>,
 }
 
 impl TcpStack {
@@ -149,415 +63,224 @@ impl TcpStack {
         Self {
             rules,
             cfg,
-            stat_conn_direct: AtomicU64::new(0),
-            stat_conn_exit: AtomicU64::new(0),
-            stat_conn_blocked: AtomicU64::new(0),
+            stat_direct: Arc::new(AtomicU64::new(0)),
+            stat_exit: Arc::new(AtomicU64::new(0)),
+            stat_blocked: Arc::new(AtomicU64::new(0)),
         }
     }
 
-    /// 主循环：从 channel 收 TCP 包 → smoltcp → 上游；写回走 io
+    /// 运行：io 负责收发 TUN 包，pkt_rx 提供 TCP 包（由主循环分发）
     pub async fn run(
         self: Arc<Self>,
         io: Arc<dyn PacketIo>,
-        mut pkt_rx: mpsc::Receiver<Vec<u8>>,
+        mut pkt_rx: tokio::sync::mpsc::Receiver<Vec<u8>>,
         default_exit: Option<String>,
     ) -> Result<()> {
-        let mut dev = QueueDevice::new(self.cfg.mtu);
-        let mut iface = Interface::new(
-            IfaceConfig::new(HardwareAddress::Ip),
-            &mut dev,
-            SmolInstant::now(),
-        );
-        // 透明代理关键: 接受发往任意目的 IP 的包。
-        // any_ip 要求：接口有 IP + 有默认路由（网关=本机 IP），否则仍会丢弃
-        iface.set_any_ip(true);
-        iface.update_ip_addrs(|addrs| {
-            let _ = addrs.push(smoltcp::wire::IpCidr::new(
-                smoltcp::wire::IpAddress::Ipv4(smoltcp::wire::Ipv4Address::new(self.cfg.local_ip.octets()[0], self.cfg.local_ip.octets()[1], self.cfg.local_ip.octets()[2], self.cfg.local_ip.octets()[3])),
-                24,
-            ));
-        });
-        iface
-            .routes_mut()
-            .add_default_ipv4_route(smoltcp::wire::Ipv4Address::new(self.cfg.local_ip.octets()[0], self.cfg.local_ip.octets()[1], self.cfg.local_ip.octets()[2], self.cfg.local_ip.octets()[3]))
-            .ok();
-        let mut sockets = SocketSet::new(vec![]);
-        let mut conns: HashMap<u32, Conn> = HashMap::new();
-        // 4 元组 → 已创建的 socket（每连接一个，避免端口级监听遮蔽已连接 socket）
-        let mut pending: HashMap<FourTuple, SocketHandle> = HashMap::new();
-        let mut next_id: u32 = 1;
-        let mut ticker = tokio::time::interval(Duration::from_millis(5));
+        let (stack, runner, _udp, listener) = StackBuilder::default()
+            .enable_tcp(true)
+            .enable_udp(false)
+            .enable_icmp(false)
+            .mtu(self.cfg.mtu)
+            .build()
+            .map_err(|e| anyhow::anyhow!("netstack build: {e}"))?;
+        let mut listener: TcpListener = listener.context("netstack 未启用 TCP")?;
+        if let Some(runner) = runner {
+            tokio::spawn(runner);
+        }
 
-        loop {
-            tokio::select! {
-                pkt = pkt_rx.recv() => {
-                    let Some(pkt) = pkt else { return Ok(()) };
-                    // 每个新 4 元组的 SYN 建一个 socket；重传的同 4 元组不再新建
-                    if let Some((tuple, is_syn)) = parse_tcp_meta(&pkt) {
-                        if is_syn && !pending.contains_key(&tuple) {
-                            let h = new_listener(&mut sockets, tuple.dst_port);
-                            pending.insert(tuple, h);
-                            log::debug!(
-                                "新连接 socket: {}:{} -> {}:{}",
-                                tuple.src_ip,
-                                tuple.src_port,
-                                tuple.dst_ip,
-                                tuple.dst_port
-                            );
-                        }
-                    }
-                    dev.rx.push_back(pkt);
-                }
-                _ = ticker.tick() => {}
-            }
+        let (mut stack_sink, mut stack_stream) = stack.split();
 
-            let polled = iface.poll(SmolInstant::now(), &mut dev, &mut sockets);
-            {
-                // 诊断: 每秒打印一次监听 socket 状态
-                static mut LAST: u64 = 0;
-                let now_ms = std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .map(|d| d.as_millis() as u64)
-                    .unwrap_or(0);
-                unsafe {
-                    if now_ms - LAST > 1000 {
-                        LAST = now_ms;
-                        log::debug!("pending={} txq={}", pending.len(),
-                            dev.tx.lock().map(|q| q.len()).unwrap_or(0));
-                        log::debug!("conns={}", conns.len());
-                        for (&id, c) in conns.iter() {
-                            let sk = sockets.get::<tcp::Socket>(c.handle);
-                            log::debug!(
-                                "conn {id} {}: {:?} can_recv={} can_send={} pending={}",
-                                c.dst,
-                                sk.state(),
-                                sk.can_recv(),
-                                sk.can_send(),
-                                c.pending.len()
-                            );
-                        }
-                    }
-                }
-            }
-            log::trace!("poll={polled}");
-
-            // 1) 已建立但还没接上游的 socket → 建立连接
-            let mut new_conns: Vec<(u32, Conn)> = Vec::new();
-            let accepted: Vec<(FourTuple, SocketHandle)> = pending
-                .iter()
-                .filter_map(|(&t, &h)| {
-                    let s = sockets.get::<tcp::Socket>(h);
-                    (s.is_active() && !s.is_listening()).then_some((t, h))
-                })
-                .collect();
-            let mut drop_pending: Vec<FourTuple> = Vec::new();
-            for (tuple, h) in accepted {
-
-                let sock = sockets.get_mut::<tcp::Socket>(h);
-                if sock.is_active() && !sock.is_listening() {
-                    // 已被 accept。透明代理下 socket 的 local_endpoint 才是"原始目标地址"
-                    let Some(local_ep) = sock.local_endpoint() else { continue };
-                    let dst_ip = match local_ep.addr {
-                        smoltcp::wire::IpAddress::Ipv4(v4) => Ipv4Addr::from(v4.0),
-                        #[allow(unreachable_patterns)]
-                        _ => continue,
-                    };
-                    let dst = SocketAddr::new(IpAddr::V4(dst_ip), local_ep.port);
-                    let id = next_id;
-                    next_id += 1;
-
-                    // 连接数上限保护（防 FD 耗尽）
-                    if conns.len() >= 400 {
-                        log::warn!("连接数达到上限, 拒绝 {}", dst);
-                        sock.abort();
-                        drop_pending.push(tuple);
-                        continue;
-                    }
-                    let decision = self.rules.decide_ip(dst_ip);
-                    let (to_up_tx, to_up_rx) = mpsc::channel::<Vec<u8>>(64);
-                    let (from_up_tx, from_up_rx) = mpsc::unbounded_channel::<Vec<u8>>();
-
-                    match decision.action {
-                        Action::Block => {
-                            self.stat_conn_blocked.fetch_add(1, Ordering::Relaxed);
-                            sock.abort();
-                            drop_pending.push(tuple);
-                            continue;
-                        }
-                        Action::Direct => {
-                            self.stat_conn_direct.fetch_add(1, Ordering::Relaxed);
-                            let protect = self.cfg.protect.clone();
-                            tokio::spawn(async move {
-                                if let Err(e) = pump_direct(to_up_rx, from_up_tx, dst, protect).await {
-                                    log::debug!("TCP 直连 {dst} 结束: {e:#}");
-                                }
-                            });
-                        }
-                        Action::Exit(node) => {
-                            self.stat_conn_exit.fetch_add(1, Ordering::Relaxed);
-                            let node = node.or(default_exit.clone());
-                            match (node, self.cfg.exit.clone()) {
-                                (Some(node), Some(exit)) => {
-                                    match exit.open(&node, dst).await {
-                                        Ok(up) => {
-                                            tokio::spawn(async move {
-                                                if let Err(e) = pump_upstream(to_up_rx, from_up_tx, up).await {
-                                                    log::debug!("TCP 出口 {dst} 结束: {e:#}");
-                                                }
-                                            });
-                                        }
-                                        Err(e) => {
-                                            log::warn!("出口 {node} 打开失败: {e:#}");
-                                            sock.abort();
-                                            drop_pending.push(tuple);
-                                            continue;
-                                        }
-                                    }
-                                }
-                                _ => {
-                                    log::warn!("未配置出口通道, 回退直连 {dst}");
-                                    let protect = self.cfg.protect.clone();
-                                    tokio::spawn(async move {
-                                        let _ = pump_direct(to_up_rx, from_up_tx, dst, protect).await;
-                                    });
-                                }
+        // 出：栈 → TUN
+        {
+            let io = io.clone();
+            tokio::spawn(async move {
+                while let Some(pkt) = stack_stream.next().await {
+                    match pkt {
+                        Ok(pkt) => {
+                            if io.send(&pkt).await.is_err() {
+                                break;
                             }
                         }
-                    }
-
-                    new_conns.push((
-                        id,
-                        Conn {
-                            handle: h,
-                            dst,
-                            to_up: to_up_tx,
-                            from_up: from_up_rx,
-                            pending: VecDeque::new(),
-                            closed: false,
-                        },
-                    ));
-                    drop_pending.push(tuple);
-                }
-            }
-            for t in drop_pending {
-                pending.remove(&t);
-            }
-            for (id, c) in new_conns {
-                log::debug!("TCP 连接 {id} -> {} ({:?})", c.dst, "ok");
-                conns.insert(id, c);
-            }
-
-            // 2) 双向泵数据
-            let mut dead = Vec::new();
-            for (&id, c) in conns.iter_mut() {
-                let sock = sockets.get_mut::<tcp::Socket>(c.handle);
-                // 客户端 → 上游
-                while sock.can_recv() {
-                    let mut chunk = Vec::new();
-                    match sock.recv(|b| {
-                        let n = b.len().min(16 * 1024);
-                        chunk.extend_from_slice(&b[..n]);
-                        (n, ())
-                    }) {
-                        Ok(()) => {}
-                        Err(_) => break,
-                    }
-                    if chunk.is_empty() {
-                        break;
-                    }
-                    if c.to_up.try_send(chunk).is_err() {
-                        break;
-                    }
-                }
-                // 上游 → 客户端
-                while let Ok(data) = c.from_up.try_recv() {
-                    c.pending.push_back(data);
-                }
-                while let Some(front) = c.pending.front() {
-                    if !sock.can_send() {
-                        break;
-                    }
-                    match sock.send_slice(front) {
-                        Ok(n) if n == front.len() => {
-                            c.pending.pop_front();
-                        }
-                        Ok(n) => {
-                            let rest = front[n..].to_vec();
-                            c.pending.pop_front();
-                            c.pending.push_front(rest);
+                        Err(e) => {
+                            log::debug!("stack stream: {e}");
                             break;
                         }
-                        Err(_) => break,
                     }
                 }
-                if !sock.is_open() && c.pending.is_empty() {
-                    log::debug!(
-                        "conn {id} 判定关闭: state={:?} pending={}",
-                        sock.state(),
-                        c.pending.len()
-                    );
-                    c.closed = true;
-                    dead.push(id);
-                }
-            }
-            for id in dead {
-                if let Some(c) = conns.remove(&id) {
-                    log::debug!("TCP 连接 {id} 关闭 ({})", c.dst);
-                    sockets.remove(c.handle);
-                }
-            }
+            });
+        }
 
-            // 3) 写回 TUN
-            let mut out: Vec<Vec<u8>> = Vec::new();
-            if let Ok(mut q) = dev.tx.lock() {
-                while let Some(p) = q.pop_front() {
-                    out.push(p);
-                }
-            }
-            for pkt in out {
-                if io.send(&pkt).await.is_err() {
+        // 入：TUN（由 pkt_rx 提供）→ 栈
+        tokio::spawn(async move {
+            while let Some(pkt) = pkt_rx.recv().await {
+                if stack_sink.send(pkt).await.is_err() {
                     break;
                 }
             }
+        });
+
+        // 连接分发
+        let active = Arc::new(AtomicU64::new(0));
+        // netstack 的 Stream item: (stream, 客户端地址, 目标地址)
+        while let Some((stream, client_addr, dst_addr)) = listener.next().await {
+            let rules = self.rules.clone();
+            let cfg = self.cfg.clone_shallow();
+            let default_exit = default_exit.clone();
+            let active2 = active.clone();
+            let stat_direct = self.stat_direct.clone();
+            let stat_exit = self.stat_exit.clone();
+            let stat_blocked = self.stat_blocked.clone();
+            tokio::spawn(async move {
+                let n = active2.fetch_add(1, Ordering::Relaxed) + 1;
+                if n as usize > cfg.max_conns {
+                    active2.fetch_sub(1, Ordering::Relaxed);
+                    log::warn!("TCP 连接数达上限 ({}), 拒绝 {dst_addr}", cfg.max_conns);
+                    drop(stream);
+                    return;
+                }
+                if let Err(e) = handle_conn(
+                    stream,
+                    dst_addr,
+                    client_addr,
+                    rules,
+                    cfg,
+                    default_exit,
+                    stat_direct,
+                    stat_exit,
+                    stat_blocked,
+                )
+                .await
+                {
+                    log::debug!("TCP {dst_addr} <- {client_addr} 结束: {e:#}");
+                }
+                active2.fetch_sub(1, Ordering::Relaxed);
+            });
+        }
+        Ok(())
+    }
+}
+
+impl TcpStackConfig {
+    fn clone_shallow(&self) -> Self {
+        Self {
+            mtu: self.mtu,
+            protect: self.protect.clone(),
+            exit: self.exit.clone(),
+            max_conns: self.max_conns,
         }
     }
 }
 
-/// 为一个端口创建监听 socket
-fn new_listener(sockets: &mut SocketSet<'_>, port: u16) -> SocketHandle {
-    let rx = tcp::SocketBuffer::new(vec![0u8; 64 * 1024]);
-    let tx = tcp::SocketBuffer::new(vec![0u8; 64 * 1024]);
-    let mut sock = tcp::Socket::new(rx, tx);
-    sock.listen(port).ok();
-    sockets.add(sock)
-}
-
-/// TCP 4 元组（诊断用）
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub struct FourTuple {
-    pub src_ip: Ipv4Addr,
-    pub src_port: u16,
-    pub dst_ip: Ipv4Addr,
-    pub dst_port: u16,
-}
-
-/// 解析 TCP 元信息：(4 元组, 是否 SYN)
-fn parse_tcp_meta(pkt: &[u8]) -> Option<(FourTuple, bool)> {
-    if pkt.len() < 40 || pkt[0] >> 4 != 4 || pkt[9] != 6 {
-        return None;
-    }
-    let ihl = ((pkt[0] & 0x0f) as usize) * 4;
-    if pkt.len() < ihl + 20 {
-        return None;
-    }
-    let src_ip = Ipv4Addr::new(pkt[12], pkt[13], pkt[14], pkt[15]);
-    let dst_ip = Ipv4Addr::new(pkt[16], pkt[17], pkt[18], pkt[19]);
-    let src_port = u16::from_be_bytes([pkt[ihl], pkt[ihl + 1]]);
-    let dst_port = u16::from_be_bytes([pkt[ihl + 2], pkt[ihl + 3]]);
-    let flags = pkt[ihl + 13];
-    Some((
-        FourTuple {
-            src_ip,
-            src_port,
-            dst_ip,
-            dst_port,
-        },
-        flags & 0x02 != 0,
-    ))
-}
-
-async fn pump_direct(
-    mut rx: mpsc::Receiver<Vec<u8>>,
-    tx: mpsc::UnboundedSender<Vec<u8>>,
+#[allow(clippy::too_many_arguments)]
+async fn handle_conn(
+    client: TcpStream,
     dst: SocketAddr,
-    protect: Option<Arc<dyn SocketProtect>>,
+    src: SocketAddr,
+    rules: Arc<RuleSet>,
+    cfg: TcpStackConfig,
+    default_exit: Option<String>,
+    stat_direct: Arc<AtomicU64>,
+    stat_exit: Arc<AtomicU64>,
+    stat_blocked: Arc<AtomicU64>,
 ) -> Result<()> {
+    let decision = rules.decide_ip(match dst.ip() {
+        std::net::IpAddr::V4(v4) => v4,
+        std::net::IpAddr::V6(_) => {
+            return Ok(()); // 暂只支持 IPv4
+        }
+    });
+
+    match decision.action {
+        Action::Block => {
+            stat_blocked.fetch_add(1, Ordering::Relaxed);
+            log::debug!("拦截 TCP {dst} ({})", decision.reason);
+            drop(client);
+            Ok(())
+        }
+        Action::Direct => {
+            stat_direct.fetch_add(1, Ordering::Relaxed);
+            log::debug!("TCP {dst} -> direct ({})", decision.reason);
+            let up = connect_direct(dst, cfg.protect.as_ref())?;
+            pipe(client, up).await
+        }
+        Action::Exit(node) => {
+            stat_exit.fetch_add(1, Ordering::Relaxed);
+            let node = node.or(default_exit);
+            match (node, cfg.exit.clone()) {
+                (Some(node), Some(exit)) => {
+                    log::debug!("TCP {dst} -> exit {node}");
+                    let up = exit.open(&node, dst).await?;
+                    pipe(client, up).await
+                }
+                _ => {
+                    log::warn!("未配置出口通道, {dst} 回退直连");
+                    let up = connect_direct(dst, cfg.protect.as_ref())?;
+                    pipe(client, up).await
+                }
+            }
+        }
+    }
+}
+
+fn connect_direct(
+    dst: SocketAddr,
+    protect: Option<&Arc<dyn SocketProtect>>,
+) -> Result<Box<dyn UpstreamIo>> {
     let std_sock = std::net::TcpStream::connect(dst)?;
     std_sock.set_nonblocking(true)?;
-    if let Some(p) = &protect {
+    if let Some(p) = protect {
         p.protect_tcp(&std_sock);
     }
-    let stream = TcpStream::from_std(std_sock)?;
-    let (mut r, mut w) = stream.into_split();
-    let up = tokio::spawn(async move {
-        let mut b = vec![0u8; 16 * 1024];
+    Ok(Box::new(RealTcpStream::from_std(std_sock)?))
+}
+
+async fn pipe<A, B>(mut a: A, mut b: B) -> Result<()>
+where
+    A: AsyncRead + AsyncWrite + Unpin,
+    B: AsyncRead + AsyncWrite + Unpin,
+{
+    let up_bytes = std::sync::Arc::new(AtomicU64::new(0));
+    let down_bytes = std::sync::Arc::new(AtomicU64::new(0));
+    let (ub, db) = (up_bytes.clone(), down_bytes.clone());
+    let (mut ar, mut aw) = tokio::io::split(&mut a);
+    let (mut br, mut bw) = tokio::io::split(&mut b);
+    let up = async {
+        let mut buf = vec![0u8; 16 * 1024];
         loop {
-            match r.read(&mut b).await {
+            match ar.read(&mut buf).await {
                 Ok(0) => break,
                 Ok(n) => {
-                    if tx.send(b[..n].to_vec()).is_err() {
+                    ub.fetch_add(n as u64, Ordering::Relaxed);
+                    if bw.write_all(&buf[..n]).await.is_err() {
                         break;
                     }
                 }
                 Err(_) => break,
             }
         }
-    });
-    while let Some(d) = rx.recv().await {
-        if w.write_all(&d).await.is_err() {
-            break;
-        }
-    }
-    up.abort();
-    Ok(())
-}
-
-async fn pump_upstream(
-    mut rx: mpsc::Receiver<Vec<u8>>,
-    tx: mpsc::UnboundedSender<Vec<u8>>,
-    up: Box<dyn UpstreamIo>,
-) -> Result<()> {
-    let (mut r, mut w) = tokio::io::split(up);
-    let reader = tokio::spawn(async move {
-        let mut b = vec![0u8; 16 * 1024];
+        let _ = bw.shutdown().await;
+    };
+    let down = async {
+        let mut buf = vec![0u8; 16 * 1024];
         loop {
-            match r.read(&mut b).await {
+            match br.read(&mut buf).await {
                 Ok(0) => break,
                 Ok(n) => {
-                    if tx.send(b[..n].to_vec()).is_err() {
+                    db.fetch_add(n as u64, Ordering::Relaxed);
+                    if aw.write_all(&buf[..n]).await.is_err() {
                         break;
                     }
                 }
                 Err(_) => break,
             }
         }
-    });
-    while let Some(d) = rx.recv().await {
-        if w.write_all(&d).await.is_err() {
-            break;
-        }
-    }
-    reader.abort();
+        let _ = aw.shutdown().await;
+    };
+    tokio::join!(up, down);
+    log::debug!(
+        "pipe 结束: up={}B down={}B",
+        up_bytes.load(Ordering::Relaxed),
+        down_bytes.load(Ordering::Relaxed)
+    );
     Ok(())
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn parse_tcp_syn() {
-        // 构造最小 TCP SYN 包
-        let mut pkt = vec![0u8; 40];
-        pkt[0] = 0x45;
-        pkt[2..4].copy_from_slice(&40u16.to_be_bytes());
-        pkt[9] = 6; // TCP
-        pkt[16..20].copy_from_slice(&[93, 184, 216, 34]);
-        pkt[20..22].copy_from_slice(&12345u16.to_be_bytes()); // src port
-        pkt[22..24].copy_from_slice(&443u16.to_be_bytes()); // dst port
-        pkt[33] = 0x02; // SYN
-        let (tuple, syn) = parse_tcp_meta(&pkt).unwrap();
-        assert_eq!(tuple.dst_ip, Ipv4Addr::new(93, 184, 216, 34));
-        assert_eq!(tuple.dst_port, 443);
-        assert_eq!(tuple.src_port, 12345);
-        assert!(syn);
-    }
-
-    #[test]
-    fn parse_ignores_udp() {
-        let mut pkt = vec![0u8; 40];
-        pkt[0] = 0x45;
-        pkt[9] = 17;
-        assert!(parse_tcp_meta(&pkt).is_none());
-    }
 }

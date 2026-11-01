@@ -161,10 +161,9 @@ async fn main() -> anyhow::Result<()> {
         rs.clone(),
         yz_core::tcp_stack::TcpStackConfig {
             mtu: 1400,
-            local_ip: std::net::Ipv4Addr::new(10, 99, 0, 1),
             protect: None,
             exit: exit_tcp,
-            idle_timeout: std::time::Duration::from_secs(120),
+            max_conns: 400,
         },
     ));
     {
@@ -183,6 +182,11 @@ async fn main() -> anyhow::Result<()> {
         let n = io.recv(&mut buf).await?;
         let pkt = buf[..n].to_vec();
         if yz_core::stack::parse_udp(&pkt).is_none() {
+            static N: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+            let n = N.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            if n < 5 || n % 200 == 0 {
+                log::debug!("TCP 包 #{n} 长度 {} -> 栈", pkt.len());
+            }
             let _ = tcp_tx.try_send(pkt);
             continue;
         }
