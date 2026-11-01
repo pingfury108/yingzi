@@ -252,7 +252,7 @@ impl TcpStack {
                 .collect();
             let mut drop_pending: Vec<FourTuple> = Vec::new();
             for (tuple, h) in accepted {
-                let port = tuple.dst_port;
+
                 let sock = sockets.get_mut::<tcp::Socket>(h);
                 if sock.is_active() && !sock.is_listening() {
                     // 已被 accept。透明代理下 socket 的 local_endpoint 才是"原始目标地址"
@@ -546,9 +546,10 @@ mod tests {
         pkt[20..22].copy_from_slice(&12345u16.to_be_bytes()); // src port
         pkt[22..24].copy_from_slice(&443u16.to_be_bytes()); // dst port
         pkt[33] = 0x02; // SYN
-        let (ip, port, syn) = parse_tcp_meta(&pkt).unwrap();
-        assert_eq!(ip, Ipv4Addr::new(93, 184, 216, 34));
-        assert_eq!(port, 443);
+        let (tuple, syn) = parse_tcp_meta(&pkt).unwrap();
+        assert_eq!(tuple.dst_ip, Ipv4Addr::new(93, 184, 216, 34));
+        assert_eq!(tuple.dst_port, 443);
+        assert_eq!(tuple.src_port, 12345);
         assert!(syn);
     }
 
