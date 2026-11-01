@@ -21,6 +21,9 @@ class SettingsActivity : AppCompatActivity() {
         findViewById<EditText>(R.id.directDns).setText(cfg.directDns)
 
         findViewById<ImageButton>(R.id.back).setOnClickListener { finish() }
+        findViewById<android.view.View>(R.id.appsRow).setOnClickListener {
+            startActivity(Intent(this, AppsActivity::class.java))
+        }
 
         findViewById<MaterialButton>(R.id.save).setOnClickListener {
             val secretInput = findViewById<EditText>(R.id.secret).text.toString().trim()
@@ -39,5 +42,18 @@ class SettingsActivity : AppCompatActivity() {
             Toast.makeText(this, "已保存", Toast.LENGTH_SHORT).show()
             finish()
         }
+    }
+
+    override fun onResume() {
+        super.onResume()
+        val mode = when (AppRules.mode(this)) {
+            AppRules.INCLUDE -> "仅代理选中应用"
+            AppRules.EXCLUDE -> "排除选中应用"
+            else -> "全局代理"
+        }
+        val n = AppRules.selected(this).size
+        findViewById<android.widget.TextView>(R.id.appsMode).text = mode
+        findViewById<android.widget.TextView>(R.id.appsSub).text =
+            if (AppRules.mode(this) == AppRules.GLOBAL) "所有应用走 VPN" else "已选 $n 个应用"
     }
 }

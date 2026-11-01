@@ -27,6 +27,7 @@ class YzVpnService : VpnService() {
         const val ACTION_START = "io.yingzi.app.START"
         const val ACTION_STOP = "io.yingzi.app.STOP"
         const val ACTION_RESTART = "io.yingzi.app.RESTART"
+        const val ACTION_REBUILD = "io.yingzi.app.REBUILD"
     }
 
     private var tun: ParcelFileDescriptor? = null
@@ -41,6 +42,12 @@ class YzVpnService : VpnService() {
             }
             ACTION_RESTART -> {
                 restartCore()
+                return START_STICKY
+            }
+            ACTION_REBUILD -> {
+                // 分应用模式变化必须重建 TUN（allowed/disallowed 只能建隧道时设定）
+                teardown()
+                startVpn()
                 return START_STICKY
             }
             else -> startVpn()
@@ -63,12 +70,43 @@ class YzVpnService : VpnService() {
             .addRoute("0.0.0.0", 0)
             .addDnsServer("223.5.5.5")
 
-        // 排除自身（避免核心的 socket 回环）—— 关键
-        try {
-            builder.addDisallowedApplication(packageName)
-            Log.i(TAG, "addDisallowedApplication ok: $packageName")
-        } catch (e: Exception) {
-            Log.e(TAG, "addDisallowedApplication 失败: $e")
+        // 分应用模式：allowed 与 disallowed 互斥，必须二选一
+        val mode = AppRules.mode(this)
+        val picked = AppRules.selected(this) - packageName
+        if (mode == AppRules.INCLUDE && picked.isNotEmpty()) {
+            // 仅代理选中应用：自身不在白名单内 → 自动绕过 VPN（不会套娃）
+            var applied = 0
+            for (pkg in picked) {
+                try {
+                    builder.addAllowedApplication(pkg)
+                    applied++
+                } catch (e: Exception) {
+                    Log.w(TAG, "分应用设置失败 $pkg: $e")
+                }
+            }
+            Log.i(TAG, "仅代理 $applied/${picked.size} 个应用")
+            YzCore.nativePushEvent("INFO", "分应用：仅代理 $applied 个应用")
+        } else {
+            // 全局 / 排除模式：先排除自身，避免核心 socket 回环
+            try {
+                builder.addDisallowedApplication(packageName)
+                Log.i(TAG, "addDisallowedApplication ok: $packageName")
+            } catch (e: Exception) {
+                Log.e(TAG, "addDisallowedApplication 失败: $e")
+            }
+            if (mode == AppRules.EXCLUDE && picked.isNotEmpty()) {
+                var applied = 0
+                for (pkg in picked) {
+                    try {
+                        builder.addDisallowedApplication(pkg)
+                        applied++
+                    } catch (e: Exception) {
+                        Log.w(TAG, "分应用设置失败 $pkg: $e")
+                    }
+                }
+                Log.i(TAG, "排除 $applied/${picked.size} 个应用")
+                YzCore.nativePushEvent("INFO", "分应用：排除 $applied 个应用")
+            }
         }
 
         val pfd = builder.establish() ?: run {
@@ -149,7 +187,8 @@ class YzVpnService : VpnService() {
         if (err.isNotEmpty()) Log.e(TAG, "重启核心失败: $err")
     }
 
-    private fun stopVpn() {
+    /** 拆除 TUN + 核心（不结束服务） */
+    private fun teardown() {
         if (tun != null) YzCore.nativePushEvent("INFO", "隧道已断开")
         netCallback?.let {
             try { getSystemService(ConnectivityManager::class.java).unregisterNetworkCallback(it) } catch (_: Exception) {}
@@ -158,6 +197,10 @@ class YzVpnService : VpnService() {
         YzCore.nativeStop()
         try { tun?.close() } catch (_: Exception) {}
         tun = null
+    }
+
+    private fun stopVpn() {
+        teardown()
         stopForeground(STOP_FOREGROUND_REMOVE)
         stopSelf()
     }
