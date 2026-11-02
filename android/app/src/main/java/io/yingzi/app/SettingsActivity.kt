@@ -21,6 +21,21 @@ class SettingsActivity : AppCompatActivity() {
         findViewById<EditText>(R.id.directDns).setText(cfg.directDns)
 
         findViewById<ImageButton>(R.id.back).setOnClickListener { finish() }
+        findViewById<androidx.appcompat.widget.SwitchCompat>(R.id.ipv6Switch).apply {
+            isChecked = cfg.ipv6
+            setOnCheckedChangeListener { _, v ->
+                NodeConfig.save(
+                    this@SettingsActivity, cfg.networkSecret, cfg.coordinator, cfg.name,
+                    cfg.defaultExit, cfg.remoteDns, cfg.directDns, cfg.fakeIp, v,
+                )
+                if (YzCore.nativeIsRunning()) {
+                    startService(
+                        Intent(this@SettingsActivity, YzVpnService::class.java)
+                            .setAction(YzVpnService.ACTION_REBUILD)
+                    )
+                }
+            }
+        }
         findViewById<androidx.appcompat.widget.SwitchCompat>(R.id.fakeIpSwitch).apply {
             isChecked = cfg.fakeIp
             setOnCheckedChangeListener { _, v ->

@@ -33,6 +33,8 @@ class YzVpnService : VpnService() {
     private var tun: ParcelFileDescriptor? = null
     private var netCallback: ConnectivityManager.NetworkCallback? = null
     private var lastRestart = 0L
+    private var firstNetCallback = true
+    private var currentNetwork: Network? = null
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         when (intent?.action) {
@@ -130,6 +132,7 @@ class YzVpnService : VpnService() {
             put("rules", org.json.JSONArray(Rules.load(this@YzVpnService)))
             put("tun_fd", pfd.fd)
             put("fake_ip", cfg.fakeIp)
+            put("ipv6", cfg.ipv6)
             put("mtu", 1400)
         }
 
@@ -149,6 +152,21 @@ class YzVpnService : VpnService() {
         val cm = getSystemService(ConnectivityManager::class.java)
         val cb = object : ConnectivityManager.NetworkCallback() {
             override fun onAvailable(network: Network) {
+                // 注册后的首个回调只是"当前网络"，不算切换
+                if (firstNetCallback) {
+                    firstNetCallback = false
+                    currentNetwork = network
+                    return
+                }
+                if (currentNetwork == network) return
+                // 自己建立的 VPN 网络也会触发 onAvailable，忽略
+                val caps = try {
+                    getSystemService(ConnectivityManager::class.java).getNetworkCapabilities(network)
+                } catch (e: Exception) {
+                    null
+                }
+                if (caps?.hasTransport(android.net.NetworkCapabilities.TRANSPORT_VPN) == true) return
+                currentNetwork = network
                 val now = System.currentTimeMillis()
                 // 防抖: 10 秒内只重建一次
                 if (now - lastRestart < 10_000) return
@@ -156,6 +174,10 @@ class YzVpnService : VpnService() {
                 Log.i(TAG, "网络变化，重启核心")
                 YzCore.nativePushEvent("WARN", "网络变化，正在重建核心")
                 restartCore()
+            }
+
+            override fun onLost(network: Network) {
+                if (currentNetwork == network) currentNetwork = null
             }
         }
         netCallback = cb
@@ -183,6 +205,7 @@ class YzVpnService : VpnService() {
             put("rules", org.json.JSONArray(Rules.load(this@YzVpnService)))
             put("tun_fd", pfd.fd)
             put("fake_ip", cfg.fakeIp)
+            put("ipv6", cfg.ipv6)
             put("mtu", 1400)
         }
         val err = YzCore.nativeStart(config.toString(), this)

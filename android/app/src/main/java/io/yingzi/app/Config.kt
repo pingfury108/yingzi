@@ -15,6 +15,7 @@ data class NodeConfig(
     val remoteDns: String,
     val directDns: String,
     val fakeIp: Boolean,
+    val ipv6: Boolean,
 ) {
     companion object {
         // 与现有 6 节点同一网络（部署时生成）
@@ -23,6 +24,10 @@ data class NodeConfig(
 
         fun load(ctx: Context): NodeConfig {
             val prefs = ctx.getSharedPreferences("yz", Context.MODE_PRIVATE)
+            // 老版本默认名 "android" → 迁移成设备名，避免多台设备重名
+            if (prefs.getString("name", null) == "android") {
+                prefs.edit().putString("name", DeviceName.suggest(ctx)).apply()
+            }
             // NS 优先从 Keystore 加密存储读取
             val secret = prefs.getString("secret_enc", null)
                 ?.let { SecureStore.decrypt(ctx, it) }
@@ -31,11 +36,12 @@ data class NodeConfig(
             return NodeConfig(
                 networkSecret = secret,
                 coordinator = prefs.getString("coordinator", "47.109.61.89:9000")!!,
-                name = prefs.getString("name", "android")!!,
+                name = prefs.getString("name", null) ?: DeviceName.suggest(ctx),
                 defaultExit = prefs.getString("exit", "overseas-hk")!!,
                 remoteDns = prefs.getString("remoteDns", "exit://overseas-hk/1.1.1.1:53")!!,
                 directDns = prefs.getString("directDns", "udp://223.5.5.5")!!,
                 fakeIp = prefs.getBoolean("fakeIp", true),
+                ipv6 = prefs.getBoolean("ipv6", false),
             )
         }
 
@@ -49,6 +55,7 @@ data class NodeConfig(
             remoteDns: String,
             directDns: String,
             fakeIp: Boolean = true,
+            ipv6: Boolean = false,
         ) {
             ctx.getSharedPreferences("yz", Context.MODE_PRIVATE).edit().apply {
                 putString("secret_enc", SecureStore.encrypt(ctx, secret))
@@ -59,6 +66,7 @@ data class NodeConfig(
                 putString("remoteDns", remoteDns)
                 putString("directDns", directDns)
                 putBoolean("fakeIp", fakeIp)
+                putBoolean("ipv6", ipv6)
                 apply()
             }
         }

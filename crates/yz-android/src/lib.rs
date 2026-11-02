@@ -74,6 +74,9 @@ struct StartConfig {
     /// fake-IP 模式（被代理域名返回 198.18.x.x 假地址）
     #[serde(default = "default_true")]
     fake_ip: bool,
+    /// IPv6 分流（默认关；geoip6 数据精度有限）
+    #[serde(default)]
+    ipv6: bool,
 }
 
 fn default_true() -> bool {
@@ -472,6 +475,7 @@ fn start_async(cfg: StartConfig, protect: Option<Arc<dyn SocketProtect>>) -> Res
     let dns_cfg = DnsConfig {
         remote: vec![Upstream::parse(&remote)?],
         direct: vec![Upstream::parse(&direct)?],
+        ipv6: cfg.ipv6,
         ..Default::default()
     };
     let fakeip = if cfg.fake_ip {

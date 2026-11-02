@@ -506,6 +506,9 @@ pub struct DnsConfig {
     pub block_ip: IpAddr,
     /// 拦截时返回 NXDOMAIN 还是 0.0.0.0
     pub block_nxdomain: bool,
+    /// IPv6 分流（默认关）：关 → AAAA/HTTPS 返回空，避免应用先试 IPv6；
+    /// 开 → 按规则正常解析 AAAA（geoip6 数据精度有限，可能误判）
+    pub ipv6: bool,
 }
 
 impl Default for DnsConfig {
@@ -525,6 +528,7 @@ impl Default for DnsConfig {
             direct: vec![Upstream::Udp("223.5.5.5:53".parse().unwrap())],
             block_ip: IpAddr::V4(Ipv4Addr::UNSPECIFIED),
             block_nxdomain: false,
+            ipv6: false,
         }
     }
 }
@@ -637,9 +641,9 @@ impl DnsService {
             _ => {}
         }
 
-        // 1.4) IPv6：栈只支持 IPv4，AAAA/HTTPS(65) 直接返回空记录
+        // 1.4) IPv6：默认关闭 → AAAA/HTTPS(65) 返回空记录
         //      —— 否则应用会先尝试 IPv6 连接、超时后才回退，明显拖慢首屏
-        if q.qtype == 28 || q.qtype == 65 {
+        if !self.cfg.ipv6 && (q.qtype == 28 || q.qtype == 65) {
             return Ok(build_response(msg.id, &q, &[], 0));
         }
 
