@@ -270,7 +270,10 @@ impl NodeRuntime {
                     rtt: rtt.get(&n.node_id).copied().unwrap_or(0),
                     path: path.get(&n.node_id).cloned().unwrap_or_default(),
                     is_exit: n.caps & yz_proto::caps::EXIT != 0,
-                    connected: tunnels.contains_key(&n.node_id),
+                    connected: tunnels
+                        .get(&n.node_id)
+                        .map(|t| !t.is_closed())
+                        .unwrap_or(false),
                 })
                 .collect();
             nodes.sort_by_key(|n| (n.rtt == 0, n.rtt));

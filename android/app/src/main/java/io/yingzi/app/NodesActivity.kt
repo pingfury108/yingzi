@@ -97,10 +97,25 @@ class NodesActivity : AppCompatActivity() {
             if (on) setBackgroundColor(Color.parseColor("#0B38F0C6"))
             setOnClickListener { pick(n.optString("name")) }
         }
-        // 左侧高亮条
+        // 左侧高亮条（当前出口）
         row.addView(View(this).apply {
             setBackgroundColor(if (on) getColor(R.color.accent) else Color.TRANSPARENT)
             layoutParams = LinearLayout.LayoutParams(dp(3), dp(30)).apply { marginEnd = dp(11) }
+        })
+
+        val connected = n.optBoolean("connected")
+        val exitCap = n.optBoolean("is_exit")
+
+        // 连接状态点: 绿=已建隧道 / 黄=可出口但未连 / 灰=普通节点
+        row.addView(View(this).apply {
+            setBackgroundResource(
+                when {
+                    connected -> R.drawable.bg_dot_direct
+                    exitCap -> R.drawable.bg_dot_warn
+                    else -> R.drawable.bg_dot_muted
+                }
+            )
+            layoutParams = LinearLayout.LayoutParams(dp(7), dp(7)).apply { marginEnd = dp(9) }
         })
 
         val box = LinearLayout(this).apply {
@@ -109,14 +124,16 @@ class NodesActivity : AppCompatActivity() {
         }
         val title = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL; gravity = Gravity.CENTER_VERTICAL }
         title.addView(label(n.optString("name"), 13f, R.color.text, true))
-        val role = when {
-            n.optBoolean("is_exit") -> "出口"
-            n.optBoolean("connected") -> "已连"
-            else -> "节点"
-        }
-        title.addView(tag(role))
+        if (exitCap) title.addView(tag("出口"))
         box.addView(title)
-        box.addView(sub("${n.optString("vip")} · ${n.optString("path").ifEmpty { "—" }}", 11f))
+
+        val path = n.optString("path")
+        val state = when {
+            connected && path.isNotEmpty() -> "已连接 · $path"
+            connected -> "已连接"
+            else -> "${n.optString("vip")} · 未连接"
+        }
+        box.addView(sub(state, 11f))
         row.addView(box)
 
         val rtt = n.optInt("rtt")
@@ -124,7 +141,15 @@ class NodesActivity : AppCompatActivity() {
             text = if (rtt > 0) "${rtt}ms" else "—"
             typeface = Typeface.MONOSPACE
             setTextSize(TypedValue.COMPLEX_UNIT_SP, 12f)
-            setTextColor(getColor(if (rtt in 1..20) R.color.direct else R.color.text_2))
+            setTextColor(
+                getColor(
+                    when {
+                        !connected -> R.color.text_3
+                        rtt in 1..20 -> R.color.direct
+                        else -> R.color.text_2
+                    }
+                )
+            )
             gravity = Gravity.END
         })
         if (on) {
