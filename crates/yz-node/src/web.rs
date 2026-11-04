@@ -9,7 +9,7 @@ use axum::extract::{Path, Request, State};
 use axum::http::{header, StatusCode};
 use axum::middleware::{self, Next};
 use axum::response::{Html, Response};
-use axum::routing::{delete, get};
+use axum::routing::{delete, get, post};
 use axum::{Json, Router};
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
@@ -107,6 +107,7 @@ pub async fn run(bind: &str, app: Arc<AppState>) -> Result<()> {
         .route("/api/routes/{idx}", delete(del_route))
         .route("/api/ingress", get(list_ingress).post(req_ingress))
         .route("/api/events", get(events))
+        .route("/api/probe", post(probe))
         .layer(middleware::from_fn_with_state(app.clone(), auth_mw));
     let router = Router::new()
         .route("/", get(index))
@@ -188,6 +189,71 @@ async fn nodes(State(app): State<Arc<AppState>>) -> Json<Vec<NodeResp>> {
         .collect();
     v.sort_by(|a, b| a.name.cmp(&b.name));
     Json(v)
+}
+
+/// 逐个节点建隧道测握手延迟（并发，单节点 4s 超时）
+/// 隧道是按需建立的：没有流量就没有隧道，所以这里主动打通一次
+async fn probe(State(app): State<Arc<AppState>>) -> Json<Vec<ProbeResp>> {
+    let targets: Vec<(String, String)> = {
+        let dir = app.node.dir.read().await;
+        dir.values()
+            .filter(|n| n.node_id != app.info.node_id)
+            .map(|n| (n.node_id.clone(), n.name.clone()))
+            .collect()
+    };
+    let mut handles = Vec::new();
+    for (id, name) in targets {
+        let state = app.node.clone();
+        let ns = app.ns.clone();
+        let id_pub = app.id_pub;
+        handles.push(tokio::spawn(async move {
+            let t0 = std::time::Instant::now();
+            // 跨地域要经中继: 直连地址逐个 4s 超时后再走中继, 这里给足余量
+            let r = tokio::time::timeout(
+                std::time::Duration::from_secs(12),
+                tunnel_for(&state, &ns, &id_pub, &id),
+            )
+            .await;
+            let (ms, path, err) = match r {
+                Ok(Ok(_)) => (
+                    t0.elapsed().as_millis() as u64,
+                    state.path.read().await.get(&id).cloned(),
+                    None,
+                ),
+                Ok(Err(e)) => (0, None, Some(format!("{e:#}"))),
+                Err(_) => (0, None, Some("超时".to_string())),
+            };
+            ProbeResp { name, rtt_ms: ms, path, error: err }
+        }));
+    }
+    // 建完后再等一小会，取心跳测得的更准 RTT
+    let mut out = Vec::new();
+    for h in handles {
+        if let Ok(v) = h.await {
+            out.push(v);
+        }
+    }
+    tokio::time::sleep(std::time::Duration::from_millis(400)).await;
+    let rtt = app.node.rtt.read().await;
+    let dir = app.node.dir.read().await;
+    for r in out.iter_mut() {
+        if let Some(n) = dir.values().find(|n| n.name == r.name) {
+            if let Some(v) = rtt.get(&n.node_id) {
+                if *v > 0 {
+                    r.rtt_ms = *v as u64;
+                }
+            }
+        }
+    }
+    Json(out)
+}
+
+#[derive(serde::Serialize)]
+struct ProbeResp {
+    name: String,
+    rtt_ms: u64,
+    path: Option<String>,
+    error: Option<String>,
 }
 
 async fn get_exit(State(app): State<Arc<AppState>>) -> Json<ExitReq> {

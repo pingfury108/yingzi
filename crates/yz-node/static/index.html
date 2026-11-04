@@ -168,7 +168,9 @@
     <span class="meta">当前 <b id="exitCur" class="num" style="color:var(--accent)">—</b></span>
   </div>
 
-  <h2>网络节点</h2>
+  <h2>网络节点
+    <button class="ghost" style="margin-left:auto" onclick="probeAll()" id="probeBtn">一键测速</button>
+  </h2>
   <div class="card" style="padding:6px 16px 10px">
     <table>
       <thead><tr>
@@ -310,9 +312,11 @@ async function refresh() {
       const connected = !!n.path;                      // 有路径 = 隧道已建立
       const dotCls = n.is_self ? 'dot on' : connected ? 'dot ok'
         : (n.exit_capable ? 'dot warn' : 'dot');
-      const rtt = n.rtt_ms != null ? `${n.rtt_ms}ms` : (connected ? '—' : '');
-      const rttColor = !connected ? 'var(--text-3)'
-        : (n.rtt_ms != null && n.rtt_ms <= 20 ? 'var(--direct)' : 'var(--text-2)');
+      const pr = probeResult[n.name] || {};
+      const rttVal = pr.rtt_ms || n.rtt_ms;
+      const rtt = rttVal ? `${rttVal}ms` : '—';
+      const rttColor = !rttVal ? 'var(--text-3)'
+        : (rttVal <= 20 ? 'var(--direct)' : rttVal <= 120 ? 'var(--text-2)' : 'var(--warn)');
       return `<tr>
         <td><span class="${dotCls}"></span></td>
         <td>
@@ -329,7 +333,7 @@ async function refresh() {
         <td class="mono" style="color:${rttColor}">${rtt || '—'}</td>
         <td>${n.is_self ? '<span class="badge self">本机</span>'
           : n.path ? `<span class="badge path">${n.path}</span>`
-          : '<span class="meta">未连接</span>'}</td>
+          : '<span class="meta">在线 · 未建隧道</span>'}</td>
       </tr>`;
     }).join('');
 
@@ -374,6 +378,18 @@ async function refresh() {
     }).join('') : '<div class="empty">暂无事件</div>';
   } catch (e) { /* 节点重启中，等下一次 */ }
 }
+
+async function probeAll() {
+  const btn = $('probeBtn');
+  btn.disabled = true; btn.textContent = '测速中…';
+  try {
+    const res = await api('/api/probe', { method: 'POST' });
+    probeResult = Object.fromEntries((res || []).map(r => [r.name, r]));
+  } catch (e) { /* ignore */ }
+  btn.disabled = false; btn.textContent = '一键测速';
+  refresh();
+}
+let probeResult = {};
 
 async function saveExit() {
   await api('/api/exit', {
