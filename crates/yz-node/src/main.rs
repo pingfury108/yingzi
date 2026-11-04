@@ -102,6 +102,10 @@ enum Cmd {
         /// 可持久化配置路径 (Web UI 改的出口/规则落盘到此)
         #[arg(long)]
         config: Option<String>,
+        /// 出口节点预热间隔(秒), 0=关闭; 保持到各出口的隧道常连,
+        /// 好处: 延迟实时可见、切出口瞬时。默认 60s
+        #[arg(long, default_value_t = 60)]
+        prewarm_exits: u64,
     },
     /// 独立隧道出口(无 mesh)
     Serve {
@@ -210,6 +214,7 @@ async fn main() -> Result<()> {
             tun,
             no_tun,
             config,
+            prewarm_exits,
         } => {
             let routes = routes
                 .iter()
@@ -241,6 +246,7 @@ async fn main() -> Result<()> {
                     fallback,
                     tun: if no_tun { None } else { Some(tun) },
                     config: config.map(std::path::PathBuf::from),
+                    prewarm_secs: prewarm_exits,
                 },
                 &ns,
                 id_pub,

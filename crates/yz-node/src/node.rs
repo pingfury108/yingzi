@@ -57,6 +57,8 @@ pub struct NodeOpts {
     pub tun: Option<String>,
     /// 可持久化配置路径 (Web UI 改动落盘)
     pub config: Option<PathBuf>,
+    /// 出口预热间隔(秒), 0=关闭
+    pub prewarm_secs: u64,
 }
 
 pub use yz_core::state::CoreState as NodeState;
@@ -380,6 +382,51 @@ pub async fn run(opts: NodeOpts, ns: &NetworkSecret, id_pub: [u8; 32]) -> Result
         tokio::spawn(async move {
             if let Err(e) = crate::mesh::run(&ifname, state, ns, id_pub, self_id).await {
                 log::warn!("tun: {e:#}");
+            }
+        });
+    }
+
+    // 2.5) 出口预热: 定期给可出口节点建隧道保活
+    //      (隧道按需建立, 空闲时全部"未连接"既看不到延迟, 切出口也要等握手)
+    if opts.prewarm_secs > 0 {
+        let st = state.clone();
+        let ns2 = ns.clone();
+        let interval = Duration::from_secs(opts.prewarm_secs);
+        let self_id2 = self_id.clone();
+        tokio::spawn(async move {
+            loop {
+                tokio::time::sleep(interval).await;
+                let targets: Vec<String> = {
+                    let dir = st.dir.read().await;
+                    dir.values()
+                        .filter(|n| n.caps & caps::EXIT != 0 && n.node_id != self_id2)
+                        .map(|n| n.node_id.clone())
+                        .collect()
+                };
+                // 分批并发, 避免同时握手造成突刺
+                for chunk in targets.chunks(3) {
+                    let mut handles = Vec::new();
+                    for id in chunk {
+                        let st2 = st.clone();
+                        let ns3 = ns2.clone();
+                        let id = id.clone();
+                        handles.push(tokio::spawn(async move {
+                            if let Some(t) = st2.tunnels.lock().await.get(&id) {
+                                if !t.is_closed() {
+                                    return; // 已有活跃隧道
+                                }
+                            }
+                            let _ = tokio::time::timeout(
+                                Duration::from_secs(12),
+                                tunnel_for(&st2, &ns3, &id_pub, &id),
+                            )
+                            .await;
+                        }));
+                    }
+                    for h in handles {
+                        let _ = h.await;
+                    }
+                }
             }
         });
     }

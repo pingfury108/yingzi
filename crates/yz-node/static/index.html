@@ -314,9 +314,9 @@ async function refresh() {
         : (n.exit_capable ? 'dot warn' : 'dot');
       const pr = probeResult[n.name] || {};
       const rttVal = pr.rtt_ms || n.rtt_ms;
-      const rtt = rttVal ? `${rttVal}ms` : '—';
-      const rttColor = !rttVal ? 'var(--text-3)'
-        : (rttVal <= 20 ? 'var(--direct)' : rttVal <= 120 ? 'var(--text-2)' : 'var(--warn)');
+      const rtt = rttVal === 0 && connected ? '<1ms' : rttVal ? `${rttVal}ms` : '—';
+      const rttColor = (!connected && !rttVal) ? 'var(--text-3)'
+        : ((rttVal ?? 0) <= 20 ? 'var(--direct)' : (rttVal ?? 0) <= 120 ? 'var(--text-2)' : 'var(--warn)');
       return `<tr>
         <td><span class="${dotCls}"></span></td>
         <td>
