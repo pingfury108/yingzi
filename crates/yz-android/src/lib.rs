@@ -10,12 +10,11 @@
 //! VpnService 对象用于调用 protect(fd)：栈自己的上游 socket 必须绕过 VPN，
 //! 否则流量会套娃（这是 Android 透明代理的必备步骤）。
 
-use anyhow::{Context, Result};
+use anyhow::Result;
 use jni::objects::{GlobalRef, JClass, JObject, JString, JValue};
-use jni::sys::{jboolean, jint, jstring, JNI_FALSE, JNI_TRUE};
+use jni::sys::{jboolean, jstring, JNI_FALSE, JNI_TRUE};
 use jni::{JNIEnv, JavaVM};
 use serde::{Deserialize, Serialize};
-use std::os::unix::io::FromRawFd;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, OnceLock};
 use yz_core::dns::{DnsConfig, DnsService, SocketProtect, Upstream};
@@ -239,6 +238,7 @@ struct NodeRuntime {
     started: std::time::Instant,
     exit: String,
     self_id: String,
+    #[allow(dead_code)]
     protect: Option<Arc<dyn SocketProtect>>,
     ns: yz_crypto::NetworkSecret,
     id_pub: [u8; 32],
@@ -625,7 +625,6 @@ fn start_async(cfg: StartConfig, protect: Option<Arc<dyn SocketProtect>>) -> Res
 async fn diagnose(
     state: Arc<CoreState>,
     dns: Arc<DnsService>,
-    protect: Option<Arc<dyn SocketProtect>>,
     ns: yz_crypto::NetworkSecret,
     id_pub: [u8; 32],
     self_id: String,
@@ -713,27 +712,6 @@ async fn diagnose(
             "hijacked": hijacked,
         },
     })
-}
-
-/// 测 TCP 连接耗时（毫秒）；失败返回错误描述
-fn tcp_probe(addr: &str, protect: Option<&Arc<dyn SocketProtect>>, timeout_ms: u64) -> Result<u128, String> {
-    use std::net::ToSocketAddrs;
-    let sock_addr = addr
-        .to_socket_addrs()
-        .map_err(|e| format!("解析失败: {e}"))?
-        .next()
-        .ok_or_else(|| "无法解析地址".to_string())?;
-    let start = std::time::Instant::now();
-    let s = std::net::TcpStream::connect_timeout(
-        &sock_addr,
-        std::time::Duration::from_millis(timeout_ms),
-    )
-    .map_err(|e| format!("{e}"))?;
-    if let Some(p) = protect {
-        p.protect_tcp(&s);
-    }
-    let _ = s.set_nodelay(true);
-    Ok(start.elapsed().as_millis())
 }
 
 /// 直接问某一侧上游（绕过规则与 fake-IP），返回 (IP 列表, 耗时 ms)
@@ -909,12 +887,11 @@ pub extern "system" fn Java_io_yingzi_app_YzCore_nativeDiagnose(
             Some(node) => {
                 let state = node.state.clone();
                 let dns = node.dns.clone();
-                let protect = node.protect.clone();
                 let self_id = node.self_id.clone();
                 let ns = node.ns.clone();
                 let id_pub = node.id_pub;
                 rt().block_on(async move {
-                    diagnose(state, dns, protect, ns, id_pub, self_id).await
+                    diagnose(state, dns, ns, id_pub, self_id).await
                 })
             }
             None => serde_json::json!({"error": "核心未运行"}),
