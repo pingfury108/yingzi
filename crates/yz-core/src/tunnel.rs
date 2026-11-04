@@ -72,6 +72,10 @@ pub struct Tunnel {
     next_sid: AtomicU32,
     /// 最后收到对端任何数据的时间 (链路健康判定)
     last_rx: Mutex<Instant>,
+    /// 已发出 PING 且尚未收到 PONG (健康判定用)
+    ping_pending: std::sync::atomic::AtomicBool,
+    /// 发出未应答 PING 的时间
+    ping_sent_at: Mutex<Option<Instant>>,
 }
 
 impl Tunnel {
@@ -105,6 +109,8 @@ impl Tunnel {
             closed_tx,
             next_sid: AtomicU32::new(sid_base),
             last_rx: Mutex::new(Instant::now()),
+            ping_pending: std::sync::atomic::AtomicBool::new(false),
+            ping_sent_at: Mutex::new(None),
         });
         match &t.link {
             Link::Tcp { sess, .. } => {
@@ -272,6 +278,28 @@ impl Tunnel {
     /// P2P UDP 链路会因对称 NAT 映射过期而"静默死亡", 必须主动判定
     pub async fn is_dead(&self, timeout: Duration) -> bool {
         self.is_closed() || self.idle_for().await > timeout
+    }
+
+    /// 健康探测: 记录"已发 PING 未收到 PONG"
+    pub async fn mark_ping_sent(&self) {
+        self.ping_pending.store(true, std::sync::atomic::Ordering::Relaxed);
+        *self.ping_sent_at.lock().await = Some(Instant::now());
+    }
+
+    /// 收到 PONG: 清除未应答标记
+    pub fn mark_ping_acked(&self) {
+        self.ping_pending.store(false, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// PING 发出后是否一直没有 PONG (超过 grace)
+    pub async fn ping_unanswered_for(&self) -> Option<Duration> {
+        if !self.ping_pending.load(std::sync::atomic::Ordering::Relaxed) {
+            return None;
+        }
+        self.ping_sent_at
+            .lock()
+            .await
+            .map(|t| t.elapsed())
     }
 
     /// 主动关闭 (供健康检查判定死亡后调用, 触发重建)

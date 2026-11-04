@@ -175,9 +175,19 @@ pub fn spawn_ctrl_handler(
                 } else {
                     PING_IDLE
                 };
-                // 判定僵尸: 两个心跳周期无任何入向数据 (PING 发出但无 PONG/数据回来)
+                // 判定僵尸 (三层):
+                //  a) 隧道已关闭
+                //  b) 上一次 PING 至今无 PONG 且超过 1.5×周期 (容忍单次丢包, 连续两轮无应答才判死)
+                //  c) 完全静默 (连对端的 PING 都收不到) 超过宽松阈值 (空闲静默 ≠ 链路死)
                 let dead_after = interval * 2 + Duration::from_secs(5);
-                if t2.is_dead(dead_after).await {
+                let unanswered = t2.ping_unanswered_for().await;
+                let silent_too_long = t2.idle_for().await > Duration::from_secs(180);
+                let dead = t2.is_closed()
+                    || match unanswered {
+                        Some(d) => d > interval + interval / 2,
+                        None => silent_too_long,
+                    };
+                if dead {
                     log::warn!(
                         "隧道无入向流量 {}s, 判定失效: {}",
                         dead_after.as_secs(),
@@ -211,6 +221,7 @@ pub fn spawn_ctrl_handler(
                     t2.mark_closed();
                     break;
                 }
+                t2.mark_ping_sent().await;
                 if t2.write_frame(&Frame::Ping { ts: now_ms() }).await.is_err() {
                     break;
                 }
@@ -258,6 +269,7 @@ pub fn spawn_ctrl_handler(
                     let _ = t.write_frame(&Frame::Pong { ts }).await;
                 }
                 Frame::Pong { ts } => {
+                    t.mark_ping_acked();
                     if let Some(st) = &state {
                         let rtt = now_ms().saturating_sub(ts).min(u32::MAX as u64) as u32;
                         st.rtt.write().await.insert(peer_id.clone(), rtt);
@@ -349,6 +361,15 @@ pub async fn adopt_tunnel(
         false,
     );
     crate::mesh::spawn_forward(h.mesh_rx, state.clone());
+    // 替换旧隧道: 必须显式关闭, 否则旧心跳任务永不退出, 持续误报"隧道失效"
+    {
+        let old = state.tunnels.lock().await.get(node_id).cloned();
+        if let Some(o) = old {
+            if !Arc::ptr_eq(&o, &t) {
+                o.mark_closed();
+            }
+        }
+    }
     state
         .path
         .write()
