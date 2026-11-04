@@ -698,7 +698,7 @@ pub async fn pump_stream(
     let (mut lr, mut lw) = local.into_split();
 
     let t2 = t.clone();
-    let uplink = tokio::spawn(async move {
+    let mut uplink = tokio::spawn(async move {
         let mut buf = vec![0u8; IO_BUF];
         loop {
             match lr.read(&mut buf).await {
@@ -723,18 +723,25 @@ pub async fn pump_stream(
         }
     });
 
-    while let Some(f) = rx.recv().await {
-        match f {
-            Frame::Data { payload, .. } => {
-                if lw.write_all(&payload).await.is_err() {
+    // 同时监听"客户端方向结束": 客户端先断开时不等人对端的 Fin
+    // (否则 socket 卡在 CLOSE_WAIT, 每个请求泄漏一个 fd)
+    loop {
+        tokio::select! {
+            f = rx.recv() => match f {
+                Some(Frame::Data { payload, .. }) => {
+                    if lw.write_all(&payload).await.is_err() {
+                        break;
+                    }
+                }
+                Some(Frame::Fin { .. }) => {
+                    lw.shutdown().await.ok();
                     break;
                 }
-            }
-            Frame::Fin { .. } => {
-                lw.shutdown().await.ok();
-            }
-            Frame::Rst { .. } => break,
-            _ => {}
+                Some(Frame::Rst { .. }) => break,
+                Some(_) => {}
+                None => break,
+            },
+            _ = &mut uplink => break,
         }
     }
     uplink.abort();

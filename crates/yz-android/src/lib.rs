@@ -431,6 +431,34 @@ fn start_async(cfg: StartConfig, protect: Option<Arc<dyn SocketProtect>>) -> Res
                             .write_frame(&yz_proto::Frame::Control { payload: hello })
                             .await;
                         log::info!("connected to coordinator {coord}");
+                        // 存活探测: 假死时 mark_closed, 让下面的 select 跳出并重连
+                        {
+                            let t = h.tunnel.clone();
+                            rt().spawn(async move {
+                                loop {
+                                    tokio::time::sleep(std::time::Duration::from_secs(10)).await;
+                                    if t.is_closed() {
+                                        break;
+                                    }
+                                    if t
+                                        .write_frame(&yz_proto::Frame::Ping {
+                                            ts: yz_core::util::now_ms(),
+                                        })
+                                        .await
+                                        .is_err()
+                                    {
+                                        log::warn!("coordinator 写失败, 触发重连");
+                                        t.mark_closed();
+                                        break;
+                                    }
+                                    if t.idle_for().await > std::time::Duration::from_secs(30) {
+                                        log::warn!("coordinator 30s 无响应, 触发重连");
+                                        t.mark_closed();
+                                        break;
+                                    }
+                                }
+                            });
+                        }
                         loop {
                             tokio::select! {
                                 f = h.ctrl_rx.recv() => match f {

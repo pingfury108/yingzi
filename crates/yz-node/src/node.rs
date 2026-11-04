@@ -431,15 +431,25 @@ pub async fn run(opts: NodeOpts, ns: &NetworkSecret, id_pub: [u8; 32]) -> Result
                     opts.exit_acl.clone(),
                     true,
                 );
-                // coordinator 隧道存活探测 (它挂了要尽早重连)
+                // coordinator 隧道存活探测: 假死必须 mark_closed 触发主循环重连
+                // (只 break 探测任务是不够的 — 主循环会一直挂在 ctrl_rx 上)
                 {
                     let t = h.tunnel.clone();
                     tokio::spawn(async move {
                         loop {
                             tokio::time::sleep(Duration::from_secs(10)).await;
-                            if t.is_closed()
-                                || t.write_frame(&Frame::Ping { ts: now_ms() }).await.is_err()
-                            {
+                            if t.is_closed() {
+                                break;
+                            }
+                            if t.write_frame(&Frame::Ping { ts: now_ms() }).await.is_err() {
+                                log::warn!("coordinator 隧道写失败, 触发重连");
+                                t.mark_closed();
+                                break;
+                            }
+                            // 30s 内没有任何入向数据 (含 PONG) → 判定假死
+                            if t.idle_for().await > Duration::from_secs(30) {
+                                log::warn!("coordinator 隧道 30s 无响应, 触发重连");
+                                t.mark_closed();
                                 break;
                             }
                         }
