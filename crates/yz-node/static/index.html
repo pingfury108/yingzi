@@ -332,6 +332,7 @@ async function refresh() {
         <td class="mono" style="color:var(--text-3)" title="${(n.addrs || []).join('\n')}">${n.addr || '—'}</td>
         <td class="mono" style="color:${rttColor}">${rtt || '—'}</td>
         <td>${n.is_self ? '<span class="badge self">本机</span>'
+          : n.exit_via ? `<span class="badge exit">经 ${n.exit_via}</span>`
           : n.path ? `<span class="badge path">${n.path}</span>`
           : '<span class="meta">在线 · 未建隧道</span>'}</td>
       </tr>`;

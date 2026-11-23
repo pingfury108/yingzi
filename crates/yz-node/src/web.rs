@@ -72,6 +72,8 @@ struct NodeResp {
     rtt_ms: Option<u32>,
     /// 本节点到该节点的隧道路径 (p2p/direct/relay)
     path: Option<String>,
+    /// 作为出口时的选定路径：None=直连出口，Some(B)=经 B 中转
+    exit_via: Option<String>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -172,6 +174,7 @@ async fn nodes(State(app): State<Arc<AppState>>) -> Json<Vec<NodeResp>> {
     let dir = app.node.dir.read().await;
     let paths = app.node.path.read().await;
     let rtt = app.node.rtt.read().await;
+    let exits = app.node.exit_path.read().await;
     let mut v: Vec<NodeResp> = dir
         .values()
         .map(|n| NodeResp {
@@ -185,6 +188,7 @@ async fn nodes(State(app): State<Arc<AppState>>) -> Json<Vec<NodeResp>> {
             is_self: n.node_id == app.info.node_id,
             path: paths.get(&n.node_id).cloned(),
             rtt_ms: rtt.get(&n.node_id).copied(),
+            exit_via: exits.get(&n.node_id).and_then(|c| c.via.clone()),
         })
         .collect();
     v.sort_by(|a, b| a.name.cmp(&b.name));

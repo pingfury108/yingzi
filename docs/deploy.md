@@ -262,6 +262,62 @@ curl --socks5-hostname 127.0.0.1:1080 https://ifconfig.me
 - 若本机已有其他 VPN（WireGuard/Tailscale），可能与 `yz0` 路由冲突
 - 用 `start /b` 从 ssh 里起的进程会随会话结束被杀，务必用计划任务
 
+## 5.2 入口协议：SOCKS5 / HTTP / 混合
+
+```bash
+# 各开一个端口
+--socks5 127.0.0.1:1080 --http 127.0.0.1:8080
+
+# 混合：同一端口自动识别（首字节 0x05 → SOCKS5，否则 HTTP）
+--mixed 127.0.0.1:11080
+
+# HTTP 代理加 Basic 认证（挂通配地址时强烈建议）
+--http 0.0.0.0:8080 --http-auth user:pass
+```
+
+验证：
+
+```bash
+curl -x http://127.0.0.1:8080 https://ifconfig.me   # CONNECT 隧道（HTTPS）
+curl -x http://127.0.0.1:8080 http://ifconfig.me    # 绝对 URI（明文）
+curl -x http://user:pass@127.0.0.1:8080 https://ifconfig.me
+curl -x http://127.0.0.1:8080 https://ifconfig.me -v | grep 407   # 无口令时
+```
+
+说明：
+- HTTP 代理支持 `CONNECT`（HTTPS/WSS）与绝对 URI（明文 HTTP）两种形态
+- 明文 HTTP 一律 `Connection: close`（一个连接一个请求）
+- 域名交给出口侧解析，不在本地解析（继承 fake-IP / 防污染）
+- 绑通配地址时只接受私网/回环来源
+
+## 5.3 两跳出口与自动选路
+
+当「本机 → 出口」链路差，但「本机 → B」与「B → 出口」都顺时，可让 B 当跳板：
+
+```bash
+# 手动指定两跳（B>C）
+--default-exit vps-tokyo>overseas-hk
+# 或写进分流规则
+--route 'domain-suffix:netflix.com=vps-tokyo>overseas-hk'
+
+# 自动选路：默认开启（--prewarm-exits>0 时生效），无需配置
+--prewarm-exits 60
+
+# 谁能请我当中转（默认 all；想收紧就列节点）
+--relay-allow all|none|nodeA,nodeB
+```
+
+自动选路的规则：
+- 对每个可出口节点，比较「直连」与「经前 3 个最近节点中转」的建链耗时
+- 新路径需比旧路径快 **25%** 才切换（防抖）；结果缓存 **5 分钟**
+- 隧道失效立即作废缓存，回退直连 → 协调器中继
+- 事件流会记录：`出口 hk 路径 direct 240ms → via laptop 85ms`
+
+安全：中转节点只转发**已端到端加密**的字节（A↔C 嵌套加密），
+它看不到内容，只能看到包大小与时序。中转链最多 2 跳（`RELAY_MARK` 不再二次转发）。
+
+Web 控制台「路径」列会显示 `经 laptop` 之类的标记。
+
 ## 6. 运维速查
 
 ```bash
