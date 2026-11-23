@@ -452,6 +452,8 @@ pub async fn try_punch(
 
 pub struct PeerCtx {
     pub exit_acl: ExitAcl,
+    /// 谁可以请我当中转（把我当作到达第三方的跳板）
+    pub relay_acl: ExitAcl,
     pub ingress_acl: ExitAcl,
     pub ingress_ports: (u16, u16),
     pub state: Option<Arc<CoreState>>,
@@ -495,7 +497,7 @@ pub async fn handle_peer(h: TunnelHandle, ctx: &PeerCtx) -> Result<()> {
         ctx.ns.clone(),
         ctx.id_pub,
         ctx.state.clone(),
-        ctx.exit_acl.clone(),
+        ctx.relay_acl.clone(),
         true,
     );
     if let Some(st) = &ctx.state {
@@ -533,6 +535,113 @@ pub fn spawn_incoming_handler(
                 });
                 continue;
             }
+            // 通用中转请求: 对端希望「先到我, 再到另一个节点」
+            // 地址形如 Domain(目标节点, 0)，不是 RELAY_MARK 就说明是请我当跳板
+            if relay_ok
+                && matches!(&addr, yz_proto::Addr::Domain(d, 0) if d != tunnel::RELAY_MARK)
+            {
+                let yz_proto::Addr::Domain(key, _) = addr.clone() else {
+                    continue;
+                };
+                let t = t.clone();
+                let ns = ns.clone();
+                let st = state.clone();
+                let acl = relay_acl.clone();
+                let peer_id = peer_id.clone();
+                tokio::spawn(async move {
+                    // 拒绝条件: ACL 不允许 / 目标就是请求者自己(防 A→B→A)
+                    if !acl.allows(&peer_id) || key == peer_id {
+                        let _ = t
+                            .write_frame(&Frame::SynAck {
+                                stream_id: sid,
+                                ok: false,
+                            })
+                            .await;
+                        log::warn!(
+                            "relay request denied ({}) from {}",
+                            if key == peer_id { "self" } else { "acl" },
+                            &peer_id[..8.min(peer_id.len())]
+                        );
+                        return;
+                    }
+                    let Some(st) = st else {
+                        let _ = t
+                            .write_frame(&Frame::SynAck {
+                                stream_id: sid,
+                                ok: false,
+                            })
+                            .await;
+                        return;
+                    };
+                    let Some(entry) = resolve_node(&st, &key).await else {
+                        let _ = t
+                            .write_frame(&Frame::SynAck {
+                                stream_id: sid,
+                                ok: false,
+                            })
+                            .await;
+                        log::debug!("relay target {key} 不在目录");
+                        return;
+                    };
+                    let target_t = match tunnel_for(&st, &ns, &id_pub, &entry.node_id).await {
+                        Ok(v) => v,
+                        Err(e) => {
+                            let _ = t
+                                .write_frame(&Frame::SynAck {
+                                    stream_id: sid,
+                                    ok: false,
+                                })
+                                .await;
+                            log::debug!("relay: 到 {} 的隧道失败: {e:#}", &entry.node_id[..8.min(entry.node_id.len())]);
+                            return;
+                        }
+                    };
+                    // 向目标开中继端点流并等它应答
+                    let (sid_b, mut rx_b) = match target_t
+                        .open_stream(yz_proto::Addr::Domain(tunnel::RELAY_MARK.into(), 0))
+                        .await
+                    {
+                        Ok(v) => v,
+                        Err(e) => {
+                            let _ = t
+                                .write_frame(&Frame::SynAck {
+                                    stream_id: sid,
+                                    ok: false,
+                                })
+                                .await;
+                            log::debug!("relay: open RELAY_MARK 失败: {e:#}");
+                            return;
+                        }
+                    };
+                    match timeout(Duration::from_secs(10), rx_b.recv()).await {
+                        Ok(Some(Frame::SynAck { ok: true, .. })) => {}
+                        _ => {
+                            let _ = t
+                                .write_frame(&Frame::SynAck {
+                                    stream_id: sid,
+                                    ok: false,
+                                })
+                                .await;
+                            log::debug!("relay: 目标未应答");
+                            return;
+                        }
+                    }
+                    if t.write_frame(&Frame::SynAck { stream_id: sid, ok: true })
+                        .await
+                        .is_err()
+                    {
+                        return;
+                    }
+                    log::debug!(
+                        "relay stream {sid}: {} -> {}",
+                        &peer_id[..8.min(peer_id.len())],
+                        &entry.node_id[..8.min(entry.node_id.len())]
+                    );
+                    crate::tunnel::pipe_streams(t, sid, rx, target_t, sid_b, rx_b).await;
+                });
+                continue;
+            }
+
             // 中继端点
             if relay_ok && matches!(&addr, yz_proto::Addr::Domain(d, 0) if d == tunnel::RELAY_MARK)
             {

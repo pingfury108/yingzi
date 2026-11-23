@@ -9,6 +9,7 @@
 
 mod coord;
 mod dial;
+mod http_proxy;
 mod mesh;
 mod node;
 mod socks5;
@@ -66,6 +67,15 @@ enum Cmd {
         /// 本地 SOCKS5 入口地址, 如 127.0.0.1:1080
         #[arg(long)]
         socks5: Option<String>,
+        /// 本地 HTTP 代理入口地址, 如 127.0.0.1:8080
+        #[arg(long)]
+        http: Option<String>,
+        /// 混合入口（同一端口自动识别 SOCKS5 / HTTP）, 如 127.0.0.1:1080
+        #[arg(long)]
+        mixed: Option<String>,
+        /// HTTP 代理认证 "user:pass"（不给则不校验）
+        #[arg(long)]
+        http_auth: Option<String>,
         /// Web UI 监听地址, 如 127.0.0.1:9800
         #[arg(long)]
         web: Option<String>,
@@ -102,6 +112,9 @@ enum Cmd {
         /// 可持久化配置路径 (Web UI 改的出口/规则落盘到此)
         #[arg(long)]
         config: Option<String>,
+        /// 允许谁请我当中转（把我当跳板到第三方）: all | none | node_id列表
+        #[arg(long, default_value = "all")]
+        relay_allow: String,
         /// 出口节点预热间隔(秒), 0=关闭; 保持到各出口的隧道常连,
         /// 好处: 延迟实时可见、切出口瞬时。默认 60s
         #[arg(long, default_value_t = 60)]
@@ -207,6 +220,9 @@ async fn main() -> Result<()> {
             advertise,
             udp_advertise,
             socks5,
+            http,
+            mixed,
+            http_auth,
             web,
             web_token,
             ingress,
@@ -220,6 +236,7 @@ async fn main() -> Result<()> {
             no_tun,
             config,
             prewarm_exits,
+            relay_allow,
         } => {
             let routes = routes
                 .iter()
@@ -240,6 +257,12 @@ async fn main() -> Result<()> {
                     coord: coordinator,
                     name,
                     socks5,
+                    http,
+                    mixed,
+                    http_auth: http_auth.as_ref().and_then(|s| {
+                        s.split_once(':')
+                            .map(|(u, p)| (u.to_string(), p.to_string()))
+                    }),
                     web,
                     web_token,
                     ingress,
@@ -252,6 +275,7 @@ async fn main() -> Result<()> {
                     tun: if no_tun { None } else { Some(tun) },
                     config: config.map(std::path::PathBuf::from),
                     prewarm_secs: prewarm_exits,
+                    relay_acl: yz_core::policy::ExitAcl::parse(&relay_allow),
                 },
                 &ns,
                 id_pub,

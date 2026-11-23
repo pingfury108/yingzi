@@ -8,7 +8,7 @@
 use yz_core::ingress::{self, IngressRule};
 use yz_core::util::{is_local_source, local_addrs};
 pub(crate) use yz_core::peer::{
-    handle_peer, resolve_node, spawn_incoming_handler, tunnel_for, tunnel_for_retry, PeerCtx,
+    handle_peer, resolve_node, spawn_incoming_handler, tunnel_for, PeerCtx,
 };
 pub(crate) use yz_core::util::{now_ms, pick_addr};
 use yz_core::policy::{match_route, ExitAcl, RouteRule};
@@ -37,6 +37,12 @@ pub struct NodeOpts {
     /// 手动指定对外公布的 UDP 映射地址 (VPS/云 NAT 场景, 探测会被回环误导)
     pub udp_advertise: Option<String>,
     pub socks5: Option<String>,
+    /// HTTP 代理入口
+    pub http: Option<String>,
+    /// 混合入口（同端口识别 SOCKS5 / HTTP）
+    pub mixed: Option<String>,
+    /// HTTP 代理认证 user:pass
+    pub http_auth: Option<(String, String)>,
     /// Web UI 监听地址
     pub web: Option<String>,
     /// Web UI 访问令牌 (挂公网必须设)
@@ -59,6 +65,8 @@ pub struct NodeOpts {
     pub config: Option<PathBuf>,
     /// 出口预热间隔(秒), 0=关闭
     pub prewarm_secs: u64,
+    /// 谁可以请我当中转
+    pub relay_acl: ExitAcl,
 }
 
 pub use yz_core::state::CoreState as NodeState;
@@ -226,6 +234,7 @@ pub async fn run(opts: NodeOpts, ns: &NetworkSecret, id_pub: [u8; 32]) -> Result
     if let Some(ep) = udp_ep.clone() {
         let ctx = PeerCtx {
             exit_acl: opts.exit_acl.clone(),
+            relay_acl: opts.relay_acl.clone(),
             ingress_acl: opts.ingress_acl.clone(),
             ingress_ports: opts.ingress_ports,
             state: Some(state.clone()),
@@ -253,6 +262,7 @@ pub async fn run(opts: NodeOpts, ns: &NetworkSecret, id_pub: [u8; 32]) -> Result
         let state = state.clone();
         let ctx = PeerCtx {
             exit_acl: opts.exit_acl.clone(),
+            relay_acl: opts.relay_acl.clone(),
             ingress_acl: opts.ingress_acl.clone(),
             ingress_ports: opts.ingress_ports,
             state: Some(state.clone()),
@@ -340,6 +350,107 @@ pub async fn run(opts: NodeOpts, ns: &NetworkSecret, id_pub: [u8; 32]) -> Result
                 }
             }
         });
+    }
+
+    // 2a) HTTP 代理入口 / 混合入口（同端口自动识别 SOCKS5 与 HTTP）
+    {
+        let http_proxy = opts.http.clone();
+        let mixed = opts.mixed.clone();
+        let auth = opts.http_auth.clone();
+
+        // 统一的连接处理：mixed 模式先 peek 首字节决定走哪条前端
+        async fn dispatch(
+            stream: TcpStream,
+            state: &Arc<NodeState>,
+            ns: &NetworkSecret,
+            id_pub: [u8; 32],
+            self_id: &str,
+            hp: &crate::http_proxy::HttpProxy,
+            allow_socks: bool,
+            sniff: bool,
+        ) {
+            if sniff {
+                let mut b = [0u8; 1];
+                let is_socks = match stream.peek(&mut b).await {
+                    Ok(1) => b[0] == 0x05,
+                    _ => return,
+                };
+                if is_socks {
+                    if allow_socks {
+                        let _ = handle_socks5(stream, state, ns, &id_pub, self_id).await;
+                    }
+                    return;
+                }
+            }
+            if let Err(e) = hp.handle(stream).await {
+                log::debug!("http proxy: {e:#}");
+            }
+        }
+
+        for (listen, sniff) in [(http_proxy, false), (mixed, true)] {
+            let Some(listen) = listen else { continue };
+            let wildcard = {
+                let host = listen.rsplit_once(':').map(|(h, _)| h).unwrap_or("");
+                host.is_empty() || host == "0.0.0.0" || host == "[::]" || host == "::"
+            };
+            let listener = match TcpListener::bind(&listen).await {
+                Ok(l) => l,
+                Err(e) => {
+                    log::error!("绑定 {listen} 失败: {e}");
+                    continue;
+                }
+            };
+            if sniff {
+                log::info!("mixed entry (socks5+http) on {listen}");
+            } else {
+                log::info!(
+                    "http proxy entry on {listen}{}",
+                    if auth.is_some() { " (需认证)" } else { "" }
+                );
+            }
+            let hp = Arc::new(crate::http_proxy::HttpProxy {
+                state: state.clone(),
+                ns: ns.clone(),
+                id_pub,
+                self_id: self_id.clone(),
+                auth: auth.clone(),
+            });
+            let state = state.clone();
+            let ns = ns.clone();
+            let self_id = self_id.clone();
+            // 混合入口总是同时支持两种前端（首字节为 0x05 走 SOCKS5，否则 HTTP）
+            let allow_socks = sniff;
+            tokio::spawn(async move {
+                loop {
+                    match listener.accept().await {
+                        Ok((stream, from)) => {
+                            if wildcard && !is_local_source(from.ip()) {
+                                log::warn!("proxy 拒绝非私网来源 {from}");
+                                continue;
+                            }
+                            let state = state.clone();
+                            let ns = ns.clone();
+                            let self_id = self_id.clone();
+                            let hp = hp.clone();
+                            tokio::spawn(async move {
+                                dispatch(stream, &state, &ns, id_pub, &self_id, &hp, allow_socks, sniff)
+                                    .await;
+                            });
+                        }
+                        Err(e) => {
+                            if e.raw_os_error() == Some(24) {
+                                state
+                                    .push_event("warn", "FD 耗尽, proxy accept 1s 后重试".into())
+                                    .await;
+                                tokio::time::sleep(Duration::from_secs(1)).await;
+                            } else {
+                                log::warn!("proxy accept: {e}");
+                            }
+                        }
+                    }
+                }
+            });
+        }
     }
 
     // 2b) Web UI
@@ -441,15 +552,11 @@ pub async fn run(opts: NodeOpts, ns: &NetworkSecret, id_pub: [u8; 32]) -> Result
                         let st2 = st.clone();
                         let ns3 = ns2.clone();
                         let id = id.clone();
+                        let sid = self_id2.clone();
                         handles.push(tokio::spawn(async move {
-                            if let Some(t) = st2.tunnels.lock().await.get(&id) {
-                                if !t.is_closed() {
-                                    return; // 已有活跃隧道
-                                }
-                            }
-                            let _ = tokio::time::timeout(
-                                Duration::from_secs(12),
-                                tunnel_for(&st2, &ns3, &id_pub, &id),
+                            // 走自动选路: 顺带完成「直连 vs 经中转」的测量与缓存
+                            let _ = yz_core::path::exit_tunnel(
+                                &st2, &ns3, &id_pub, &sid, &id, None,
                             )
                             .await;
                         }));
@@ -624,7 +731,11 @@ pub async fn run(opts: NodeOpts, ns: &NetworkSecret, id_pub: [u8; 32]) -> Result
 
 enum Exit {
     Direct,
-    Via(String), // node_id
+    /// 经出口节点出网；hop = Some(B) 表示强制经 B 中转（B>C 语法）
+    Via {
+        target: String,
+        hop: Option<String>,
+    },
 }
 
 async fn handle_socks5(
@@ -658,38 +769,76 @@ async fn handle_socks5(
             tokio::time::sleep(Duration::from_millis(500)).await;
         }
     }
-    let decision = resolve_exit(state, &key, self_id).await;
-
-    match decision {
-        Exit::Direct => {
-            let outbound = match TcpStream::connect(addr.to_string()).await {
-                Ok(s) => s,
-                Err(e) => {
-                    socks5::reply_fail(&mut local).await;
-                    return Err(e.into());
-                }
-            };
+    // 建立上游（直连或经出口，含自动选路）
+    let up = match open_upstream(state, ns, id_pub, self_id, &key, &addr).await {
+        Ok(u) => u,
+        Err(e) => {
+            socks5::reply_fail(&mut local).await;
+            return Err(e);
+        }
+    };
+    match up {
+        Upstream::Direct(mut outbound) => {
             socks5::reply_ok(&mut local).await?;
             log::debug!("{addr} -> direct");
-            let (mut lr, mut lw) = local.into_split();
-            let (mut or, mut ow) = outbound.into_split();
-            let a = tokio::io::copy(&mut lr, &mut ow);
-            let b = tokio::io::copy(&mut or, &mut lw);
-            let _ = tokio::join!(a, b);
+            let _ = tokio::io::copy_bidirectional(&mut local, &mut outbound).await;
             Ok(())
         }
-        Exit::Via(node_id) => {
-            let t = tunnel_for_retry(state, ns, id_pub, &node_id, 2, Duration::from_millis(1200))
-                .await?;
-            let (sid, mut rx) = match t.open_stream(addr.clone()).await {
+        Upstream::Tunnel { t, sid, rx } => {
+            socks5::reply_ok(&mut local).await?;
+            log::debug!("{addr} -> via tunnel");
+            tunnel::pump_stream(local, sid, rx, t).await
+        }
+    }
+}
+
+/// 已建立的上游通道
+pub(crate) enum Upstream {
+    /// 直连目标（本地解析）
+    Direct(TcpStream),
+    /// 经出口节点（可能是直连出口，也可能经中转），已等到 SYN_ACK
+    Tunnel {
+        t: Arc<yz_core::tunnel::Tunnel>,
+        sid: u32,
+        rx: mpsc::Receiver<Frame>,
+    },
+}
+
+/// 按出口策略建立到 `target` 的上游通道（不写任何前端应答）。
+/// SOCKS5 / HTTP 代理共用。
+pub(crate) async fn open_upstream(
+    state: &Arc<NodeState>,
+    ns: &NetworkSecret,
+    id_pub: &[u8; 32],
+    self_id: &str,
+    exit_key: &str,
+    target: &Addr,
+) -> Result<Upstream> {
+    match resolve_exit(state, exit_key, self_id).await {
+        Exit::Direct => {
+            let s = TcpStream::connect(target.to_string()).await?;
+            s.set_nodelay(true).ok();
+            Ok(Upstream::Direct(s))
+        }
+        Exit::Via { target: node_id, hop } => {
+            let t = yz_core::path::exit_tunnel(
+                state,
+                ns,
+                id_pub,
+                self_id,
+                &node_id,
+                hop.as_deref(),
+            )
+            .await?;
+            let short = &node_id[..8.min(node_id.len())];
+            let (sid, mut rx) = match t.open_stream(target.clone()).await {
                 Ok(v) => v,
                 Err(e) => {
-                    // 开流失败通常意味着隧道已死: 淘汰缓存, 让下次请求重建
-                    log::debug!("open_stream 失败, 淘汰隧道 {}: {e:#}", &node_id[..8]);
+                    log::debug!("open_stream 失败, 淘汰隧道 {short}: {e:#}");
                     t.mark_closed();
                     state.tunnels.lock().await.remove(&node_id);
                     state.path.write().await.remove(&node_id);
-                    socks5::reply_fail(&mut local).await;
+                    state.exit_path.write().await.remove(&node_id);
                     return Err(e);
                 }
             };
@@ -702,66 +851,79 @@ async fn handle_socks5(
                 Err(_) => None, // 超时 = 链路可能已死
             };
             match acked {
-                Some(true) => {}
+                Some(true) => Ok(Upstream::Tunnel { t, sid, rx }),
                 other => {
-                    // 淘汰疑似僵尸隧道, 下次请求会重建
                     t.mark_closed();
                     state.tunnels.lock().await.remove(&node_id);
                     state.path.write().await.remove(&node_id);
+                    state.exit_path.write().await.remove(&node_id);
                     state
                         .push_event(
                             "warn",
                             format!(
-                                "隧道无响应, 已淘汰: {} ({})",
-                                &node_id[..8.min(node_id.len())],
+                                "隧道无响应, 已淘汰: {short} ({})",
                                 if other.is_some() { "拒绝" } else { "超时" }
                             ),
                         )
                         .await;
-                    socks5::reply_fail(&mut local).await;
                     bail!("exit {node_id} 流建立失败 ({other:?}), 隧道已淘汰");
                 }
             }
-            socks5::reply_ok(&mut local).await?;
-            log::debug!("{addr} -> via {}", &node_id[..8]);
-            tunnel::pump_stream(local, sid, rx, t).await
         }
     }
 }
 
 /// 枚举本机可用于隧道连接的地址 (不含回环/通配):
 /// 把 --advertise 的端口应用到所有本地网卡 IP 上, 让不同网段的节点都能连到我们
-async fn resolve_exit(state: &Arc<NodeState>, exit: &str, self_id: &str) -> Exit {    match exit {
-        "direct" => Exit::Direct,
-                // auto: 选延迟最低的可出口节点 (未测得延迟的排最后)
-                "auto" => {
-                    let dir = state.dir.read().await;
-                    let rtt = state.rtt.read().await;
-                    let mut cands: Vec<(u32, String)> = dir
-                        .values()
-                        .filter(|n| n.caps & caps::EXIT != 0 && n.node_id != self_id)
-                        .map(|n| {
-                            (
-                                rtt.get(&n.node_id).copied().unwrap_or(u32::MAX),
-                                n.node_id.clone(),
-                            )
-                        })
-                        .collect();
-                    cands.sort();
-                    match cands.first() {
-                        Some((_, id)) => Exit::Via(id.clone()),
-                        None => Exit::Direct,
-                    }
-                }
-        key => {
-            match resolve_node(state, key).await {
-                Some(n) => Exit::Via(n.node_id),
-                None => {
-                    log::warn!("exit node '{key}' not in directory, fallback direct");
-                    Exit::Direct
-                }
+async fn resolve_exit(state: &Arc<NodeState>, exit: &str, self_id: &str) -> Exit {
+    // 支持 "B>C" 语法：经 B 中转到达出口 C
+    let (hop_spec, exit_spec) = yz_core::path::parse_spec(exit);
+    // 手动指定的中转节点先解析成 node_id
+    let hop = match &hop_spec {
+        Some(h) => match resolve_node(state, h).await {
+            Some(n) => Some(n.node_id),
+            None => {
+                log::warn!("中转节点 '{h}' 不在目录, 忽略中转直接到出口");
+                None
+            }
+        },
+        None => None,
+    };
+    match exit_spec.as_str() {
+        "direct" if hop.is_none() => Exit::Direct,
+        // auto: 选延迟最低的可出口节点 (未测得延迟的排最后)
+        "auto" if hop.is_none() => {
+            let dir = state.dir.read().await;
+            let rtt = state.rtt.read().await;
+            let mut cands: Vec<(u32, String)> = dir
+                .values()
+                .filter(|n| n.caps & caps::EXIT != 0 && n.node_id != self_id)
+                .map(|n| {
+                    (
+                        rtt.get(&n.node_id).copied().unwrap_or(u32::MAX),
+                        n.node_id.clone(),
+                    )
+                })
+                .collect();
+            cands.sort();
+            match cands.first() {
+                Some((_, id)) => Exit::Via {
+                    target: id.clone(),
+                    hop,
+                },
+                None => Exit::Direct,
             }
         }
+        key => match resolve_node(state, key).await {
+            Some(n) => Exit::Via {
+                target: n.node_id,
+                hop,
+            },
+            None => {
+                log::warn!("exit node '{key}' not in directory, fallback direct");
+                Exit::Direct
+            }
+        },
     }
 }
 
@@ -920,10 +1082,19 @@ async fn open_udp_route(
             });
             Ok(tx)
         }
-        Exit::Via(node_id) => {
-            log::debug!("udp route {target} -> exit {}", &node_id[..8]);
-            let t = tunnel_for_retry(state, ns, id_pub, &node_id, 2, Duration::from_millis(1200))
-                .await?;
+        Exit::Via { target: exit_node, hop } => {
+            let node_id = exit_node;
+            log::debug!("udp route {target} -> exit {}", &node_id[..8.min(node_id.len())]);
+            // UDP 同样走入口选路（直连 or 经中转）
+            let t = yz_core::path::exit_tunnel(
+                state,
+                ns,
+                id_pub,
+                self_id,
+                &node_id,
+                hop.as_deref(),
+            )
+            .await?;
             let (sid, mut rx) = t
                 .open_stream_kind(target.clone(), yz_proto::StreamKind::Udp)
                 .await?;
@@ -1013,6 +1184,7 @@ pub async fn serve(
 ) -> Result<()> {
     let ctx = PeerCtx {
         exit_acl: ExitAcl::All,
+        relay_acl: ExitAcl::None, // 独立 serve 模式不做中转
         ingress_acl: ExitAcl::None,
         ingress_ports: (0, 0),
         state: None,

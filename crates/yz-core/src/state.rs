@@ -49,6 +49,20 @@ pub struct CoreState {
     /// 最近一次与协调器成功交互的时间 (unix ms, 0 = 从未)
     /// 用原子量而非锁: 看门狗必须能在任何锁死的情况下读到它
     pub coord_seen_ms: std::sync::atomic::AtomicU64,
+    /// 出口自动选路结果: 出口 node_id → 选定路径
+    pub exit_path: RwLock<HashMap<String, ExitChoice>>,
+}
+
+/// 出口路径选择（直连 or 经中转）
+#[derive(Clone)]
+pub struct ExitChoice {
+    /// Some(B) = 经 B 中转; None = 直连出口
+    pub via: Option<String>,
+    /// 建链耗时（毫秒），用于比较与展示
+    pub ms: u64,
+    pub at: std::time::Instant,
+    /// 经中转时缓存的嵌套隧道（直连时为 None，走 tunnels 表）
+    pub tunnel: Option<Arc<Tunnel>>,
 }
 
 impl CoreState {

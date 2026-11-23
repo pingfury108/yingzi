@@ -10,6 +10,7 @@ pub mod fakeip;
 pub mod geo;
 pub mod ingress;
 pub mod mesh;
+pub mod path;
 pub mod peer;
 pub mod policy;
 pub mod stack;
