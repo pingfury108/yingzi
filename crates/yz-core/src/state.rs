@@ -46,6 +46,9 @@ pub struct CoreState {
     pub p2p_fail: RwLock<HashMap<String, (u32, std::time::Instant)>>,
     /// 域名访问统计: 域名 → (次数, 动作)
     pub domains: RwLock<HashMap<String, (u64, String)>>,
+    /// 最近一次与协调器成功交互的时间 (unix ms, 0 = 从未)
+    /// 用原子量而非锁: 看门狗必须能在任何锁死的情况下读到它
+    pub coord_seen_ms: std::sync::atomic::AtomicU64,
 }
 
 impl CoreState {
@@ -71,6 +74,24 @@ pub struct PersistedConfig {
 }
 
 impl CoreState {
+    /// 记录一次与协调器的成功交互（注册成功 / 收到 DirSync）
+    pub fn touch_coord(&self) {
+        self.coord_seen_ms
+            .store(crate::util::now_ms(), std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// 距上次与协调器交互的秒数 (None = 尚未成功过)
+    pub fn coord_silence_secs(&self) -> Option<u64> {
+        let ms = self
+            .coord_seen_ms
+            .load(std::sync::atomic::Ordering::Relaxed);
+        if ms == 0 {
+            return None;
+        }
+        let now = crate::util::now_ms();
+        Some(now.saturating_sub(ms) / 1000)
+    }
+
     /// 域名访问计数（用于统计页 TOP 榜）
     pub async fn bump_domain(&self, domain: &str, action: &str) {
         let mut m = self.domains.write().await;

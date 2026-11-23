@@ -386,6 +386,37 @@ pub async fn run(opts: NodeOpts, ns: &NetworkSecret, id_pub: [u8; 32]) -> Result
         });
     }
 
+    // 2.4) 协调器看门狗
+    // 历史问题: 曾出现进程存活但协调器隧道假死、且主循环卡在清理阶段，
+    // 导致节点从目录消失却 10 天不重连、日志零输出。这里用原子量做看门狗，
+    // 失联超时就主动退出，交给守护进程 (runpulse/systemd) 重启。
+    {
+        const SILENCE_LIMIT: u64 = 150; // 秒
+        let st = state.clone();
+        tokio::spawn(async move {
+            let mut last_note = 0u64;
+            loop {
+                tokio::time::sleep(Duration::from_secs(20)).await;
+                let Some(silence) = st.coord_silence_secs() else {
+                    continue; // 还没成功注册过, 由注册循环自己重试
+                };
+                if silence <= SILENCE_LIMIT {
+                    last_note = 0;
+                    continue;
+                }
+                // 每 60s 记一次, 避免刷屏
+                if silence.saturating_sub(last_note) >= 60 {
+                    last_note = silence;
+                    log::error!("协调器已失联 {silence}s, 判定为僵死");
+                }
+                if silence > SILENCE_LIMIT + 30 {
+                    log::error!("协调器失联超过 {}s, 主动退出以便被守护进程重启", SILENCE_LIMIT + 30);
+                    std::process::exit(3);
+                }
+            }
+        });
+    }
+
     // 2.5) 出口预热: 定期给可出口节点建隧道保活
     //      (隧道按需建立, 空闲时全部"未连接"既看不到延迟, 切出口也要等握手)
     if opts.prewarm_secs > 0 {
@@ -445,6 +476,7 @@ pub async fn run(opts: NodeOpts, ns: &NetworkSecret, id_pub: [u8; 32]) -> Result
                     coord,
                     &h.peer.node_id()[..8]
                 );
+                state.touch_coord();
                 *state.coord_tunnel.write().await = Some(h.tunnel.clone());
                 let port = opts
                     .advertise
@@ -516,6 +548,7 @@ pub async fn run(opts: NodeOpts, ns: &NetworkSecret, id_pub: [u8; 32]) -> Result
                                                 format!("{}{}{}({})", n.name, exit, p2p, &n.node_id[..8])
                                             })
                                             .collect();
+                                        state.touch_coord();
                                         log::info!("directory: {} nodes: {}", nodes.len(), list.join(", "));
                                         let mut dir = state.dir.write().await;
                                         dir.clear();
@@ -563,9 +596,21 @@ pub async fn run(opts: NodeOpts, ns: &NetworkSecret, id_pub: [u8; 32]) -> Result
                     }
                 }
                 // 目录失效: 离线期间不知道谁下线, 保守清空
-                state.coord_tunnel.write().await.take();
-                state.dir.write().await.clear();
-                state.tunnels.lock().await.retain(|_, t| !t.is_closed());
+                // 注意: 每个清理步骤都加超时 —— 若某把锁被别处永久持有,
+                // 这里宁可跳过并继续重连, 也不能静默卡死
+                let to = Duration::from_secs(5);
+                let _ = tokio::time::timeout(to, async {
+                    state.coord_tunnel.write().await.take();
+                })
+                .await;
+                let _ = tokio::time::timeout(to, async {
+                    state.dir.write().await.clear();
+                })
+                .await;
+                let _ = tokio::time::timeout(to, async {
+                    state.tunnels.lock().await.retain(|_, t| !t.is_closed());
+                })
+                .await;
                 log::warn!("lost coordinator, reconnecting...");
             }
             Err(e) => log::warn!("connect coordinator {coord}: {e:#}"),
