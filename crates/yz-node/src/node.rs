@@ -230,6 +230,80 @@ pub async fn run(opts: NodeOpts, ns: &NetworkSecret, id_pub: [u8; 32]) -> Result
         });
     }
 
+    // 1a2) 映射保鲜 + 存活时间实测
+    //   · udp_addr 只在启动探一次是不够的：NAT 重绑定/网络切换后地址就陈旧了，
+    //     对端永远往旧端口打，打洞必败。这里每 5 分钟重探一次，变了就重发 HELLO。
+    //   · 顺带估算 UDP 映射存活时间（逐步拉大两包间隔直到丢），
+    //     供心跳间隔自适应（P2P 路径尤其依赖它）。
+    if let Some(ep) = udp_ep.clone() {
+        let st = state.clone();
+        let name = opts.name.clone();
+        let adv = opts.advertise.clone();
+        let caps_bit = if opts.exit_acl.advertise() {
+            caps::EXIT
+        } else {
+            0
+        };
+        let coord = opts.coord.first().cloned().unwrap_or_default();
+        tokio::spawn(async move {
+            // 启动后先等协调器隧道就绪
+            let mut tick: u32 = 0;
+            loop {
+                tokio::time::sleep(Duration::from_secs(300)).await;
+                tick += 1;
+                let Some(ca) = tokio::net::lookup_host(coord.as_str())
+                    .await
+                    .ok()
+                    .and_then(|mut i| i.next())
+                else {
+                    continue;
+                };
+                let Ok(a1) = ep.probe_via(ca).await else {
+                    continue;
+                };
+                let old = st.udp_addr.read().await.clone();
+                if old != a1.to_string() {
+                    log::info!("udp 映射变化: {old} -> {a1}");
+                    *st.udp_addr.write().await = a1.to_string();
+                    st.push_event("info", format!("UDP 映射更新: {a1}")).await;
+                    // 重发 HELLO 让全网目录立即更新
+                    if let Some(ct) = st.coord_tunnel.read().await.clone() {
+                        let port = adv
+                            .rsplit_once(':')
+                            .and_then(|(_, p)| p.parse::<u16>().ok())
+                            .unwrap_or(9100);
+                        let addrs = local_addrs(port, Some(adv.as_str()));
+                        let hello = yz_proto::encode_control(&ControlMsg::Hello {
+                            version: 1,
+                            name: name.clone(),
+                            addrs,
+                            udp_addr: a1.to_string(),
+                            caps: caps_bit,
+                        });
+                        let _ = ct.write_frame(&Frame::Control { payload: hello }).await;
+                    }
+                }
+                // 首轮就测一次（早拿数据），之后每 30 分钟一次
+                if tick == 1 || tick % 6 == 0 {
+                    let mut last_ok = 0u64;
+                    for gap in [10u64, 20, 30, 45, 60, 90] {
+                        tokio::time::sleep(Duration::from_secs(gap - last_ok)).await;
+                        if ep.probe_via(ca).await.is_ok() {
+                            last_ok = gap;
+                        } else {
+                            break;
+                        }
+                    }
+                    if last_ok > 0 {
+                        st.nat_lifetime_secs
+                            .store(last_ok, std::sync::atomic::Ordering::Relaxed);
+                        log::info!("udp 映射存活 ≈ {last_ok}s（心跳将取其一半）");
+                    }
+                }
+            }
+        });
+    }
+
     // 1b) UDP 隧道接入 (P2P 被打入方)
     if let Some(ep) = udp_ep.clone() {
         let ctx = PeerCtx {
@@ -621,6 +695,7 @@ pub async fn run(opts: NodeOpts, ns: &NetworkSecret, id_pub: [u8; 32]) -> Result
                 // (只 break 探测任务是不够的 — 主循环会一直挂在 ctrl_rx 上)
                 {
                     let t = h.tunnel.clone();
+                    let st = state.clone();
                     tokio::spawn(async move {
                         loop {
                             tokio::time::sleep(Duration::from_secs(10)).await;
@@ -638,6 +713,9 @@ pub async fn run(opts: NodeOpts, ns: &NetworkSecret, id_pub: [u8; 32]) -> Result
                                 t.mark_closed();
                                 break;
                             }
+                            // 有入向流量 = 协调器活着。看门狗靠这个判活，
+                            // 否则目录 150s 不变会被误判为失联而自杀。
+                            st.touch_coord();
                         }
                     });
                 }
@@ -761,12 +839,16 @@ async fn handle_socks5(
         }
     };
     // 显式出口节点但目录尚未同步 (刚启动/部署窗口): 等目录到位, 不静默走 direct
-    if !matches!(key.as_str(), "direct" | "auto") {
-        for _ in 0..8 {
-            if resolve_node(state, &key).await.is_some() {
-                break;
+    // 注意：出口可能写成 "B>C"，必须拿解析后的目标去查，否则永远匹配不上、白等满 4s
+    {
+        let target = yz_core::path::parse_spec(&key).1;
+        if !matches!(target.as_str(), "direct" | "auto") {
+            for _ in 0..8 {
+                if resolve_node(state, &target).await.is_some() {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(250)).await;
             }
-            tokio::time::sleep(Duration::from_millis(500)).await;
         }
     }
     // 建立上游（直连或经出口，含自动选路）

@@ -61,6 +61,71 @@ pub async fn exit_tunnel(
         }
     }
 
+    // 2) 手动指定中转：必须同步建立（用户明确要求走这条）
+    if let Some(hop) = force_hop {
+        let best = measure(state, ns, id_pub, self_id, exit_id, Some(hop)).await;
+        if best.tunnel.is_none() {
+            anyhow::bail!("经 {hop} 到出口 {exit_id} 不可用");
+        }
+        let t = best.tunnel.clone().expect("已校验");
+        state.exit_path.write().await.insert(exit_id.to_string(), best);
+        return Ok(t);
+    }
+
+    // 3) 自动模式：先秒回直连（可用就先给用户用），后台异步测路
+    //    （否则冷启动时首个请求要等完探测：实测 6s）
+    let direct = tunnel_for(state, ns, id_pub, exit_id).await?;
+    let need_measure = {
+        let mut cache = state.exit_path.write().await;
+        let stale = cache
+            .get(exit_id)
+            .map(|e| e.at.elapsed() >= TTL)
+            .unwrap_or(true);
+        if stale {
+            // 占位：标记为直连，TTL 内不重复阻塞
+            cache.insert(
+                exit_id.to_string(),
+                ExitChoice {
+                    via: None,
+                    ms: 0,
+                    at: Instant::now(),
+                    tunnel: None,
+                },
+            );
+            true
+        } else {
+            false
+        }
+    };
+    if need_measure {
+        let start = state.exit_measuring.write().await.insert(exit_id.to_string());
+        if start {
+            let st = state.clone();
+            let ns2 = ns.clone();
+            let ip = *id_pub;
+            let sid = self_id.to_string();
+            let eid = exit_id.to_string();
+            tokio::spawn(async move {
+                let best = measure(&st, &ns2, &ip, &sid, &eid, None).await;
+                if best.tunnel.is_some() {
+                    st.exit_path.write().await.insert(eid.clone(), best);
+                }
+                st.exit_measuring.write().await.remove(&eid);
+            });
+        }
+    }
+    Ok(direct)
+}
+
+#[allow(dead_code)]
+async fn exit_tunnel_sync_measure(
+    state: &Arc<CoreState>,
+    ns: &NetworkSecret,
+    id_pub: &[u8; 32],
+    self_id: &str,
+    exit_id: &str,
+    force_hop: Option<&str>,
+) -> Result<Arc<Tunnel0>> {
     // 2) 重新测量
     let best = measure(state, ns, id_pub, self_id, exit_id, force_hop).await;
     if best.tunnel.is_none() {

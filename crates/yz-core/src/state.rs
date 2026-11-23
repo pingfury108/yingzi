@@ -51,12 +51,39 @@ pub struct CoreState {
     pub coord_seen_ms: std::sync::atomic::AtomicU64,
     /// 出口自动选路结果: 出口 node_id → 选定路径
     pub exit_path: RwLock<HashMap<String, ExitChoice>>,
+    /// 正在后台测路的出口（避免重复探测）
+    pub exit_measuring: RwLock<std::collections::HashSet<String>>,
+    /// 每对节点的链路诊断计数
+    pub peer_diag: RwLock<HashMap<String, PeerDiag>>,
+    /// 本机 UDP 映射存活时间估计（秒，0 = 未知）
+    pub nat_lifetime_secs: std::sync::atomic::AtomicU64,
+}
+
+/// 单个对等节点的链路诊断计数（"不稳定"要从这里看）
+#[derive(Default, Clone, serde::Serialize)]
+pub struct PeerDiag {
+    /// 打洞尝试 / 成功 / 失败
+    pub punch_try: u64,
+    pub punch_ok: u64,
+    pub punch_fail: u64,
+    /// 最近一次打洞耗时（毫秒）
+    pub punch_ms: u64,
+    /// 直连（TCP）成功次数 / 经协调器中继次数
+    pub direct_ok: u64,
+    pub relay_ok: u64,
+    /// 被判定失效（僵尸）次数
+    pub dead: u64,
+    /// 路径切换次数
+    pub path_switches: u64,
+    /// 最近一次切换距今（秒）
+    pub last_switch_secs: u64,
+    /// 最近一次已知路径（p2p/direct/relay）
+    pub path: String,
 }
 
 /// 出口路径选择（直连 or 经中转）
 #[derive(Clone)]
-pub struct ExitChoice {
-    /// Some(B) = 经 B 中转; None = 直连出口
+pub struct ExitChoice {    /// Some(B) = 经 B 中转; None = 直连出口
     pub via: Option<String>,
     /// 建链耗时（毫秒），用于比较与展示
     pub ms: u64,
@@ -88,6 +115,27 @@ pub struct PersistedConfig {
 }
 
 impl CoreState {
+    /// 更新某节点的诊断计数（不拿到锁就静默跳过，不影响业务）
+    pub fn diag<F: FnOnce(&mut PeerDiag)>(&self, node_id: &str, f: F) {
+        let Ok(mut m) = self.peer_diag.try_write() else {
+            return;
+        };
+        f(m.entry(node_id.to_string()).or_default());
+    }
+
+    /// 记录一次路径选定/切换
+    pub fn note_path(&self, node_id: &str, path: &str) {
+        self.diag(node_id, |d| {
+            if d.path != path {
+                if !d.path.is_empty() {
+                    d.path_switches += 1;
+                }
+                d.path = path.to_string();
+                d.last_switch_secs = 0;
+            }
+        });
+    }
+
     /// 记录一次与协调器的成功交互（注册成功 / 收到 DirSync）
     pub fn touch_coord(&self) {
         self.coord_seen_ms

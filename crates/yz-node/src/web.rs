@@ -110,6 +110,7 @@ pub async fn run(bind: &str, app: Arc<AppState>) -> Result<()> {
         .route("/api/ingress", get(list_ingress).post(req_ingress))
         .route("/api/events", get(events))
         .route("/api/probe", post(probe))
+        .route("/api/diag", get(diag))
         .layer(middleware::from_fn_with_state(app.clone(), auth_mw));
     let router = Router::new()
         .route("/", get(index))
@@ -258,6 +259,25 @@ struct ProbeResp {
     rtt_ms: u64,
     path: Option<String>,
     error: Option<String>,
+}
+
+/// 链路诊断：NAT 映射存活、每对节点的打洞/路径切换/判死计数
+/// 用来定位「不稳定」是运营商回收映射、对称 NAT 打不通，还是心跳参数问题
+async fn diag(State(app): State<Arc<AppState>>) -> Json<serde_json::Value> {
+    let nat_life = app
+        .node
+        .nat_lifetime_secs
+        .load(std::sync::atomic::Ordering::Relaxed);
+    let peers = app.node.peer_diag.read().await.clone();
+    let paths = app.node.path.read().await.clone();
+    let udp_addr = app.node.udp_addr.read().await.clone();
+    Json(serde_json::json!({
+        "udp_addr": udp_addr,
+        "nat_lifetime_secs": nat_life,
+        "keepalive_hint_secs": if nat_life == 0 { 10 } else { (nat_life / 2).clamp(8, 25) },
+        "current_paths": paths,
+        "peers": peers,
+    }))
 }
 
 async fn get_exit(State(app): State<Arc<AppState>>) -> Json<ExitReq> {

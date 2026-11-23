@@ -25,8 +25,38 @@ pub async fn resolve_node(state: &Arc<CoreState>, key: &str) -> Option<NodeEntry
         .cloned()
 }
 
-/// 取到指定节点的隧道: 复用活跃隧道 → P2P 打洞 → TCP 兜底
+/// 取到指定节点的隧道: 复用活跃隧道 → P2P 打洞 → TCP 兜底 → 中继兜底
 pub async fn tunnel_for(
+    state: &Arc<CoreState>,
+    ns: &NetworkSecret,
+    id_pub: &[u8; 32],
+    node_id: &str,
+) -> Result<Arc<Tunnel>> {
+    tunnel_for_with(state, ns, id_pub, node_id, true).await
+}
+
+/// 同上；`allow_relay=false` 时不做中继兜底（中转请求处理时用，防中继套中继成环）
+pub async fn tunnel_for_with(
+    state: &Arc<CoreState>,
+    ns: &NetworkSecret,
+    id_pub: &[u8; 32],
+    node_id: &str,
+    allow_relay: bool,
+) -> Result<Arc<Tunnel>> {
+    match tunnel_direct_only(state, ns, id_pub, node_id).await {
+        Ok(t) => Ok(t),
+        Err(e) => {
+            if allow_relay {
+                relay_fallback(state, node_id, ns, id_pub).await
+            } else {
+                Err(e)
+            }
+        }
+    }
+}
+
+/// 只走直连/打洞（不含中继），中转请求处理与中继跳板选择都用它（防递归成环）
+async fn tunnel_direct_only(
     state: &Arc<CoreState>,
     ns: &NetworkSecret,
     id_pub: &[u8; 32],
@@ -77,43 +107,98 @@ pub async fn tunnel_for(
             }
         }
     }
-    // P2P 连续失效后短暂降级: 跳过打洞直接走 TCP (打洞在对称 NAT 下易反复失效)
+    // P2P 连续失效后降级: 打洞在对称 NAT 下几乎不可用，指数退避避免每次都白等
     let p2p_ok = {
         let fails = state.p2p_fail.read().await;
         match fails.get(node_id) {
             Some((n, until)) if *n >= 1 && std::time::Instant::now() < *until => {
-                log::debug!("P2P 降级中 (连续失效 {} 次), 跳过打洞: {}", n, &node_id[..8.min(node_id.len())]);
+                log::debug!(
+                    "P2P 降级中 (连续失效 {} 次), 跳过打洞: {}",
+                    n,
+                    &node_id[..8.min(node_id.len())]
+                );
                 false
             }
             _ => true,
         }
     };
-    // P2P 打洞优先
-    if p2p_ok && !entry.udp_addr.is_empty() {
-        if let Some(h) = try_punch(state, ns, id_pub, &entry).await {
-            state.p2p_fail.write().await.remove(node_id);
-            state.push_event("info", format!("P2P 打洞成功: {}", &node_id[..8.min(node_id.len())])).await;
-            return Ok(adopt_tunnel(state, h, node_id, ns, *id_pub, "p2p").await);
+
+    // 打洞与 TCP 直连**并行竞速**：先成功者胜。
+    // 旧实现串行（先打洞 5.5s 再回落），对称 NAT 下每次冷建链都白等 5s。
+    let mut punch_task = {
+        let st = state.clone();
+        let ns2 = ns.clone();
+        let ip = *id_pub;
+        let e = entry.clone();
+        tokio::spawn(async move {
+            if !p2p_ok || e.udp_addr.is_empty() {
+                return None;
+            }
+            try_punch(&st, &ns2, &ip, &e).await
+        })
+    };
+    let mut tcp_task = {
+        let ns2 = ns.clone();
+        let ip = *id_pub;
+        let e = entry.clone();
+        tokio::spawn(async move {
+            for a in e.addrs.iter() {
+                match timeout(Duration::from_secs(4), tunnel::connect(a, &ns2, &ip)).await {
+                    Ok(Ok(h)) => return Some(h),
+                    Ok(Err(err)) => log::debug!("tcp direct {a}: {err:#}"),
+                    Err(_) => log::debug!("tcp direct {a}: timeout"),
+                }
+            }
+            None
+        })
+    };
+
+    let mut punch_done = false;
+    let mut tcp_done = false;
+    let mut winner: Option<(&'static str, TunnelHandle)> = None;
+    loop {
+        tokio::select! {
+            r = &mut punch_task, if !punch_done => {
+                punch_done = true;
+                if let Some(h) = r.ok().flatten() {
+                    winner = Some(("p2p", h));
+                    break;
+                }
+            }
+            r = &mut tcp_task, if !tcp_done => {
+                tcp_done = true;
+                if let Some(h) = r.ok().flatten() {
+                    winner = Some(("direct", h));
+                    break;
+                }
+            }
+        }
+        if punch_done && tcp_done {
+            break;
         }
     }
-    // TCP 兜底 → 中继兜底 (依次尝试各地址, 直连加快速超时避免黑洞拖死降级链)
-    let mut last_err: Option<anyhow::Error> = None;
-    for a in entry.addrs.iter() {
-        match timeout(Duration::from_secs(4), tunnel::connect(a, ns, id_pub)).await {
-            Ok(Ok(h)) => {
-                return Ok(adopt_tunnel(state, h, node_id, ns, *id_pub, "direct").await)
+
+    match winner {
+        Some((path, h)) => {
+            // 清理落败分支：若它也成功了，显式关闭，避免泄漏 socket
+            let loser = if path == "p2p" { tcp_task } else { punch_task };
+            loser.abort();
+            if let Ok(Some(l)) = loser.await {
+                l.tunnel.mark_closed();
             }
-            Ok(Err(e)) => {
-                log::debug!("tcp direct {a}: {e:#}");
-                last_err = Some(e);
+            if path == "p2p" {
+                state.p2p_fail.write().await.remove(node_id);
+                state
+                    .push_event(
+                        "info",
+                        format!("P2P 打洞成功: {}", &node_id[..8.min(node_id.len())]),
+                    )
+                    .await;
             }
-            Err(_) => log::debug!("tcp direct {a}: timeout"),
+            Ok(adopt_tunnel(state, h, node_id, ns, *id_pub, path).await)
         }
+        None => anyhow::bail!("直连/打洞均失败: {}", &node_id[..8.min(node_id.len())]),
     }
-    if let Some(e) = last_err {
-        log::debug!("tcp direct {} 全部失败: {e:#}", &node_id[..8.min(node_id.len())]);
-    }
-    relay_fallback(state, node_id, ns, id_pub).await
 }
 
 /// 中继兜底: 经 coordinator 建立嵌套隧道
@@ -124,6 +209,62 @@ pub async fn relay_fallback(
     ns: &NetworkSecret,
     id_pub: &[u8; 32],
 ) -> Result<Arc<Tunnel>> {
+    // 1) 本地化中继：优先经一个「最近且能直连」的节点转发，
+    //    避免所有中继流量都压到 geography 很远的 coordinator。
+    //    用 allow_relay=false 取该节点的隧道，确保不会再递归中继（防环）。
+    {
+        let hop = {
+            let dir = state.dir.read().await;
+            let rtt = state.rtt.read().await;
+            let mut v: Vec<(u32, String)> = dir
+                .values()
+                .filter(|n| n.node_id != node_id)
+                .map(|n| {
+                    (
+                        rtt.get(&n.node_id).copied().unwrap_or(u32::MAX),
+                        n.node_id.clone(),
+                    )
+                })
+                .collect();
+            v.sort();
+            v.first().map(|(_, id)| id.clone())
+        };
+        if let Some(hop) = hop {
+            // 本机必须能直连/打洞到这个跳板（否则无意义）
+            if let Ok(Ok(hop_t)) = timeout(
+                Duration::from_secs(4),
+                tunnel_direct_only(state, ns, id_pub, &hop),
+            )
+            .await
+            {
+                if let Ok(Ok(h)) = timeout(
+                    Duration::from_secs(6),
+                    tunnel::connect_relayed(&hop_t, node_id, ns, id_pub),
+                )
+                .await
+                {
+                    state
+                        .push_event(
+                            "warn",
+                            format!(
+                                "中继: {} 经 {}",
+                                &node_id[..8.min(node_id.len())],
+                                &hop[..8.min(hop.len())]
+                            ),
+                        )
+                        .await;
+                    log::info!(
+                        "localized relay to {} via {}",
+                        &node_id[..8.min(node_id.len())],
+                        &hop[..8.min(hop.len())]
+                    );
+                    return Ok(adopt_tunnel(state, h, node_id, ns, *id_pub, "relay").await);
+                }
+            }
+        }
+    }
+
+    // 2) 兵底：经 coordinator 中继
     let coord_t = state
         .coord_tunnel
         .read()
@@ -137,7 +278,9 @@ pub async fn relay_fallback(
     .await
     .context("relay timeout")??;
     log::info!("relayed via coordinator to {}", &node_id[..8.min(node_id.len())]);
-    state.push_event("warn", format!("走中继: {}", &node_id[..8.min(node_id.len())])).await;
+    state
+        .push_event("warn", format!("走中继: {}", &node_id[..8.min(node_id.len())]))
+        .await;
     Ok(adopt_tunnel(state, h, node_id, ns, *id_pub, "relay").await)
 }
 
@@ -154,7 +297,9 @@ pub fn spawn_ctrl_handler(
     ingress: Option<(ExitAcl, (u16, u16))>,
 ) {
     // 心跳: 兼作存活探测 + 维持 NAT 映射。
-    // 自适应间隔: 活跃 10s / 空闲 30s —— 手机端省电（避免 10s 一次唤醒射频）
+    // 间隔按路径与实测 NAT 映射存活时间自适应：
+    //  · P2P(UDP) 路径必须勤发，否则映射被运营商回收 → 静默丢包（最大不稳定源）
+    //  · TCP/中继不存在映射过期，空闲可以降频省电
     const PING_ACTIVE: Duration = Duration::from_secs(10);
     const PING_IDLE: Duration = Duration::from_secs(30);
     if let Some(st) = &state {
@@ -169,8 +314,24 @@ pub fn spawn_ctrl_handler(
                     st2.rtt.write().await.remove(&pid);
                     break;
                 }
-                // 空闲超过 20s 降频到 30s；有流量立刻回到 10s
-                interval = if t2.idle_for().await < Duration::from_secs(20) {
+                let is_p2p = st2
+                    .path
+                    .read()
+                    .await
+                    .get(&pid)
+                    .map(|p| p == "p2p")
+                    .unwrap_or(false);
+                interval = if is_p2p {
+                    // 映射存活时间未知时保守用 10s；测得后取一半，夹在 [8s, 25s]
+                    let life = st2
+                        .nat_lifetime_secs
+                        .load(std::sync::atomic::Ordering::Relaxed);
+                    if life == 0 {
+                        PING_ACTIVE
+                    } else {
+                        Duration::from_secs((life / 2).clamp(8, 25))
+                    }
+                } else if t2.idle_for().await < Duration::from_secs(20) {
                     PING_ACTIVE
                 } else {
                     PING_IDLE
@@ -195,6 +356,7 @@ pub fn spawn_ctrl_handler(
                     );
                     st2.push_event("warn", format!("隧道失效: {}", &pid[..8.min(pid.len())]))
                         .await;
+                    st2.diag(&pid, |d| d.dead += 1);
                     st2.rtt.write().await.remove(&pid);
                     // 若是 P2P 路径, 累加失效计数并降级 5 分钟
                     let was_p2p = st2
@@ -208,8 +370,15 @@ pub fn spawn_ctrl_handler(
                         let mut fails = st2.p2p_fail.write().await;
                         let e = fails.entry(pid.clone()).or_insert((0, std::time::Instant::now()));
                         e.0 += 1;
-                        // 首次失效即降级 2 分钟, 避免反复在打洞上耗时间
-                        e.1 = std::time::Instant::now() + Duration::from_secs(120);
+                        // 指数退避：2m → 5m → 15m → 30m（上限）
+                        // 对称 NAT 下打洞基本不可用，反复尝试只会白花时间
+                        let backoff = match e.0 {
+                            1 => 120,
+                            2 => 300,
+                            3 => 900,
+                            _ => 1800,
+                        };
+                        e.1 = std::time::Instant::now() + Duration::from_secs(backoff);
                         log::info!(
                             "隧道失效({}) 计数 {} → 降级 2 分钟: {}",
                             if was_p2p { "p2p" } else { "其它" },
@@ -375,6 +544,13 @@ pub async fn adopt_tunnel(
         .write()
         .await
         .insert(node_id.to_string(), path.to_string());
+    // 诊断埋点：路径计数 + 切换记录
+    match path {
+        "direct" => state.diag(node_id, |d| d.direct_ok += 1),
+        "relay" => state.diag(node_id, |d| d.relay_ok += 1),
+        _ => {}
+    }
+    state.note_path(node_id, path);
     state.push_event("info", format!("隧道建立: {} ({path})", &node_id[..8.min(node_id.len())])).await;
     state
         .tunnels
@@ -426,16 +602,24 @@ pub async fn try_punch(
     if cands.is_empty() {
         return None;
     }
+    state.diag(&node_id, |d| d.punch_try += 1);
+    let t0 = std::time::Instant::now();
     let punched = match ep.punch(&cands, Duration::from_millis(2500)).await {
         Ok(a) => a,
         Err(e) => {
-            log::debug!("punch {}: {e:#}", &node_id[..8]);
+            log::debug!("punch {}: {e:#}", &node_id[..8.min(node_id.len())]);
+            state.diag(&node_id, |d| d.punch_fail += 1);
             return None;
         }
     };
     match ep.connect(punched, ns, id_pub).await {
         Ok((rudp, info)) => {
-            log::info!("p2p punched {} via {punched}", &node_id[..8]);
+            let ms = t0.elapsed().as_millis() as u64;
+            state.diag(&node_id, |d| {
+                d.punch_ok += 1;
+                d.punch_ms = ms;
+            });
+            log::info!("p2p punched {} via {punched}", &node_id[..8.min(node_id.len())]);
             Some(tunnel::from_rudp_with_base(rudp, info, 1))
         }
         Err(e) => {
@@ -583,7 +767,9 @@ pub fn spawn_incoming_handler(
                         log::debug!("relay target {key} 不在目录");
                         return;
                     };
-                    let target_t = match tunnel_for(&st, &ns, &id_pub, &entry.node_id).await {
+                    // allow_relay=false: 中转请求处理时不再递归中继，否则会成环
+                    // 中转请求处理：只走直连/打洞，不再递归中继（防成环）
+                    let target_t = match tunnel_direct_only(&st, &ns, &id_pub, &entry.node_id).await {
                         Ok(v) => v,
                         Err(e) => {
                             let _ = t
