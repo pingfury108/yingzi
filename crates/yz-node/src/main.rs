@@ -149,6 +149,7 @@ enum Cmd {
 /// macOS 默认软限制仅 256, Linux 常见 1024 —— 浏览器级并发(SOCKS5 入口)很快打满,
 /// 表现为所有 accept 报 "Too many open files"。
 /// 抬高 FD 软限制 (macOS 默认 256 / Linux 常见 1024, 代理级并发不够)
+#[cfg(unix)]
 fn raise_nofile() {
     unsafe {
         let mut lim = libc::rlimit { rlim_cur: 0, rlim_max: 0 };
@@ -170,6 +171,10 @@ fn raise_nofile() {
         }
     }
 }
+
+/// Windows 没有 rlimit 概念（句柄数由系统管理），空实现
+#[cfg(not(unix))]
+fn raise_nofile() {}
 
 #[tokio::main]
 async fn main() -> Result<()> {
