@@ -41,6 +41,16 @@ cp target/x86_64-unknown-linux-musl/release/yz /tmp/yz-musl   # 静态, 零依�
 
 # macOS（本机直接编译）
 cargo build --release -p yz-node     # → target/release/yz
+
+# Windows（在 Linux 上交叉编译，不需要 Windows 环境装 Rust）
+sudo apt-get install -y mingw-w64
+rustup target add x86_64-pc-windows-gnu
+export CC_x86_64_pc_windows_gnu=x86_64-w64-mingw32-gcc
+export CARGO_TARGET_X86_64_PC_WINDOWS_GNU_LINKER=x86_64-w64-mingw32-gcc
+cargo build --release --target x86_64-pc-windows-gnu -p yz-node   # → yz.exe
+# 运行时需要 wintun.dll（TUN 后端）放在 exe 同目录：
+curl -LO https://www.wintun.net/builds/wintun-0.14.1.zip
+unzip -j wintun-0.14.1.zip wintun/bin/amd64/wintun.dll
 ```
 
 **为什么要 musl**：静态链接、零 glibc 依赖，同一个二进制能在任意 x86_64 Linux（含 CentOS 7 老内核）上跑。
@@ -212,6 +222,45 @@ ssh <host> 'runpulse logs yz-node | grep -E "p2p punched|relayed|tcp direct"'
   ```
 
 无权限时优雅降级：只打一条 warn，SOCKS5/出口/ingress 功能不受影响。
+
+## 5.1 Windows 节点
+
+产物：`yz.exe` + `wintun.dll`（同目录）。
+
+```bat
+:: 手动跑（TUN 组网需要管理员）
+yz.exe node --bind 0.0.0.0:9100 --advertise <公网IP或LAN IP>:9100 ^
+  --coordinator 47.109.61.89:9000 --name win-pc ^
+  --socks5 127.0.0.1:1080 --default-exit overseas-hk ^
+  --exit-allow all --web 127.0.0.1:9800 --tun yz0 ^
+  --network-secret <64位hex>
+
+:: 只要 SOCKS5、不要虚拟网卡（普通权限即可）
+yz.exe node ... --no-tun
+```
+
+**常驻**（SYSTEM 身份，因此有权限建 TUN；开机自启）：
+
+```bat
+schtasks /create /tn yingzi /tr "C:\Users\<user>\yz\start.bat" /sc onstart /ru SYSTEM /rl HIGHEST /f
+schtasks /run /tn yingzi      :: 立即启动
+schtasks /end /tn yingzi      :: 停止
+```
+
+验证：
+
+```bat
+tasklist /FI "IMAGENAME eq yz.exe"     :: 进程（注意会话应为 Services）
+ipconfig | findstr /C:"yz0"            :: 虚拟网卡 100.64.x.x/14
+route print 100.64.0.0                  :: 100.64.0.0/14 on-link
+ping <某节点 vIP>                       :: 组网连通（跨节点 80~100ms 正常）
+curl --socks5-hostname 127.0.0.1:1080 https://ifconfig.me
+```
+
+注意：
+- 首次运行会自动安装 wintun 驱动（需管理员）
+- 若本机已有其他 VPN（WireGuard/Tailscale），可能与 `yz0` 路由冲突
+- 用 `start /b` 从 ssh 里起的进程会随会话结束被杀，务必用计划任务
 
 ## 6. 运维速查
 
