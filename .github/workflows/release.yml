@@ -26,8 +26,9 @@ jobs:
           - target: x86_64-apple-darwin
             os: macos-13
             archive: tar.gz
-          - target: x86_64-pc-windows-msvc
-            os: windows-latest
+          # 用 mingw 交叉编译（已验证），不依赖 Windows runner
+          - target: x86_64-pc-windows-gnu
+            os: ubuntu-latest
             archive: zip
     name: build ${{ matrix.target }}
     runs-on: ${{ matrix.os }}
@@ -47,6 +48,12 @@ jobs:
           sudo apt-get update && sudo apt-get install -y musl-tools
           echo "CC_x86_64_unknown_linux_musl=musl-gcc" >> $GITHUB_ENV
           echo "CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_LINKER=musl-gcc" >> $GITHUB_ENV
+      - name: mingw 交叉工具链 (windows)
+        if: matrix.target == 'x86_64-pc-windows-gnu'
+        run: |
+          sudo apt-get update && sudo apt-get install -y mingw-w64
+          echo "CC_x86_64_pc_windows_gnu=x86_64-w64-mingw32-gcc" >> $GITHUB_ENV
+          echo "CARGO_TARGET_X86_64_PC_WINDOWS_GNU_LINKER=x86_64-w64-mingw32-gcc" >> $GITHUB_ENV
       - name: aarch64 交叉工具链 (gnu)
         if: matrix.target == 'aarch64-unknown-linux-gnu'
         run: |
