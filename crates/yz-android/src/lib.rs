@@ -76,6 +76,9 @@ struct StartConfig {
     /// IPv6 分流（默认关；geoip6 数据精度有限）
     #[serde(default)]
     ipv6: bool,
+    /// 对外宣告的隧道地址（移动端无监听端口，留空即可）
+    #[serde(default)]
+    advertise: Option<String>,
 }
 
 fn default_true() -> bool {
@@ -336,6 +339,10 @@ impl NodeRuntime {
             udp_direct: self.udp.stat_udp_direct.load(std::sync::atomic::Ordering::Relaxed),
             udp_exit: self.udp.stat_udp_exit.load(std::sync::atomic::Ordering::Relaxed),
             udp_dns: self.udp.stat_udp_dns.load(std::sync::atomic::Ordering::Relaxed),
+            udp_addr: {
+                let st = self.state.clone();
+                rt().block_on(async move { st.udp_addr.read().await.clone() })
+            },
         }
     }
 }
@@ -380,6 +387,107 @@ struct StatusJson {
     udp_direct: u64,
     udp_exit: u64,
     udp_dns: u64,
+    /// 本机公网 UDP 映射（空 = P2P 不可用）
+    udp_addr: String,
+}
+
+/// 绑定一个已 protect 的 UDP socket（Android 必须 protect，否则回流入 TUN）
+fn bind_protected_udp(protect: Option<&Arc<dyn SocketProtect>>) -> Option<std::net::UdpSocket> {
+    let s = std::net::UdpSocket::bind("0.0.0.0:0").ok()?;
+    if s.set_nonblocking(true).is_err() {
+        return None;
+    }
+    if let Some(p) = protect {
+        p.protect(&s);
+    }
+    Some(s)
+}
+
+/// UDP 侧后台任务：接受入向 P2P 握手 + NAT 映射探测与保鲜
+#[allow(clippy::too_many_arguments)]
+fn spawn_udp_tasks(
+    state: Arc<CoreState>,
+    ep: Arc<yz_rudp::Endpoint>,
+    ns: yz_crypto::NetworkSecret,
+    coord: String,
+    name: String,
+    advertise: String,
+    id_pub: [u8; 32],
+) {
+    // 1) 接受入向 P2P 握手（对端打洞成功后会向我们发起 YZP 握手）
+    {
+        let st = state.clone();
+        let ns2 = ns.clone();
+        let ep2 = ep.clone();
+        rt().spawn(async move {
+            let ctx = yz_core::peer::PeerCtx {
+                // 移动端：必须允许入向隧道（P2P 的一半在这里），
+                // 但不对外宣告 EXIT 能力（caps=0），也不会替别人中转
+                exit_acl: yz_core::policy::ExitAcl::All,
+                relay_acl: yz_core::policy::ExitAcl::None,
+                ingress_acl: yz_core::policy::ExitAcl::None,
+                ingress_ports: (0, 0),
+                state: Some(st.clone()),
+                fallback: None,
+                ns: ns2.clone(),
+                id_pub,
+            };
+            while let Some((rudp, peer)) = ep2.accept().await {
+                let ctx = ctx.clone();
+                rt().spawn(async move {
+                    if let Err(e) = yz_core::peer::handle_peer(
+                        yz_core::tunnel::from_rudp(rudp, peer),
+                        &ctx,
+                    )
+                    .await
+                    {
+                        log::debug!("udp peer closed: {e:#}");
+                    }
+                });
+            }
+        });
+    }
+
+    // 2) NAT 映射探测（第一次 2s 后）+ 每 5 分钟保鲜
+    //    手机网络（尤其运营商 NAT）映射寿命短、换网即变，必须刷新后重发 HELLO
+    rt().spawn(async move {
+        let mut tick = 0u32;
+        loop {
+            let wait = if tick == 0 { 2 } else { 300 };
+            tokio::time::sleep(std::time::Duration::from_secs(wait)).await;
+            tick += 1;
+            let Ok(mut it) = tokio::net::lookup_host(coord.as_str()).await else {
+                continue;
+            };
+            let Some(addr) = it.next() else { continue };
+            let Ok(a1) = ep.probe_via(addr).await else {
+                continue;
+            };
+            let new = a1.to_string();
+            let old = state.udp_addr.read().await.clone();
+            if old == new {
+                continue;
+            }
+            log::info!("udp 映射: {old} -> {new}");
+            *state.udp_addr.write().await = new.clone();
+            // 重发 HELLO，让全网目录立即拿到新的 udp_addr
+            if let Some(ct) = state.coord_tunnel.read().await.clone() {
+                let port = advertise
+                    .rsplit_once(':')
+                    .and_then(|(_, p)| p.parse::<u16>().ok())
+                    .unwrap_or(9100);
+                let addrs = yz_core::util::local_addrs(port, Some(advertise.as_str()));
+                let hello = yz_proto::encode_control(&yz_proto::ControlMsg::Hello {
+                    version: 1,
+                    name: name.clone(),
+                    addrs,
+                    udp_addr: new,
+                    caps: 0,
+                });
+                let _ = ct.write_frame(&yz_proto::Frame::Control { payload: hello }).await;
+            }
+        }
+    });
 }
 
 fn start_async(cfg: StartConfig, protect: Option<Arc<dyn SocketProtect>>) -> Result<NodeRuntime> {
@@ -415,6 +523,47 @@ fn start_async(cfg: StartConfig, protect: Option<Arc<dyn SocketProtect>>) -> Res
     let state = Arc::new(CoreState::default());
     // 出口自动选路需要排除自己
     state.set_self_id(&yz_crypto::node_id(&id_pub));
+
+    // ---------- UDP 端点（P2P 打洞）----------
+    // 必须 protect：否则包会回流进自己的 TUN 造成环路。
+    // 绑定后探测公网映射（conP/对称），写入 state.udp_addr 供 HELLO 上报。
+    // 注意：start_async 是同步函数（内部用 rt().block_on），这里单独 block_on 初始化。
+    if let Some(std_sock) = bind_protected_udp(protect.as_ref()) {
+        let st = state.clone();
+        let ns2 = ns.clone();
+        let ep_opt = rt().block_on(async move {
+            let Ok(udp_sock) = tokio::net::UdpSocket::from_std(std_sock) else {
+                log::warn!("udp socket 转换失败");
+                return None;
+            };
+            match yz_rudp::Endpoint::bind(udp_sock, &ns2, id_pub).await {
+                Ok(ep) => {
+                    let ep = Arc::new(ep);
+                    *st.udp_ep.write().await = Some(ep.clone());
+                    log::info!("udp endpoint up（P2P 可用）");
+                    Some(ep)
+                }
+                Err(e) => {
+                    log::warn!("udp endpoint: {e:#}");
+                    None
+                }
+            }
+        });
+        if let Some(ep) = ep_opt {
+            spawn_udp_tasks(
+                state.clone(),
+                ep,
+                ns.clone(),
+                cfg.coordinator.clone(),
+                cfg.name.clone(),
+                cfg.advertise.clone().unwrap_or_default(),
+                id_pub,
+            );
+        }
+    } else {
+        log::warn!("udp 绑定失败，P2P 不可用（仍可 TCP 直连/中继）");
+    }
+
     let (stop_tx, mut stop_rx) = tokio::sync::watch::channel(false);
 
     // 连接协调器 + 目录同步
@@ -430,11 +579,13 @@ fn start_async(cfg: StartConfig, protect: Option<Arc<dyn SocketProtect>>) -> Res
                     Ok(mut h) => {
                         backoff = std::time::Duration::from_secs(1);
                         *state.coord_tunnel.write().await = Some(h.tunnel.clone());
+                        // 上报探测到的公网 UDP 映射，让对端能向我们打洞
+                        let udp_addr = state.udp_addr.read().await.clone();
                         let hello = yz_proto::encode_control(&yz_proto::ControlMsg::Hello {
                             version: 1,
                             name: name.clone(),
                             addrs: vec![],
-                            udp_addr: String::new(),
+                            udp_addr,
                             caps: 0,
                         });
                         let _ = h

@@ -11,6 +11,7 @@ crate-type = ["cdylib"]
 yz-core = { path = "../yz-core" }
 yz-proto = { path = "../yz-proto" }
 yz-crypto = { path = "../yz-crypto" }
+yz-rudp = { path = "../yz-rudp" }
 anyhow = "1"
 tokio = { version = "1", features = ["full"] }
 serde = { version = "1", features = ["derive"] }
