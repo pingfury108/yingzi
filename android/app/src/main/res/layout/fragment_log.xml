@@ -9,9 +9,6 @@
         android:paddingStart="18dp" android:paddingEnd="18dp"
         android:paddingTop="14dp" android:paddingBottom="10dp">
 
-        <ImageButton android:id="@+id/back" android:layout_width="36dp" android:layout_height="36dp"
-            android:background="@drawable/bg_icon_btn" android:src="@drawable/ic_back"
-            app:tint="@color/text_2" android:contentDescription="返回" />
 
         <TextView android:layout_width="0dp" android:layout_height="wrap_content"
             android:layout_weight="1" android:layout_marginStart="10dp" android:text="日志"
@@ -38,10 +35,4 @@
             android:paddingStart="18dp" android:paddingEnd="18dp" android:paddingBottom="18dp" />
     </ScrollView>
 
-    <com.google.android.material.bottomnavigation.BottomNavigationView
-        android:id="@+id/nav" android:layout_width="match_parent" android:layout_height="wrap_content"
-        android:background="@color/bg" app:menu="@menu/nav_main"
-        app:labelVisibilityMode="labeled" app:itemIconTint="@color/nav_item"
-        app:itemTextColor="@color/nav_item" app:itemActiveIndicatorStyle="@null"
-        app:itemRippleColor="@color/accent_soft" />
 </LinearLayout>
