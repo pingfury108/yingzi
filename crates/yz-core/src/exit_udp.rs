@@ -1,6 +1,5 @@
 //! exit_udp: 经出口节点转发 UDP（复用 mesh 的 UDP 流）
 
-use crate::peer::tunnel_for;
 use crate::stack::{ExitUdp, UdpRelay};
 use crate::state::CoreState;
 use anyhow::{bail, Context, Result};
@@ -44,7 +43,8 @@ impl ExitUdp for TunnelExitUdp {
                     .map(|n| n.node_id.clone())
                     .with_context(|| format!("出口节点不在目录中: {node}"))?
             };
-            let t = tunnel_for(&self.state, &self.ns, &self.id_pub, &node_id).await?;
+            // 走出口自动选路（直连 vs 经中转）
+            let t = crate::exit_tunnel_for(&self.state, &self.ns, &self.id_pub, &node_id).await?;
             let target = match dst.ip() {
                 std::net::IpAddr::V4(v4) => Addr::V4(v4.octets(), dst.port()),
                 std::net::IpAddr::V6(v6) => Addr::V6(v6.octets(), dst.port()),
@@ -140,7 +140,8 @@ impl ExitTcp for TunnelExitTcp {
                     .map(|n| n.node_id.clone())
                     .with_context(|| format!("出口节点不在目录中: {node}"))?
             };
-            let t = tunnel_for(&self.state, &self.ns, &self.id_pub, &node_id).await?;
+            // 走出口自动选路（直连 vs 经中转）
+            let t = crate::exit_tunnel_for(&self.state, &self.ns, &self.id_pub, &node_id).await?;
             let target = match dst.ip() {
                 std::net::IpAddr::V4(v4) => Addr::V4(v4.octets(), dst.port()),
                 std::net::IpAddr::V6(v6) => Addr::V6(v6.octets(), dst.port()),

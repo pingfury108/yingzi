@@ -74,7 +74,9 @@ pub async fn exit_tunnel(
 
     // 3) 自动模式：先秒回直连（可用就先给用户用），后台异步测路
     //    （否则冷启动时首个请求要等完探测：实测 6s）
+    log::debug!("path: {exit_id} 无缓存，取直连…");
     let direct = tunnel_for(state, ns, id_pub, exit_id).await?;
+    log::debug!("path: {exit_id} 直连就绪，写占位");
     let need_measure = {
         let mut cache = state.exit_path.write().await;
         let stale = cache

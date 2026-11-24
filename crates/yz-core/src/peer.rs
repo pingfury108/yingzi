@@ -7,7 +7,7 @@ use crate::ingress;
 use crate::policy::ExitAcl;
 use crate::state::CoreState;
 use crate::tunnel::{self, Incoming, Tunnel, TunnelHandle};
-use crate::util::{is_lan_addr, now_ms, pick_addr};
+use crate::util::{is_same_subnet, now_ms, pick_addr};
 use anyhow::{bail, Context, Result};
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -62,9 +62,11 @@ async fn tunnel_direct_only(
     id_pub: &[u8; 32],
     node_id: &str,
 ) -> Result<Arc<Tunnel>> {
+    // 注意：绝不能在持有 tunnels 锁时 await（is_dead / push_event 都会拿别的锁）
+    // 先把候选 Arc 取出来，放掉锁再判断。
+    let existing = { state.tunnels.lock().await.get(node_id).cloned() };
     {
-        let tunnels = state.tunnels.lock().await;
-        if let Some(t) = tunnels.get(node_id) {
+        if let Some(t) = existing {
             // 僵尸隧道判定: P2P UDP 会因 NAT 映射过期静默死亡, 必须按"无入向流量超时"淘汰
             if !t.is_closed() && !t.is_dead(Duration::from_secs(45)).await {
                 return Ok(t.clone());
@@ -84,6 +86,7 @@ async fn tunnel_direct_only(
                     )
                     .await;
                 t.mark_closed();
+                state.tunnels.lock().await.remove(node_id);
             }
         }
     }
@@ -93,9 +96,10 @@ async fn tunnel_direct_only(
             .cloned()
             .with_context(|| format!("node {} not in directory", &node_id[..8.min(node_id.len())]))?
     };
-    // 局域网对端: 直连优先 (省掉打洞等待, 同网段通常 <1ms 可连)
+    // 同 /24 的对端直连优先（省掉打洞），不要用 is_private 判，
+    // 对端上报的 172.17-31.x 往往是它那边的 docker 网段，会白等 1.5s
     if let Some(a) = pick_addr(&entry.addrs, true) {
-        if is_lan_addr(&a) {
+        if is_same_subnet(&a) {
             if let Ok(Ok(h)) = timeout(
                 Duration::from_millis(1500),
                 tunnel::connect(&a, ns, id_pub),
@@ -180,11 +184,22 @@ async fn tunnel_direct_only(
 
     match winner {
         Some((path, h)) => {
-            // 清理落败分支：若它也成功了，显式关闭，避免泄漏 socket
-            let loser = if path == "p2p" { tcp_task } else { punch_task };
-            loser.abort();
-            if let Ok(Some(l)) = loser.await {
-                l.tunnel.mark_closed();
+            log::debug!("竞速胜者: {path}");
+            // 清理落败分支：只 abort 未完成的那个。
+            // 已完成的 JoinHandle 不能再 poll（tokio 会 panic: polled after completion）；
+            // 而且已完成说明它没成功（成功就会被选为 winner），无需处理。
+            if path == "p2p" {
+                if !tcp_done {
+                    tcp_task.abort();
+                    if let Ok(Some(l)) = tcp_task.await {
+                        l.tunnel.mark_closed();
+                    }
+                }
+            } else if !punch_done {
+                punch_task.abort();
+                if let Ok(Some(l)) = punch_task.await {
+                    l.tunnel.mark_closed();
+                }
             }
             if path == "p2p" {
                 state.p2p_fail.write().await.remove(node_id);
@@ -510,6 +525,7 @@ pub async fn adopt_tunnel(
     id_pub: [u8; 32],
     path: &str,
 ) -> Arc<Tunnel> {
+    log::debug!("adopt {node_id}: {path}");
     let t = h.tunnel.clone();
     spawn_ctrl_handler(
         t.clone(),
@@ -531,6 +547,8 @@ pub async fn adopt_tunnel(
     );
     crate::mesh::spawn_forward(h.mesh_rx, state.clone());
     // 替换旧隧道: 必须显式关闭, 否则旧心跳任务永不退出, 持续误报"隧道失效"
+    log::debug!("adopt {node_id}: 旧隧道检查");
+    log::debug!("adopt {node_id}: 旧隧道检查");
     {
         let old = state.tunnels.lock().await.get(node_id).cloned();
         if let Some(o) = old {
@@ -539,6 +557,7 @@ pub async fn adopt_tunnel(
             }
         }
     }
+    log::debug!("adopt {node_id}: 写 path 表");
     state
         .path
         .write()

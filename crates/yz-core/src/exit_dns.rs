@@ -5,7 +5,6 @@
 //! 出口节点只需支持已有的 UDP 流中继（pump_udp_stream），无需新增协议。
 
 use crate::dns::ExitDnsQuery;
-use crate::peer::tunnel_for;
 use crate::state::CoreState;
 use anyhow::{bail, Context, Result};
 use std::net::SocketAddr;
@@ -48,7 +47,8 @@ impl ExitDnsQuery for TunnelExitDns {
                     .with_context(|| format!("出口节点不在目录中: {node}"))?
             };
 
-            let t = tunnel_for(&self.state, &self.ns, &self.id_pub, &node_id).await?;
+            // 走出口自动选路（直连 vs 经中转），与 node 的 TCP/UDP 入口一致
+            let t = crate::exit_tunnel_for(&self.state, &self.ns, &self.id_pub, &node_id).await?;
 
             let target = match server.ip() {
                 std::net::IpAddr::V4(v4) => Addr::V4(v4.octets(), server.port()),

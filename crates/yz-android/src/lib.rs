@@ -39,7 +39,7 @@ fn rt() -> &'static tokio::runtime::Runtime {
     RUNTIME.get_or_init(|| {
         tokio::runtime::Builder::new_multi_thread()
             .enable_all()
-            .worker_threads(2)
+            .worker_threads(4)
             .build()
             .expect("tokio runtime")
     })
@@ -253,12 +253,21 @@ impl NodeRuntime {
         let state = self.state.clone();
         let (tx_bytes, rx_bytes, streams, peers, rtt_ms, nodes, domains) = rt().block_on(async move {
             let traffic = state.traffic().await;
-            let tunnels = state.tunnels.lock().await;
-            let peers = tunnels.len();
+            // 注意：不要持着 tunnels 锁去取其它锁（会跟 adopt_tunnel 等形成锁序反转）
+            let peers = state.tunnels.lock().await.len();
             let rtt = state.rtt.read().await.clone();
             let path = state.path.read().await.clone();
             let dir = state.dir.read().await.clone();
             let self_id = self.self_id.clone();
+            // 连接状态单独取一次锁（内层全部同步，不 await）
+            let connected_ids: std::collections::HashSet<String> = state
+                .tunnels
+                .lock()
+                .await
+                .iter()
+                .filter(|(_, t)| !t.is_closed())
+                .map(|(k, _)| k.clone())
+                .collect();
             let mut nodes: Vec<NodeStatus> = dir
                 .values()
                 .filter(|n| n.node_id != self_id)
@@ -270,10 +279,7 @@ impl NodeRuntime {
                     rtt: rtt.get(&n.node_id).copied().unwrap_or(0),
                     path: path.get(&n.node_id).cloned().unwrap_or_default(),
                     is_exit: n.caps & yz_proto::caps::EXIT != 0,
-                    connected: tunnels
-                        .get(&n.node_id)
-                        .map(|t| !t.is_closed())
-                        .unwrap_or(false),
+                    connected: connected_ids.contains(&n.node_id),
                 })
                 .collect();
             nodes.sort_by_key(|n| (n.rtt == 0, n.rtt));
@@ -407,6 +413,8 @@ fn start_async(cfg: StartConfig, protect: Option<Arc<dyn SocketProtect>>) -> Res
     let ruleset = Arc::new(RuleSet::new(rules, geoip, geosite, default_action));
 
     let state = Arc::new(CoreState::default());
+    // 出口自动选路需要排除自己
+    state.set_self_id(&yz_crypto::node_id(&id_pub));
     let (stop_tx, mut stop_rx) = tokio::sync::watch::channel(false);
 
     // 连接协调器 + 目录同步
@@ -756,6 +764,15 @@ pub extern "system" fn Java_io_yingzi_app_YzCore_nativeStart(
         android_logger::Config::default().with_max_level(log::LevelFilter::Debug),
     );
     let cfg_json = read_jstring(&mut env, &config);
+
+    // 把 panic 写进 logcat（android_logger 默认不接 panic hook，
+    // 任务 panic 时只会看到连接莫名失败）
+    static HOOK: std::sync::Once = std::sync::Once::new();
+    HOOK.call_once(|| {
+        std::panic::set_hook(Box::new(|info| {
+            log::error!("PANIC: {info}");
+        }));
+    });
 
     // 保存 JavaVM + VpnService 全局引用（供 protect 使用）
     if VM.get().is_none() {

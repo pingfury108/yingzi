@@ -77,6 +77,7 @@ pub async fn run(opts: NodeOpts, ns: &NetworkSecret, id_pub: [u8; 32]) -> Result
     let self_id = yz_crypto::node_id(&id_pub);
     let mut state0 = NodeState::default();
     state0.config_path.clone_from(&opts.config);
+    state0.set_self_id(&self_id);
     let state = Arc::new(state0);
 
     // 配置加载: 文件优先 (Web UI 改的是事实源), 无文件时用 CLI 初值

@@ -148,6 +148,23 @@ pub fn is_lan_addr(addr: &str) -> bool {
     }
 }
 
+/// 是否与本机某个地址同一个 /24（真正的“同局域网”判定）。
+/// 不要用 is_private 代替：对端上报的 172.17-31.x 常常是它那边的 docker 网段，
+/// 当成 LAN 会白白多走一次 1.5s 超时的直连尝试。
+pub fn is_same_subnet(addr: &str) -> bool {
+    let Some((host, _)) = addr.rsplit_once(':') else {
+        return false;
+    };
+    let Ok(ip) = host.parse::<std::net::Ipv4Addr>() else {
+        return false;
+    };
+    let o = ip.octets();
+    my_addrs().iter().any(|m| {
+        let mo = m.octets();
+        mo[0] == o[0] && mo[1] == o[1] && mo[2] == o[2]
+    })
+}
+
 /// 解析 exit 配置为具体决策
 
 /// 虚拟网段: 100.64.0.0/14 (避开阿里云/华为云 100.100.x 元数据段)

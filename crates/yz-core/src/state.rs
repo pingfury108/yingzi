@@ -57,6 +57,8 @@ pub struct CoreState {
     pub peer_diag: RwLock<HashMap<String, PeerDiag>>,
     /// 本机 UDP 映射存活时间估计（秒，0 = 未知）
     pub nat_lifetime_secs: std::sync::atomic::AtomicU64,
+    /// 本节点 id（出口选路需要排除自己）
+    pub self_id: std::sync::OnceLock<String>,
 }
 
 /// 单个对等节点的链路诊断计数（"不稳定"要从这里看）
@@ -115,6 +117,15 @@ pub struct PersistedConfig {
 }
 
 impl CoreState {
+    /// 记录本节点 id（启动时调一次）
+    pub fn set_self_id(&self, id: &str) {
+        let _ = self.self_id.set(id.to_string());
+    }
+
+    pub fn self_id(&self) -> &str {
+        self.self_id.get().map(|s| s.as_str()).unwrap_or("")
+    }
+
     /// 更新某节点的诊断计数（不拿到锁就静默跳过，不影响业务）
     pub fn diag<F: FnOnce(&mut PeerDiag)>(&self, node_id: &str, f: F) {
         let Ok(mut m) = self.peer_diag.try_write() else {
