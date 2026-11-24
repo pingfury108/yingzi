@@ -211,6 +211,18 @@ async fn handle_conn(
 
     // fake-IP：命中则用域名决策，并把假地址解析成真实地址
     let host = cfg.fakeip.as_ref().and_then(|p| p.domain(dst_ip));
+    // 在假地址段内但反查不到域名 = 陈旧映射（核心重启后客户端 DNS 缓存里还留着旧假地址）。
+    // 这种连接怎么处理都不对，直接快速失败让客户端重新解析，而不是走 IP 规则
+    // （198.18/15 常被 geoip:private 命中，会变成"直连"然后一路超时）。
+    if host.is_none() {
+        if let Some(pool) = &cfg.fakeip {
+            if pool.contains(dst_ip) {
+                log::debug!("陈旧 fake-IP {dst_ip}，快速失败让客户端重解析");
+                drop(client);
+                return Ok(());
+            }
+        }
+    }
     let decision = match &host {
         Some(h) => rules.decide_domain(h),
         None => rules.decide_ip(dst_ip),

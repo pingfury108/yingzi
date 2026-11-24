@@ -54,7 +54,14 @@ class NodesFragment : Fragment() {
 
         val items = ArrayList<JSONObject>()
         for (i in 0 until nodes.length()) items.add(nodes.getJSONObject(i))
-        items.sortBy { it.optInt("rtt").let { r -> if (r == 0) 99999 else r } }
+        // 稳定排序：当前出口置顶，其余按名字。
+        // 不要按 RTT 排——选中后 RTT 变化会让行跳动，用户会点错行。
+        items.sortWith(
+            compareBy(
+                { if (it.optString("name") == current) 0 else 1 },
+                { it.optString("name") },
+            )
+        )
 
         val card = LinearLayout(requireContext()).apply {
             orientation = LinearLayout.VERTICAL
@@ -172,12 +179,13 @@ class NodesFragment : Fragment() {
         val ctx = requireContext()
         val cfg = NodeConfig.load(ctx)
         NodeConfig.save(ctx, cfg.networkSecret, cfg.coordinator, cfg.name, name, cfg.remoteDns, cfg.directDns)
-        if (YzCore.nativeIsRunning()) {
-            ctx.startService(
-                Intent(ctx, YzVpnService::class.java).setAction(YzVpnService.ACTION_RESTART)
-            )
-        }
-        Toast.makeText(ctx, "出口已切换到 $name", Toast.LENGTH_SHORT).show()
+        // 热切换：不重启核心（重启会丢 fake-IP 池，客户端缓存的旧假地址会失效）
+        val ok = YzCore.nativeIsRunning() && YzCore.nativeSetExit(name)
+        Toast.makeText(
+            ctx,
+            if (ok) "出口已切换到 $name" else "已保存，重启核心后生效",
+            Toast.LENGTH_SHORT
+        ).show()
         list.postDelayed({ render() }, 600)
     }
 

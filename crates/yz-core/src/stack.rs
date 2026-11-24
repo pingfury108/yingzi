@@ -256,6 +256,15 @@ impl Stack {
         // 2) 规则决策（fake-IP 命中时按域名，否则按目的 IP）
         let mut dst = SocketAddr::new(IpAddr::V4(u.dst), u.dst_port);
         let host = self.cfg.fakeip.as_ref().and_then(|p| p.domain(u.dst));
+        // 陈旧 fake-IP：段内但反查不到域名 → 丢弃（客户端会重新解析）
+        if host.is_none() {
+            if let Some(pool) = &self.cfg.fakeip {
+                if pool.contains(u.dst) {
+                    log::debug!("陈旧 fake-IP {}，丢弃", u.dst);
+                    return Ok(());
+                }
+            }
+        }
         let decision = match &host {
             Some(h) => self.rules.decide_domain(h),
             None => self.rules.decide_ip(u.dst),

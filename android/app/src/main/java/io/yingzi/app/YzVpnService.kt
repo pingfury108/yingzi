@@ -159,6 +159,12 @@ class YzVpnService : VpnService() {
                     return
                 }
                 if (currentNetwork == network) return
+                // 让 VPN 跟随新的底层网络（否则切网后底层网络可能仍是旧的）
+                try {
+                    setUnderlyingNetworks(null)
+                } catch (e: Exception) {
+                    Log.w(TAG, "setUnderlyingNetworks 失败: $e")
+                }
                 // 自己建立的 VPN 网络也会触发 onAvailable，忽略
                 val caps = try {
                     getSystemService(ConnectivityManager::class.java).getNetworkCapabilities(network)

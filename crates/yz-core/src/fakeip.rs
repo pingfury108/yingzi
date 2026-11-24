@@ -44,19 +44,27 @@ impl FakeIp {
         if let Some(ip) = inner.by_domain.get(&domain) {
             return *ip;
         }
-        // 满了就先清空（简单可靠；正常使用不会触发）
         if inner.by_domain.len() >= MAX_ENTRIES {
             inner.by_domain.clear();
             inner.by_ip.clear();
         }
-        loop {
-            let v = BASE + (inner.next % SIZE);
-            inner.next = inner.next.wrapping_add(1);
-            let ip = Ipv4Addr::from(v);
-            // 跳过 .0 / .255 之类看起来像广播的地址（不重要，但便于排查）
+        // 按域名哈希定位（而不是递增分配）：
+        // 核心重启后同一个域名还能拿到同一个假地址，
+        // 否则客户端 DNS 缓存里的旧假地址反查不到域名，会落到 IP 规则上误判
+        // （198.18/15 在不少 geoip:private 列表里，被判成内网 → 直连超时）。
+        let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+        for b in domain.as_bytes() {
+            h ^= *b as u64;
+            h = h.wrapping_mul(0x0000_0100_0000_01b3);
+        }
+        let start = (h % SIZE as u64) as u32;
+        for step in 0..SIZE {
+            let v = BASE + ((start + step) % SIZE);
+            // 跳过 .0 / .255，便于排查
             if v & 0xff == 0 || v & 0xff == 0xff {
                 continue;
             }
+            let ip = Ipv4Addr::from(v);
             if inner.by_ip.contains_key(&ip) {
                 continue;
             }
@@ -64,6 +72,10 @@ impl FakeIp {
             inner.by_ip.insert(ip, domain);
             return ip;
         }
+        // 极端情况：池子耗尽，退回到旧行为
+        let v = BASE + (inner.next % SIZE);
+        inner.next = inner.next.wrapping_add(1);
+        Ipv4Addr::from(v)
     }
 
     /// 假 IP → 域名

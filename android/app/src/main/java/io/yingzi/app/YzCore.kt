@@ -12,4 +12,5 @@ object YzCore {
     external fun nativeIsRunning(): Boolean
     external fun nativePushEvent(level: String, msg: String)
     external fun nativeDiagnose(): String
+    external fun nativeSetExit(name: String): Boolean
 }

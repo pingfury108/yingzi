@@ -404,7 +404,8 @@ pub struct RuleSet {
     rules: std::sync::RwLock<Vec<Rule>>,
     geoip: Option<GeoIpDb>,
     geosite: Option<GeoSiteDb>,
-    default_action: Action,
+    /// 默认动作（可热改：切换出口时不重启核心）
+    default_action: std::sync::RwLock<Action>,
 }
 
 impl RuleSet {
@@ -418,7 +419,21 @@ impl RuleSet {
             rules: std::sync::RwLock::new(rules),
             geoip,
             geosite,
-            default_action,
+            default_action: std::sync::RwLock::new(default_action),
+        }
+    }
+
+    /// 热改默认动作（切出口用）
+    pub fn set_default_action(&self, action: Action) {
+        if let Ok(mut w) = self.default_action.write() {
+            *w = action;
+        }
+    }
+
+    fn default(&self) -> Action {
+        match self.default_action.read() {
+            Ok(g) => g.clone(),
+            Err(p) => p.into_inner().clone(),
         }
     }
 
@@ -438,7 +453,7 @@ impl RuleSet {
         let d = domain.trim().to_ascii_lowercase();
         let rules = match self.rules.read() {
             Ok(r) => r,
-            Err(_) => return Decision { action: self.default_action.clone(), reason: "规则锁异常".into() },
+            Err(_) => return Decision { action: self.default().clone(), reason: "规则锁异常".into() },
         };
         for r in rules.iter() {
             if !r.matcher.is_domain_matcher() {
@@ -464,7 +479,7 @@ impl RuleSet {
             }
         }
         Decision {
-            action: self.default_action.clone(),
+            action: self.default().clone(),
             reason: "默认动作".into(),
         }
     }
@@ -473,7 +488,7 @@ impl RuleSet {
     pub fn decide_ip(&self, ip: Ipv4Addr) -> Decision {
         let rules = match self.rules.read() {
             Ok(r) => r,
-            Err(_) => return Decision { action: self.default_action.clone(), reason: "规则锁异常".into() },
+            Err(_) => return Decision { action: self.default().clone(), reason: "规则锁异常".into() },
         };
         for r in rules.iter() {
             if !r.matcher.is_ip_matcher() {
@@ -496,7 +511,7 @@ impl RuleSet {
             }
         }
         Decision {
-            action: self.default_action.clone(),
+            action: self.default().clone(),
             reason: "默认动作".into(),
         }
     }

@@ -738,6 +738,24 @@ pub fn spawn_incoming_handler(
                 });
                 continue;
             }
+            // 中转类流（端口 0，非 RELAY_MARK）：不处理时必须显式拒绝，
+            // 绝不能落到下面的通用 connect——那会把 <node_id>:0 当域名去解析，
+            // 白白等一次 DNS 失败（之前 Android 上就是这么把整条链路弄断的）。
+            if matches!(&addr, yz_proto::Addr::Domain(d, 0) if d != tunnel::RELAY_MARK) {
+                if !relay_ok {
+                    let _ = t
+                        .write_frame(&Frame::SynAck {
+                            stream_id: sid,
+                            ok: false,
+                        })
+                        .await;
+                    log::debug!(
+                        "relay request refused (relay disabled on this link): {}",
+                        &peer_id[..8.min(peer_id.len())]
+                    );
+                    continue;
+                }
+            }
             // 通用中转请求: 对端希望「先到我, 再到另一个节点」
             // 地址形如 Domain(目标节点, 0)，不是 RELAY_MARK 就说明是请我当跳板
             if relay_ok

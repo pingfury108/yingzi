@@ -120,9 +120,8 @@ class StatusFragment : Fragment() {
         )
         if (YzCore.nativeIsRunning()) {
             YzCore.nativePushEvent("INFO", "出口切换到 $name")
-            ctx.startService(
-                Intent(ctx, YzVpnService::class.java).setAction(YzVpnService.ACTION_RESTART)
-            )
+            // 热切换，避免重启核心导致 fake-IP 池被清空
+            YzCore.nativeSetExit(name)
         }
         chipsBuilt = false
         pollAsync()

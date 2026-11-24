@@ -654,7 +654,8 @@ impl DnsService {
                 let ip = pool.alloc(&name);
                 self.stat_remote
                     .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                return Ok(build_response(msg.id, &q, &[(30u32, IpAddr::V4(ip))], 0));
+                // 假地址对同一域名恒定，TTL 给长一点，减少重复查询
+                return Ok(build_response(msg.id, &q, &[(300u32, IpAddr::V4(ip))], 0));
             }
         }
 

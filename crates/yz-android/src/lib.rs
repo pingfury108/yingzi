@@ -143,7 +143,10 @@ impl VpnProtect {
 
 struct FdIo {
     read_rx: tokio::sync::Mutex<tokio::sync::mpsc::Receiver<Vec<u8>>>,
-    write_fd: i32,
+    /// 发给专用写线程的队列（不再每包 spawn_blocking）
+    write_tx: tokio::sync::mpsc::Sender<Vec<u8>>,
+    /// 写队列溢出丢包计数（TUN 出口丢包）
+    write_drop: Arc<std::sync::atomic::AtomicU64>,
 }
 
 impl PacketIo for FdIo {
@@ -169,17 +172,12 @@ impl PacketIo for FdIo {
         pkt: &'a [u8],
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<()>> + Send + 'a>> {
         Box::pin(async move {
-            let fd = self.write_fd;
-            let data = pkt.to_vec();
-            // 阻塞写放到 blocking 线程，避免占用 async worker
-            tokio::task::spawn_blocking(move || unsafe {
-                let n = libc_write(fd, &data);
-                if n < 0 {
-                    return Err(anyhow::anyhow!("tun write failed"));
-                }
-                Ok(())
-            })
-            .await?
+            // 入队即返回：真正的 write(2) 由专用线程做，避免每包一次 spawn_blocking
+            if self.write_tx.try_send(pkt.to_vec()).is_err() {
+                self.write_drop
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            }
+            Ok(())
         })
     }
 }
@@ -204,19 +202,20 @@ unsafe fn jni_write(fd: i32, data: &[u8]) -> isize {
 }
 
 fn spawn_tun_reader(fd: i32) -> tokio::sync::mpsc::Receiver<Vec<u8>> {
-    let (tx, rx) = tokio::sync::mpsc::channel::<Vec<u8>>(512);
+    // 频道放大：读线程不能被分发循环短暂卡住，否则内核 TUN 队列直接丢包
+    let (tx, rx) = tokio::sync::mpsc::channel::<Vec<u8>>(1024);
     std::thread::spawn(move || {
         extern "C" {
             fn read(fd: i32, buf: *mut std::ffi::c_void, count: usize) -> isize;
         }
-        let mut buf = vec![0u8; 4096];
+        let mut buf = vec![0u8; 65536];
         loop {
             let n = unsafe { read(fd, buf.as_mut_ptr() as *mut std::ffi::c_void, buf.len()) };
             if n < 0 {
                 // EAGAIN/EWOULDBLOCK: fd 非阻塞, 稍等再试
                 let err = std::io::Error::last_os_error();
                 if err.kind() == std::io::ErrorKind::WouldBlock {
-                    std::thread::sleep(std::time::Duration::from_millis(2));
+                    std::thread::sleep(std::time::Duration::from_millis(1));
                     continue;
                 }
                 log::warn!("tun read 结束: {err}");
@@ -233,13 +232,34 @@ fn spawn_tun_reader(fd: i32) -> tokio::sync::mpsc::Receiver<Vec<u8>> {
     rx
 }
 
+/// 专用写线程：一包一次 write(2)，不再每包 spawn_blocking
+fn spawn_tun_writer(
+    fd: i32,
+    mut rx: tokio::sync::mpsc::Receiver<Vec<u8>>,
+    dropped: Arc<std::sync::atomic::AtomicU64>,
+) {
+    std::thread::spawn(move || {
+        let mut last_note = 0u64;
+        while let Some(pkt) = rx.blocking_recv() {
+            unsafe {
+                libc_write(fd, &pkt);
+            }
+            // 每 5000 次丢包报一次，避免刷屏
+            let d = dropped.load(std::sync::atomic::Ordering::Relaxed);
+            if d > 0 && d - last_note >= 5000 {
+                last_note = d;
+                log::warn!("TUN 写队列溢出丢包累计 {d}");
+            }
+        }
+    });
+}
+
 // ---------- 运行时 ----------
 
 struct NodeRuntime {
     state: Arc<CoreState>,
     ruleset: Arc<RuleSet>,
     started: std::time::Instant,
-    exit: String,
     self_id: String,
     #[allow(dead_code)]
     protect: Option<Arc<dyn SocketProtect>>,
@@ -254,7 +274,8 @@ struct NodeRuntime {
 impl NodeRuntime {
     fn status(&self) -> StatusJson {
         let state = self.state.clone();
-        let (tx_bytes, rx_bytes, streams, peers, rtt_ms, nodes, domains) = rt().block_on(async move {
+        let (tx_bytes, rx_bytes, streams, peers, rtt_ms, nodes, domains, exit_now) =
+            rt().block_on(async move {
             let traffic = state.traffic().await;
             // 注意：不要持着 tunnels 锁去取其它锁（会跟 adopt_tunnel 等形成锁序反转）
             let peers = state.tunnels.lock().await.len();
@@ -299,21 +320,25 @@ impl NodeRuntime {
                 .collect();
             domains.sort_by(|a, b| b.hits.cmp(&a.hits));
             domains.truncate(20);
+            // 出口实时读 state（支持热切换；重启核心会丢 fake-IP 池）
+            let exit_now = state.default_exit.read().await.clone();
             let rtt_ms = rtt
-                .get(&self.exit)
+                .get(&exit_now)
                 .copied()
                 .or_else(|| {
                     dir.values()
-                        .find(|n| n.name == self.exit)
+                        .find(|n| n.name == exit_now)
                         .and_then(|n| rtt.get(&n.node_id).copied())
                 })
                 .unwrap_or(0);
-            (traffic.0, traffic.1, traffic.2, peers, rtt_ms, nodes, domains)
+            (
+                traffic.0, traffic.1, traffic.2, peers, rtt_ms, nodes, domains, exit_now,
+            )
         });
         StatusJson {
             running: true,
             peers,
-            exit: self.exit.clone(),
+            exit: exit_now,
             rtt_ms,
             uptime_s: self.started.elapsed().as_secs(),
             nodes,
@@ -694,9 +719,13 @@ fn start_async(cfg: StartConfig, protect: Option<Arc<dyn SocketProtect>>) -> Res
 
     // TUN
     let tun_rx = spawn_tun_reader(cfg.tun_fd);
+    let (tun_tx, tun_wx) = tokio::sync::mpsc::channel::<Vec<u8>>(2048);
+    let tun_drop = Arc::new(std::sync::atomic::AtomicU64::new(0));
+    spawn_tun_writer(cfg.tun_fd, tun_wx, tun_drop.clone());
     let io: Arc<dyn PacketIo> = Arc::new(FdIo {
         read_rx: tokio::sync::Mutex::new(tun_rx),
-        write_fd: cfg.tun_fd,
+        write_tx: tun_tx,
+        write_drop: tun_drop.clone(),
     });
 
     // UDP 栈
@@ -723,7 +752,9 @@ fn start_async(cfg: StartConfig, protect: Option<Arc<dyn SocketProtect>>) -> Res
             mtu: cfg.mtu,
             protect: protect.clone(),
             exit: Some(exit_tcp),
-            max_conns: 400,
+            // smoltcp 每连接 327KB×2 缓冲；400 连接最坏要 256MB，手机上会被 OOM 杀。
+            // 200 已足够手机浏览峰值。
+            max_conns: 200,
         },
     ));
 
@@ -732,7 +763,9 @@ fn start_async(cfg: StartConfig, protect: Option<Arc<dyn SocketProtect>>) -> Res
         let io_loop = io.clone();
         let udp = udp.clone();
         let tcp = tcp.clone();
-        let (tcp_tx, tcp_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(256);
+        let (tcp_tx, tcp_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(1024);
+        let tcp_drop = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let tcp_drop2 = tcp_drop.clone();
         let mut stop = stop_tx.subscribe();
         rt().spawn(async move {
             let io = io_loop;
@@ -743,7 +776,13 @@ fn start_async(cfg: StartConfig, protect: Option<Arc<dyn SocketProtect>>) -> Res
                         let Ok(n) = r else { break };
                         let pkt = buf[..n].to_vec();
                         if yz_core::stack::parse_udp(&pkt).is_none() {
-                            let _ = tcp_tx.try_send(pkt);
+                            // TCP 段丢了会被重传，但频繁丢包表现为卡顿，计数并告警
+                            if tcp_tx.try_send(pkt).is_err() {
+                                let d = tcp_drop2.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+                                if d % 5000 == 0 {
+                                    log::warn!("TCP 分发队列溢出丢包累计 {d}");
+                                }
+                            }
                         } else {
                             let io2 = io.clone();
                             let udp2 = udp.clone();
@@ -767,7 +806,6 @@ fn start_async(cfg: StartConfig, protect: Option<Arc<dyn SocketProtect>>) -> Res
         state,
         ruleset,
         started: std::time::Instant::now(),
-        exit: cfg.default_exit.clone().unwrap_or_default(),
         self_id: yz_crypto::node_id(&id_pub),
         protect: protect.clone(),
         ns,
@@ -1004,6 +1042,41 @@ pub extern "system" fn Java_io_yingzi_app_YzCore_nativeEvents(
         .map(|(ts, level, msg)| serde_json::json!({"ts": ts, "level": level, "msg": msg}))
         .collect();
     to_jstring(&mut env, &serde_json::to_string(&arr).unwrap_or_default())
+}
+
+/// nativeSetExit(name) —— 热切换出口，不重启核心
+/// （重启会清空 fake-IP 池，客户端缓存里的旧假地址就反查不到域名了）
+#[no_mangle]
+pub extern "system" fn Java_io_yingzi_app_YzCore_nativeSetExit(
+    mut env: JNIEnv,
+    _class: JClass,
+    name: JString,
+) -> jboolean {
+    let Ok(s) = env.get_string(&name) else {
+        return JNI_FALSE;
+    };
+    let name: String = s.into();
+    let guard = NODE.lock().unwrap();
+    let Some(node) = guard.as_ref() else {
+        return JNI_FALSE;
+    };
+    let state = node.state.clone();
+    // 同步更新 RuleSet 的默认动作：Android 的分流决策走 decide_*，
+    // 它用的是 RuleSet 里的 default_action（启动时的快照），只改 state 不生效。
+    node.ruleset
+        .set_default_action(yz_core::policy::Action::Exit(Some(name.clone())));
+    rt().block_on(async move {
+        *state.default_exit.write().await = name.clone();
+        // 丢掉这个出口的选路缓存，下次按新出口重测
+        if let Some(entry) = {
+            let dir = state.dir.read().await;
+            dir.values().find(|n| n.name == name || n.node_id == name).cloned()
+        } {
+            state.exit_path.write().await.remove(&entry.node_id);
+        }
+    });
+    log::info!("出口已切换（热）");
+    JNI_TRUE
 }
 
 /// nativeSetRules(json) —— 热更新规则（JSON 字符串数组），立即生效
